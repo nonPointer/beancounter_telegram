@@ -281,7 +281,7 @@ def handle_message(message):
     f = github_download_file()
     if f:
         if github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], "Update via bot"):
-            reply("Created entry" + (f":\n```{appendix}```" if appendix else ""))
+            reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
             bot.log("Logged entry:\n" + appendix)
 
 
