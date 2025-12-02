@@ -1,0 +1,9 @@
+{% if payee and narration %}
+{{ date }} * "{{ payee }}" "{{ narration }}" {{ '#' ~ tag if tag else '' }} {{ '^' ~ link if link else '' }}
+{% else %}
+{{ date }} * "{{ payee }}" {{ '#' ~ tag if tag else '' }} {{ '^' ~ link if link else '' }}
+{% endif %}
+  datetime: "{{ datetime }}"
+  {%- for posting in postings %}
+  {{ posting.account }}  {{ posting.amount }} {{ posting.currency }} 
+  {%- endfor %}

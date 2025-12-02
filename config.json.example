@@ -1,0 +1,10 @@
+{
+    "TELEGRAM_BOT_TOKEN": "",
+    "GITHUB_TOKEN": "",
+    "REPO_OWNER": "",
+    "REPO_NAME": "",
+    "BRANCH_NAME": "main",
+    "FILE_PATH": "journals/telegram.bean",
+    "TIMEZONE": "Asia/Shanghai",
+    "CHAT_ID": ""
+}
