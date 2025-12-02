@@ -1,6 +1,6 @@
 # beancounter_telegram
 
-用 Telegram 来记账。
+追加记账记录到特定 GitHub 仓库的特定文件，随时随地用 Telegram 也可以记录生活消费，且不影响现有的 Beancounter 工作流。
 
 ## Quick Start
 
@@ -27,6 +27,7 @@
 - [ ] 记账时自动补全货币
 - [x] `/tz <timezone>` 设置时区
 - [ ] `/view [date]` 查看指定日期的记账记录
+- [ ] 终极懒鬼：让 LLM 来解析自然语言的记账内容
 
 # Example
 
