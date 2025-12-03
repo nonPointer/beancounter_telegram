@@ -146,6 +146,12 @@ def handle_message(message):
     date_str = dt.strftime('%Y-%m-%d')
     datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
     
+    if re.match(r'^\d{4}-\d{2}-\d{2}', text.strip()):
+        bot.log("Custom date detected")
+        date_part = text.strip().splitlines()[0].strip()
+        date_str = date_part
+        text = '\n'.join(text.strip().splitlines()[1:]).strip()
+    
     appendix = ""
     if text.startswith('/'):
         # command
