@@ -42,7 +42,7 @@ def parse_accounts():
 
     return sorted(accounts)
 
-def match_account(account_suffix: str) -> list:
+def match_account(account_suffix: str) -> str | None:
     accounts = parse_accounts()
     suffix_lower = account_suffix.lower()
     matches = [a for a in accounts if a.lower().endswith(suffix_lower)]
@@ -51,7 +51,7 @@ def match_account(account_suffix: str) -> list:
         bot.log(f"No matching account for suffix: {account_suffix}")
         bot.log(f"Available accounts: {accounts}")
     
-    return matches[0] if matches else account_suffix
+    return matches[0] if matches else None
 
 class bcolors():
     HEADER = '\033[95m'
@@ -197,6 +197,9 @@ def handle_message(message):
             reply("Invalid balance command format.")
             return
         account = match_account(matches[0][0])
+        if not account:
+            reply(f"No matching account found for suffix: {pmatches[0][0]}")
+            return
         amount = matches[0][1]
         currency = matches[0][2]
 
@@ -256,6 +259,9 @@ def handle_message(message):
                 reply(f"Invalid posting format: {posting}")
                 return
             account = match_account(pmatches[0][0])
+            if not account:
+                reply(f"No matching account found for suffix: {pmatches[0][0]}")
+                return
             amount = pmatches[0][1] if len(pmatches[0]) > 1 else ""
             currency = pmatches[0][2] if len(pmatches[0]) > 2 else ""
             p = {
