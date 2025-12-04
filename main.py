@@ -258,7 +258,7 @@ def handle_message(message):
             return
         
         # units and currency can be optional in postings
-        r_posting = r'([^\s]+)\s*([^\s]+)?\s*([^\s]+)?'
+        r_posting = r'([^\s]+)\s*([^\s]+)?\s*(.+)'
         for posting in text:
             pmatches = re.findall(r_posting, posting)
             if not pmatches or len(pmatches[0]) < 1:
@@ -269,14 +269,13 @@ def handle_message(message):
                 reply(f"No matching account found for suffix: {pmatches[0][0]}")
                 return
             amount = pmatches[0][1] if len(pmatches[0]) > 1 else ""
-            currency = pmatches[0][2] if len(pmatches[0]) > 2 else ""
+            currency_price_cost = pmatches[0][2] if len(pmatches[0]) > 2 else ""
             p = {
                 "account": account,
                 "amount": amount,
-                "currency": currency
+                "currency": currency_price_cost
             }
             postings.append(p)
-            # posting_list.append(f"{account}  {amount} {currency}".strip())
             
         appendix = jinja2.get_template("transaction.bean.j2").render(
             date=date_str,
