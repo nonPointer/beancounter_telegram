@@ -260,6 +260,8 @@ def handle_message(message):
         # units and currency can be optional in postings
         r_posting = r'([^\s]+)\s*([^\s]+)?\s*(.+)'
         for posting in text:
+            posting, comment = posting.split(';', 1) if ';' in posting else (posting, "")
+            
             pmatches = re.findall(r_posting, posting)
             if not pmatches or len(pmatches[0]) < 1:
                 reply(f"Invalid posting format: {posting}")
@@ -273,7 +275,8 @@ def handle_message(message):
             p = {
                 "account": account,
                 "amount": amount,
-                "currency": currency_price_cost
+                "currency": currency_price_cost,
+                "comment": comment.strip()
             }
             postings.append(p)
             

@@ -5,5 +5,5 @@
 {%- endif %}
   datetime: "{{ datetime }}"
   {%- for posting in postings %}
-  {{ posting.account }}  {{ posting.amount }} {{ posting.currency }} 
+  {{ posting.account }}  {{ posting.amount }} {{ posting.currency }} {{ ' ; ' + posting.comment if posting.comment else '' }}
   {%- endfor %}
