@@ -152,6 +152,7 @@ def handle_message(message):
         date_str = date_part
         text = '\n'.join(text.strip().splitlines()[1:]).strip()
     
+    commit_message = 'Add entry by Telegram Bot\n\n'
     appendix = ""
     if text.startswith('/'):
         # command
@@ -270,6 +271,8 @@ def handle_message(message):
             if not account:
                 reply(f"No matching account found for suffix: {pmatches[0][0]}")
                 return
+            if not account.startswith("Expenses") and not account.startswith("Income"):
+                commit_message += f"{account}\n"
             amount = pmatches[0][1] if len(pmatches[0]) > 1 else ""
             currency_price_cost = pmatches[0][2] if len(pmatches[0]) > 2 else ""
             p = {
@@ -294,7 +297,7 @@ def handle_message(message):
     # upload to github
     f = github_download_file()
     if f:
-        if github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], "Update via bot"):
+        if github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
             reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
             bot.log("Logged entry:\n" + appendix)
 
