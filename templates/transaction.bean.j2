@@ -1,9 +1,13 @@
+{%- set account_width = postings | map(attribute='account') | map('length') | max + 2 -%}
+{%- set amount_width  = postings | map(attribute='amount')  | map('string') | map('length') | max + 2 -%}
+{%- set currency_width = postings | map(attribute='currency') | map('length') | max + 2 -%}
+
 {%- if payee and narration -%}
-{{ date }} * "{{ payee }}" "{{ narration }}" {{ '#' ~ tag if tag else '' }} {{ '^' ~ link if link else '' }}
+{{ date }} * "{{ payee }}" "{{ narration }}"{{ ' #' ~ tag if tag else '' }}{{ ' ^' ~ link if link else '' }}
 {%- else -%}
-{{ date }} * "{{ payee }}" {{ '#' ~ tag if tag else '' }} {{ '^' ~ link if link else '' }}
+{{ date }} * "{{ payee }}"{{ ' #' ~ tag if tag else '' }}{{ ' ^' ~ link if link else '' }}
 {%- endif %}
   datetime: "{{ datetime }}"
-  {%- for posting in postings %}
-  {{ posting.account }}  {{ posting.amount }} {{ posting.currency }} {{ ' ; ' + posting.comment if posting.comment else '' }}
-  {%- endfor %}
+{%- for posting in postings %}
+  {{ posting.account.ljust(account_width) }} {{ posting.amount.rjust(amount_width) }} {{ posting.currency.ljust(currency_width) }} {{ ('; ' + posting.comment) if posting.comment else '' }}
+{%- endfor %}
