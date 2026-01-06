@@ -221,19 +221,6 @@ def handle_message(message):
         # transaction
         bot.log("Transaction detected")
         text = text.splitlines()
-        # if len(text) < 3:
-        #     reply("Invalid transaction format.")
-        #     return        
-        # header = text.pop()
-        # r = r'"(.*?)"\s+"(.*?)"(?:\s+#([^\s]+))?(?:\s+\^([^\s]+))?'
-        # matches = re.findall(r, header)
-        # if not matches or len(matches[0]) < 2:
-        #     reply("Invalid transaction header format.")
-        #     return
-        # payee = matches[0][0]
-        # narration = matches[0][1]
-        # tag = matches[0][2] if len(matches[0]) > 2 else ""
-        # link = matches[0][3] if len(matches[0]) > 3 else ""
         
         if len(text) < 4:
             reply("Invalid transaction format. Please provide payee, narration and two postings.")
@@ -259,29 +246,41 @@ def handle_message(message):
             return
         
         # units and currency can be optional in postings
-        r_posting = r'([^\s]+)\s*([^\s]+)?\s*(.+)'
         for posting in text:
-            posting, comment = posting.split(';', 1) if ';' in posting else (posting, "")
+            posting = posting.strip()
+            if not posting:
+                continue
             
-            pmatches = re.findall(r_posting, posting)
-            if not pmatches or len(pmatches[0]) < 1:
+            posting, comment = posting.split(';', 1) if ';' in posting else (posting, "")
+
+            # extract account, amount, currency and the rest of the string
+            r_posting = r'([^\s]+)\s*(-?\d+\.?\d*)\s*([^\s]+)\s*(.*?)\s*$'
+            
+            pmatches = re.match(r_posting, posting)
+            if not pmatches:
                 reply(f"Invalid posting format: {posting}")
                 return
-            account = match_account(pmatches[0][0])
+            
+            account = match_account(pmatches.group(1))
             if not account:
-                reply(f"No matching account found for suffix: {pmatches[0][0]}")
+                reply(f"No matching account found for suffix: {pmatches.group(1)}")
                 return
             if not account.startswith("Expenses") and not account.startswith("Income"):
                 commit_message += f"{account}\n"
-            amount = pmatches[0][1] if len(pmatches[0]) > 1 else ""
-            currency_price_cost = pmatches[0][2] if len(pmatches[0]) > 2 else ""
-            p = {
+            
+            amount = pmatches.group(2)
+            currency = pmatches.group(3)
+            rest = pmatches.group(4) if pmatches.group(4) else ""
+  
+            posting = {
                 "account": account,
                 "amount": amount,
-                "currency": currency_price_cost,
+                "currency": currency,
+                "rest": rest,
                 "comment": comment.strip()
             }
-            postings.append(p)
+            
+            postings.append(posting)
             
         appendix = jinja2.get_template("transaction.bean.j2").render(
             date=date_str,
