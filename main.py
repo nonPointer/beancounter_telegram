@@ -271,6 +271,10 @@ def handle_message(message):
             amount = pmatches.group(2)
             currency = pmatches.group(3)
             rest = pmatches.group(4) if pmatches.group(4) else ""
+
+            if not re.match(r'^[A-Z0-9][A-Z0-9\'._-]*$', currency) or not re.search(r'[A-Z]', currency):
+                reply(f"货币符号 '{currency}' 无效：必须全部大写，可包含数字，例如 USD、CNY、3NVD。")
+                return
   
             posting = {
                 "account": account,
