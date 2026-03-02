@@ -1,26 +1,21 @@
-import requests
-import time
+import base64
+import json
+import os
+import re
+import sys
 import threading
 import time
-import os
-import sys
-import re
-import base64
-import pytz
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader
-
-jinja2 = Environment(loader=FileSystemLoader(searchpath="./templates"))
 from pprint import pprint
 
+import pytz
+import requests
+from jinja2 import Environment, FileSystemLoader
 
 with open("config.json", "r") as f:
-    import json
     config = json.load(f)
 
 GITHUB_URL_BASE = "https://api.github.com"
-BOT_API_BASE_URL = "https://api.telegram.org/bot{}".format(
-    config["TELEGRAM_BOT_TOKEN"])
 GITHUB_TOKEN = config["GITHUB_TOKEN"]
 REPO_OWNER = config["REPO_OWNER"]
 REPO_NAME = config["REPO_NAME"]
@@ -28,32 +23,10 @@ BRANCH_NAME = config["BRANCH_NAME"]
 FILE_PATH = config["FILE_PATH"]
 CHAT_ID = config.get("CHAT_ID", None)
 
-TIMEZONE = pytz.timezone(config["TIMEZONE"])
+jinja2 = Environment(loader=FileSystemLoader(searchpath="./templates"))
 
-def parse_accounts():
-    files = list(filter(lambda x: x.endswith(".bean"), os.listdir("./accounts")))
-    accounts = []
-    for file in files:
-        with open(f"./accounts/{file}", "r") as f:
-            content = f.read()
-            r_account = r'\d{4}-\d{2}-\d{2} open (.*)'
-            matches = re.findall(r_account, content)
-            accounts += [x.strip().split(" ", 1)[0] for x in matches]
 
-    return sorted(accounts)
-
-def match_account(account_suffix: str) -> str | None:
-    accounts = parse_accounts()
-    suffix_lower = account_suffix.lower()
-    matches = [a for a in accounts if a.lower().endswith(suffix_lower)]
-
-    if not matches:
-        bot.log(f"No matching account for suffix: {account_suffix}")
-        bot.log(f"Available accounts: {accounts}")
-    
-    return matches[0] if matches else None
-
-class bcolors():
+class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKCYAN = '\033[96m'
@@ -65,7 +38,7 @@ class bcolors():
     UNDERLINE = '\033[4m'
 
 
-class rotating_loading():
+class rotating_loading:
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
 
@@ -76,260 +49,248 @@ class rotating_loading():
             for symbol in symbols:
                 print('\r' + symbol, end='', flush=True)
                 time.sleep(duration)
-
         print("\r", end='')
 
 
-def handle_edited_message(message):
-    pass
+def parse_accounts():
+    files = [f for f in os.listdir("./accounts") if f.endswith(".bean")]
+    accounts = []
+    for file in files:
+        with open(f"./accounts/{file}", "r") as f:
+            content = f.read()
+            matches = re.findall(r'\d{4}-\d{2}-\d{2} open (.*)', content)
+            accounts += [x.strip().split(" ", 1)[0] for x in matches]
+    return sorted(accounts)
 
 
-def github_download_file() -> dict | None:
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.object",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
-    url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}?ref={BRANCH_NAME}"
-    r = requests.get(url=url,headers=headers)
-    
-    if r.status_code == 200:
-        results = {
-            "content": base64.b64decode(r.json()["content"]).decode("utf-8"),
-            "sha": r.json()["sha"]
-        }
-        return results
-    elif r.status_code == 404:
-        bot.log("File not found.")
-        return {"content": "", "sha": ""}
-    else:
-        bot.log("Error:", r.status_code)
-        return None
-
-def github_upload_file(content: str, sha: str, commit_message: str) -> bool:
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.object",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
-    url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
-    data = {
-        "message": commit_message,
-        "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
-        "branch": BRANCH_NAME,
-        "sha": sha
-    }
-    r = requests.put(url=url, headers=headers, json=data)
-    if r.status_code in [200, 201]:
-        return True
-    else:
-        bot.log(f"Error uploading file: {r.status_code}")
-        bot.log(r.text)
-        return False
-        
-def handle_message(message):
-    text = message["message"]["text"]
-    chat_id = message["message"]["chat"]["id"]
-    
-    def reply(text: str):
-        bot.send_message(chat_id, text)
-        
-    if CHAT_ID and str(chat_id) != CHAT_ID:
-        bot.log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
-        reply("How dare you?")
-        return
-    
-    
-    # date and datetime in custom timezone
-    global TIMEZONE
-    dt = datetime.now(TIMEZONE)
-    date_str = dt.strftime('%Y-%m-%d')
-    datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    if re.match(r'^\d{4}-\d{2}-\d{2}', text.strip()):
-        bot.log("Custom date detected")
-        date_part = text.strip().splitlines()[0].strip()
-        date_str = date_part
-        text = '\n'.join(text.strip().splitlines()[1:]).strip()
-    
-    commit_message = 'Add entry by Telegram Bot\n\n'
-    appendix = ""
-    if text.startswith('/'):
-        # command
-        text = text[1:]
-        command = text.split(' ', 1)[0]
-        payload = text[len(command):].strip()
-        bot.log(f"Command: {command}, Payload: {payload}")
-        if command == "tz":
-            TIMEZONE = payload
-            if TIMEZONE == 'London':
-                TIMEZONE = pytz.timezone("Europe/London")
-                reply(f"Timezone set to {TIMEZONE}")
-            elif TIMEZONE == 'Beijing':
-                TIMEZONE = pytz.timezone("Asia/Shanghai")
-                reply(f"Timezone set to {TIMEZONE}")
-            else:
-                try:
-                    TIMEZONE = pytz.timezone(payload)
-                    reply(f"Timezone set to {TIMEZONE}")
-                except pytz.UnknownTimeZoneError:
-                    reply(f"Unknown timezone: {payload}")
-                    return
-            reply(f"Current time: {datetime.now(TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')}")
-        else:
-            reply(f"Unknown command: {command}")
-        return
-    elif text.lower().startswith("open"):
-        bot.log("/open command detected")
-        r = r'.*?\s+([^\s]+)\s+([^\s]+)'
-        matches = re.findall(r, text, re.IGNORECASE)
-        if not matches or len(matches[0]) < 2:
-            reply("Invalid open command format.")
-            return
-        account = matches[0][0]
-        currency = matches[0][1]
-        
-        appendix = jinja2.get_template("open.bean.j2").render(
-            date=date_str,
-            account=account,
-            currency=currency,
-            datetime=datetime_str
-        )
-    elif text.lower().startswith("balance"):
-        bot.log("/balance command detected")
-        # directive, account, amount, currency
-        r = r'.*?\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)'
-        matches = re.findall(r, text, re.IGNORECASE)
-        if not matches or len(matches[0]) < 2:
-            reply("Invalid balance command format.")
-            return
-        account = match_account(matches[0][0])
-        if not account:
-            reply(f"No matching account found for suffix: {pmatches[0][0]}")
-            return
-        amount = matches[0][1]
-        currency = matches[0][2]
-
-        appendix = jinja2.get_template("balance.bean.j2").render(
-            date=date_str,
-            account=account,
-            amount=amount,
-            currency=currency,
-            datetime=datetime_str
-        )
-    else:
-        # transaction
-        bot.log("Transaction detected")
-        text = text.splitlines()
-        
-        if len(text) < 4:
-            reply("Invalid transaction format. Please provide payee, narration and two postings.")
-            return
-        payee = text.pop(0).strip()
-        narration = text.pop(0).strip()
-        
-        # extract optional tag and link
-        tag = None
-        link = None
-        while text and text[0].strip():
-            if text[0].startswith('#'):
-                tag = text.pop(0)[1:].strip()
-            elif text[0].startswith('^'):
-                link = text.pop(0)[1:].strip()
-            else:
-                break
-        
-        postings = []
-        # if there are less than 2 postings, invalid
-        if len(text) < 2:
-            reply("A transaction must have at least two postings.")
-            return
-        
-        # units and currency can be optional in postings
-        for posting in text:
-            posting = posting.strip()
-            if not posting:
-                continue
-            
-            posting, comment = posting.split(';', 1) if ';' in posting else (posting, "")
-
-            # extract account, amount, currency and the rest of the string
-            r_posting = r'([^\s]+)\s*(-?\d+\.?\d*)\s*([^\s]+)\s*(.*?)\s*$'
-            
-            pmatches = re.match(r_posting, posting)
-            if not pmatches:
-                reply(f"Invalid posting format: {posting}")
-                return
-            
-            account = match_account(pmatches.group(1))
-            if not account:
-                reply(f"No matching account found for suffix: {pmatches.group(1)}")
-                return
-            if not account.startswith("Expenses") and not account.startswith("Income"):
-                commit_message += f"{account}\n"
-            
-            amount = pmatches.group(2)
-            currency = pmatches.group(3)
-            rest = pmatches.group(4) if pmatches.group(4) else ""
-
-            if not re.match(r'^[A-Z0-9][A-Z0-9\'._-]*$', currency) or not re.search(r'[A-Z]', currency):
-                reply(f"货币符号 '{currency}' 无效：必须全部大写，可包含数字，例如 USD、CNY、3NVD。")
-                return
-  
-            posting = {
-                "account": account,
-                "amount": amount,
-                "currency": currency,
-                "rest": rest,
-                "comment": comment.strip()
-            }
-            
-            postings.append(posting)
-            
-        appendix = jinja2.get_template("transaction.bean.j2").render(
-            date=date_str,
-            payee=payee,
-            narration=narration,
-            postings=postings,
-            tag=tag,
-            link=link,
-            datetime=datetime_str,
-        )
-    
-     
-    # upload to github
-    f = github_download_file()
-    if f:
-        if github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
-            reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
-            bot.log("Logged entry:\n" + appendix)
+def match_account(account_suffix: str, log=None) -> str | None:
+    accounts = parse_accounts()
+    suffix_lower = account_suffix.lower()
+    matches = [a for a in accounts if a.lower().endswith(suffix_lower)]
+    if not matches and log:
+        log(f"No matching account for suffix: {account_suffix}")
+        log(f"Available accounts: {accounts}")
+    return matches[0] if matches else None
 
 
-class Bot():
+class Bot:
+    def __init__(self, debug: bool = False):
+        self.update_id = 0
+        self.debug = debug
+        self.stop = threading.Event()
+        self.timezone = pytz.timezone(config["TIMEZONE"])
+        self.api_base = "https://api.telegram.org/bot{}".format(config["TELEGRAM_BOT_TOKEN"])
+
     def log(self, message):
-        print(
-            f"{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
+        print(f"{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
         if isinstance(message, str):
             print(" " + message)
         else:
             print()
             pprint(message)
 
-    def __init__(self, debug: bool = False):
-        self.update_id = 0
-        self.debug = debug
-        self.stop = threading.Event()
+    def send_message(self, chat_id, text):
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        response = requests.post(self.api_base + "/sendMessage", data=data)
+        if response.status_code != 200:
+            self.log(f"Error sending message: {response.status_code}")
+            self.log(response.text)
+        return response.json()
+
+    def github_download_file(self) -> dict | None:
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.object",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}?ref={BRANCH_NAME}"
+        r = requests.get(url=url, headers=headers)
+        if r.status_code == 200:
+            return {
+                "content": base64.b64decode(r.json()["content"]).decode("utf-8"),
+                "sha": r.json()["sha"]
+            }
+        elif r.status_code == 404:
+            self.log("File not found.")
+            return {"content": "", "sha": ""}
+        else:
+            self.log(f"Error: {r.status_code}")
+            return None
+
+    def github_upload_file(self, content: str, sha: str, commit_message: str) -> bool:
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.object",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
+        data = {
+            "message": commit_message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+            "branch": BRANCH_NAME,
+            "sha": sha
+        }
+        r = requests.put(url=url, headers=headers, json=data)
+        if r.status_code in [200, 201]:
+            return True
+        else:
+            self.log(f"Error uploading file: {r.status_code}")
+            self.log(r.text)
+            return False
+
+    def handle_message(self, message):
+        text = message["message"]["text"]
+        chat_id = message["message"]["chat"]["id"]
+
+        def reply(text: str):
+            self.send_message(chat_id, text)
+
+        if CHAT_ID and str(chat_id) != CHAT_ID:
+            self.log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
+            reply("How dare you?")
+            return
+
+        dt = datetime.now(self.timezone)
+        date_str = dt.strftime('%Y-%m-%d')
+        datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        if re.match(r'^\d{4}-\d{2}-\d{2}', text.strip()):
+            self.log("Custom date detected")
+            date_str = text.strip().splitlines()[0].strip()
+            text = '\n'.join(text.strip().splitlines()[1:]).strip()
+
+        commit_message = 'Add entry by Telegram Bot\n\n'
+        appendix = ""
+
+        if text.startswith('/'):
+            text = text[1:]
+            command = text.split(' ', 1)[0]
+            payload = text[len(command):].strip()
+            self.log(f"Command: {command}, Payload: {payload}")
+            if command == "tz":
+                if payload == 'London':
+                    self.timezone = pytz.timezone("Europe/London")
+                elif payload == 'Beijing':
+                    self.timezone = pytz.timezone("Asia/Shanghai")
+                else:
+                    try:
+                        self.timezone = pytz.timezone(payload)
+                    except pytz.UnknownTimeZoneError:
+                        reply(f"Unknown timezone: {payload}")
+                        return
+                reply(f"Timezone set to {self.timezone}")
+                reply(f"Current time: {datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                reply(f"Unknown command: {command}")
+            return
+
+        elif text.lower().startswith("open"):
+            self.log("/open command detected")
+            matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
+            if not matches or len(matches[0]) < 2:
+                reply("Invalid open command format.")
+                return
+            account = matches[0][0]
+            currency = matches[0][1]
+            appendix = jinja2.get_template("open.bean.j2").render(
+                date=date_str, account=account, currency=currency, datetime=datetime_str
+            )
+
+        elif text.lower().startswith("balance"):
+            self.log("/balance command detected")
+            matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
+            if not matches or len(matches[0]) < 3:
+                reply("Invalid balance command format.")
+                return
+            account = match_account(matches[0][0], log=self.log)
+            if not account:
+                reply(f"No matching account found for suffix: {matches[0][0]}")
+                return
+            amount = matches[0][1]
+            currency = matches[0][2]
+            appendix = jinja2.get_template("balance.bean.j2").render(
+                date=date_str, account=account, amount=amount, currency=currency, datetime=datetime_str
+            )
+
+        else:
+            self.log("Transaction detected")
+            lines = text.splitlines()
+
+            if len(lines) < 4:
+                reply("Invalid transaction format. Please provide payee, narration and two postings.")
+                return
+
+            payee = lines.pop(0).strip()
+            narration = lines.pop(0).strip()
+
+            tag = None
+            link = None
+            while lines and lines[0].strip():
+                if lines[0].startswith('#'):
+                    tag = lines.pop(0)[1:].strip()
+                elif lines[0].startswith('^'):
+                    link = lines.pop(0)[1:].strip()
+                else:
+                    break
+
+            if len(lines) < 2:
+                reply("A transaction must have at least two postings.")
+                return
+
+            postings = []
+            r_posting = r'([^\s]+)\s*(-?\d+\.?\d*)\s*([^\s]+)\s*(.*?)\s*$'
+            for posting_line in lines:
+                posting_line = posting_line.strip()
+                if not posting_line:
+                    continue
+
+                posting_str, comment = posting_line.split(';', 1) if ';' in posting_line else (posting_line, "")
+                pmatches = re.match(r_posting, posting_str)
+                if not pmatches:
+                    reply(f"Invalid posting format: {posting_str}")
+                    return
+
+                account = match_account(pmatches.group(1), log=self.log)
+                if not account:
+                    reply(f"No matching account found for suffix: {pmatches.group(1)}")
+                    return
+                if not account.startswith("Expenses") and not account.startswith("Income"):
+                    commit_message += f"{account}\n"
+
+                amount = pmatches.group(2)
+                currency = pmatches.group(3)
+                rest = pmatches.group(4) or ""
+
+                if not re.match(r'^[A-Z0-9][A-Z0-9\'._-]*$', currency) or not re.search(r'[A-Z]', currency):
+                    reply(f"货币符号 '{currency}' 无效：必须全部大写，可包含数字，例如 USD、CNY、3NVD。")
+                    return
+
+                postings.append({
+                    "account": account,
+                    "amount": amount,
+                    "currency": currency,
+                    "rest": rest,
+                    "comment": comment.strip()
+                })
+
+            appendix = jinja2.get_template("transaction.bean.j2").render(
+                date=date_str, payee=payee, narration=narration,
+                postings=postings, tag=tag, link=link, datetime=datetime_str,
+            )
+
+        f = self.github_download_file()
+        if f:
+            if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
+                reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
+                self.log("Logged entry:\n" + appendix)
 
     def get_updates(self):
-        params = {
-            "offset": self.update_id + 1,
-            "timeout": 30
-        }
+        params = {"offset": self.update_id + 1, "timeout": 30}
         try:
             loading_stop_event = threading.Event()
             loading = threading.Thread(target=rotating_loading(loading_stop_event).start)
             loading.start()
-            response = requests.get(BOT_API_BASE_URL + "/getUpdates", data=params, timeout=params["timeout"] + 1)
+            response = requests.get(self.api_base + "/getUpdates", data=params, timeout=params["timeout"] + 1)
             loading_stop_event.set()
 
             if response.status_code != 200:
@@ -346,71 +307,50 @@ class Bot():
             return {"result": []}
         return response.json()
 
-    def send_message(self, chat_id, text):
-        data = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(BOT_API_BASE_URL + "/sendMessage", data=data)
-        if response.status_code != 200:
-            self.log(f"Error sending message: {response.status_code}")
-            self.log(response.text)
-        return response.json()
-
-    def main(self, ):
+    def process_updates(self):
         updates = self.get_updates()
-        edited_message = list(
-            filter(lambda x: "edited_message" in x, updates["result"]))
-        messages = list(filter(lambda x: "message" in x, updates["result"]))
+        edited_messages = [x for x in updates["result"] if "edited_message" in x]
+        messages = [x for x in updates["result"] if "message" in x]
 
         if self.debug:
             pprint(updates)
 
-        for message in edited_message:
+        for message in edited_messages:
             self.update_id = message["update_id"]
             self.log(message)
 
         for message in messages:
-            # self.log(message)
-
             self.update_id = message["update_id"]
-
-            chat_id = message["message"]["chat"]["id"]
-            first_name = message["message"]["chat"]["first_name"] if "first_name" in message["message"]["chat"] else ""
-            last_name = message["message"]["chat"]["last_name"] if "last_name" in message["message"]["chat"] else ""
-            username = message["message"]["chat"]["username"] if "username" in message["message"]["chat"] else ""
-
-            text = message["message"]["text"] if "text" in message["message"] else None
+            chat = message["message"]["chat"]
+            chat_id = chat["id"]
+            first_name = chat.get("first_name", "")
+            last_name = chat.get("last_name", "")
+            username = chat.get("username", "")
+            text = message["message"].get("text")
 
             fmt = f"{bcolors.OKBLUE}[{chat_id}]{bcolors.ENDC} {first_name} {last_name} (@{username}):"
             if text:
-                hd = threading.Thread(target=handle_message, args=(message,))
+                hd = threading.Thread(target=self.handle_message, args=(message,))
                 hd.start()
                 if len(text.splitlines()) > 1:
                     self.log(f"{fmt} \n{text}")
                 else:
                     self.log(f"{fmt} {text}")
             else:
-                obj = {k: v for k, v in message['message'].items() if k not in [
-                    'chat', 'date', 'from', 'message_id']}
+                obj = {k: v for k, v in message['message'].items() if k not in ['chat', 'date', 'from', 'message_id']}
                 self.log(f"{fmt} {obj}")
 
     def start(self):
         while not self.stop.is_set():
-            self.main()
-            
+            self.process_updates()
+
 
 if __name__ == "__main__":
-    bot = Bot()
-
-    debug = False
-    if len(sys.argv) > 1 and sys.argv[1] == "debug":
+    debug = len(sys.argv) > 1 and sys.argv[1] == "debug"
+    bot = Bot(debug)
+    if debug:
         bot.log("Debug mode")
-        debug = True
-
     try:
-        th = Bot(debug)
-        th.start()
+        bot.start()
     except KeyboardInterrupt:
         bot.log("Exiting...")
