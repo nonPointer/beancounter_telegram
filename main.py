@@ -329,10 +329,14 @@ class Bot:
             )
 
         f = self.github_download_file()
-        if f:
-            if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
-                reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
-                self.log("Logged entry:\n" + appendix)
+        if not f:
+            reply("Failed to download from GitHub.")
+            return
+        if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
+            reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
+            self.log("Logged entry:\n" + appendix)
+        else:
+            reply("Failed to upload to GitHub.")
 
     def get_updates(self):
         params = {"offset": self.update_id + 1, "timeout": 30}
