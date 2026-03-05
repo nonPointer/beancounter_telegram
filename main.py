@@ -1,6 +1,5 @@
 import base64
 import json
-import os
 import re
 import sys
 import threading
@@ -57,15 +56,52 @@ class rotating_loading:
             print('\r \r', end='', flush=True)
 
 
+_accounts_cache = {"accounts": None, "ts": 0}
+ACCOUNTS_CACHE_TTL = 300  # seconds
+
+GITHUB_HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.object",
+    "X-GitHub-Api-Version": "2022-11-28"
+}
+
+
 def parse_accounts():
-    files = [f for f in os.listdir("./accounts") if f.endswith(".bean")]
+    now = time.time()
+    if _accounts_cache["accounts"] is not None and now - _accounts_cache["ts"] < ACCOUNTS_CACHE_TTL:
+        return _accounts_cache["accounts"]
+
+    list_headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/accounts?ref={BRANCH_NAME}"
+    r = requests.get(url, headers=list_headers)
+    if r.status_code != 200:
+        print(f"Error fetching accounts: {r.status_code}")
+        print(r.text)
+        return []
     accounts = []
-    for file in files:
-        with open(f"./accounts/{file}", "r") as f:
-            content = f.read()
-            matches = re.findall(r'\d{4}-\d{2}-\d{2} open (.*)', content)
-            accounts += [x.strip().split(" ", 1)[0] for x in matches]
-    return sorted(accounts)
+    for item in r.json():
+        if not item["name"].endswith(".bean"):
+            continue
+        file_r = requests.get(item["url"], headers=list_headers)
+        if file_r.status_code != 200:
+            continue
+        content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
+        for m in re.findall(r'\d{4}-\d{2}-\d{2} open (.*)', content):
+            accounts.append(m.strip().split(" ", 1)[0])
+        for m in re.findall(r'\d{4}-\d{2}-\d{2} close (.*)', content):
+            closed = m.strip().split(" ", 1)[0]
+            if closed in accounts:
+                accounts.remove(closed)
+
+    accounts.sort()
+    
+    _accounts_cache["accounts"] = accounts
+    _accounts_cache["ts"] = now
+    return accounts
 
 
 def match_account(account_suffix: str, log=None) -> str | None:
@@ -104,13 +140,8 @@ class Bot:
         return response.json()
 
     def github_download_file(self) -> dict | None:
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.object",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}?ref={BRANCH_NAME}"
-        r = requests.get(url=url, headers=headers)
+        r = requests.get(url=url, headers=GITHUB_HEADERS)
         if r.status_code == 200:
             return {
                 "content": base64.b64decode(r.json()["content"]).decode("utf-8"),
@@ -124,11 +155,6 @@ class Bot:
             return None
 
     def github_upload_file(self, content: str, sha: str, commit_message: str) -> bool:
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.object",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
         data = {
             "message": commit_message,
@@ -136,7 +162,7 @@ class Bot:
             "branch": BRANCH_NAME,
             "sha": sha
         }
-        r = requests.put(url=url, headers=headers, json=data)
+        r = requests.put(url=url, headers=GITHUB_HEADERS, json=data)
         if r.status_code in [200, 201]:
             return True
         else:
