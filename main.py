@@ -79,8 +79,9 @@ def parse_accounts():
     url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/accounts?ref={BRANCH_NAME}"
     r = requests.get(url, headers=list_headers)
     if r.status_code != 200:
-        print(f"Error fetching accounts: {r.status_code}")
-        print(r.text)
+        if log:
+            log(f"Error fetching accounts: {r.status_code}")
+            log(r.text)
         return []
     accounts = []
     for item in r.json():
