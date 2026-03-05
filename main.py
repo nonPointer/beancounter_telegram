@@ -40,6 +40,16 @@ class bcolors:
 print_lock = threading.Lock()
 
 
+def log(message):
+    with print_lock:
+        print(f"\r \r{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
+        if isinstance(message, str):
+            print(" " + message)
+        else:
+            print()
+            pprint(message)
+
+
 class rotating_loading:
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
@@ -66,7 +76,7 @@ GITHUB_HEADERS = {
 }
 
 
-def parse_accounts(log=None):
+def parse_accounts():
     now = time.time()
     if _accounts_cache["accounts"] is not None and now - _accounts_cache["ts"] < ACCOUNTS_CACHE_TTL:
         return _accounts_cache["accounts"]
@@ -79,9 +89,8 @@ def parse_accounts(log=None):
     url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/accounts?ref={BRANCH_NAME}"
     r = requests.get(url, headers=list_headers)
     if r.status_code != 200:
-        if log:
-            log(f"Error fetching accounts: {r.status_code}")
-            log(r.text)
+        log(f"Error fetching accounts: {r.status_code}")
+        log(r.text)
         return []
     accounts = []
     for item in r.json():
@@ -105,11 +114,11 @@ def parse_accounts(log=None):
     return accounts
 
 
-def match_account(account_suffix: str, log=None) -> str | None:
-    accounts = parse_accounts(log=log)
+def match_account(account_suffix: str) -> str | None:
+    accounts = parse_accounts()
     suffix_lower = account_suffix.lower()
     matches = [a for a in accounts if a.lower().endswith(suffix_lower)]
-    if not matches and log:
+    if not matches:
         log(f"No matching account for suffix: {account_suffix}")
         log(f"Available accounts: {accounts}")
     return matches[0] if matches else None
@@ -123,21 +132,12 @@ class Bot:
         self.timezone = pytz.timezone(config["TIMEZONE"])
         self.api_base = "https://api.telegram.org/bot{}".format(config["TELEGRAM_BOT_TOKEN"])
 
-    def log(self, message):
-        with print_lock:
-            print(f"\r \r{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
-            if isinstance(message, str):
-                print(" " + message)
-            else:
-                print()
-                pprint(message)
-
     def send_message(self, chat_id, text):
         data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
         response = requests.post(self.api_base + "/sendMessage", data=data)
         if response.status_code != 200:
-            self.log(f"Error sending message: {response.status_code}")
-            self.log(response.text)
+            log(f"Error sending message: {response.status_code}")
+            log(response.text)
         return response.json()
 
     def github_download_file(self) -> dict | None:
@@ -149,10 +149,10 @@ class Bot:
                 "sha": r.json()["sha"]
             }
         elif r.status_code == 404:
-            self.log("File not found.")
+            log("File not found.")
             return {"content": "", "sha": ""}
         else:
-            self.log(f"Error: {r.status_code}")
+            log(f"Error: {r.status_code}")
             return None
 
     def github_upload_file(self, content: str, sha: str, commit_message: str) -> bool:
@@ -167,8 +167,8 @@ class Bot:
         if r.status_code in [200, 201]:
             return True
         else:
-            self.log(f"Error uploading file: {r.status_code}")
-            self.log(r.text)
+            log(f"Error uploading file: {r.status_code}")
+            log(r.text)
             return False
 
     def handle_message(self, message):
@@ -179,7 +179,7 @@ class Bot:
             self.send_message(chat_id, text)
 
         if CHAT_ID and str(chat_id) != CHAT_ID:
-            self.log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
+            log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
             reply("How dare you?")
             return
 
@@ -188,7 +188,7 @@ class Bot:
         datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
 
         if re.match(r'^\d{4}-\d{2}-\d{2}', text.strip()):
-            self.log("Custom date detected")
+            log("Custom date detected")
             date_str = text.strip().splitlines()[0].strip()
             text = '\n'.join(text.strip().splitlines()[1:]).strip()
 
@@ -199,7 +199,7 @@ class Bot:
             text = text[1:]
             command = text.split(' ', 1)[0]
             payload = text[len(command):].strip()
-            self.log(f"Command: {command}, Payload: {payload}")
+            log(f"Command: {command}, Payload: {payload}")
             if command == "tz":
                 if payload == 'London':
                     self.timezone = pytz.timezone("Europe/London")
@@ -218,7 +218,7 @@ class Bot:
             return
 
         elif text.lower().startswith("open"):
-            self.log("/open command detected")
+            log("/open command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
             if not matches or len(matches[0]) < 2:
                 reply("Invalid open command format.")
@@ -230,12 +230,12 @@ class Bot:
             )
 
         elif text.lower().startswith("balance"):
-            self.log("/balance command detected")
+            log("/balance command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
             if not matches or len(matches[0]) < 3:
                 reply("Invalid balance command format.")
                 return
-            account = match_account(matches[0][0], log=self.log)
+            account = match_account(matches[0][0])
             if not account:
                 reply(f"No matching account found for suffix: {matches[0][0]}")
                 return
@@ -246,16 +246,16 @@ class Bot:
             )
 
         elif text.lower().startswith("pad"):
-            self.log("/pad command detected")
+            log("/pad command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
             if not matches or len(matches[0]) < 2:
                 reply("Invalid pad command format.")
                 return
-            account = match_account(matches[0][0], log=self.log)
+            account = match_account(matches[0][0])
             if not account:
                 reply(f"No matching account found for suffix: {matches[0][0]}")
                 return
-            pad_account = match_account(matches[0][1], log=self.log)
+            pad_account = match_account(matches[0][1])
             if not pad_account:
                 reply(f"No matching account found for suffix: {matches[0][1]}")
                 return
@@ -264,7 +264,7 @@ class Bot:
             )
 
         else:
-            self.log("Transaction detected")
+            log("Transaction detected")
             lines = text.splitlines()
 
             if len(lines) < 4:
@@ -301,7 +301,7 @@ class Bot:
                     reply(f"Invalid posting format: {posting_str}")
                     return
 
-                account = match_account(pmatches.group(1), log=self.log)
+                account = match_account(pmatches.group(1))
                 if not account:
                     reply(f"No matching account found for suffix: {pmatches.group(1)}")
                     return
@@ -335,7 +335,7 @@ class Bot:
             return
         if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
             reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
-            self.log("Logged entry:\n" + appendix)
+            log("Logged entry:\n" + appendix)
         else:
             reply("Failed to upload to GitHub.")
 
@@ -349,16 +349,16 @@ class Bot:
             loading_stop_event.set()
 
             if response.status_code != 200:
-                self.log(f"Error: {response.status_code}")
+                log(f"Error: {response.status_code}")
                 return {"result": []}
         except KeyboardInterrupt:
-            self.log("Got KeyboardInterrupt in Bot thread.")
+            log("Got KeyboardInterrupt in Bot thread.")
             loading_stop_event.set()
             self.stop.set()
             exit(0)
         except Exception as e:
-            self.log(e)
-            self.log("Timeout or Connection Error")
+            log(e)
+            log("Timeout or Connection Error")
             return {"result": []}
         return response.json()
 
@@ -372,7 +372,7 @@ class Bot:
 
         for message in edited_messages:
             self.update_id = message["update_id"]
-            self.log(message)
+            log(message)
 
         for message in messages:
             self.update_id = message["update_id"]
@@ -388,12 +388,12 @@ class Bot:
                 hd = threading.Thread(target=self.handle_message, args=(message,))
                 hd.start()
                 if len(text.splitlines()) > 1:
-                    self.log(f"{fmt} \n{text}")
+                    log(f"{fmt} \n{text}")
                 else:
-                    self.log(f"{fmt} {text}")
+                    log(f"{fmt} {text}")
             else:
                 obj = {k: v for k, v in message['message'].items() if k not in ['chat', 'date', 'from', 'message_id']}
-                self.log(f"{fmt} {obj}")
+                log(f"{fmt} {obj}")
 
     def start(self):
         while not self.stop.is_set():
@@ -404,8 +404,8 @@ if __name__ == "__main__":
     debug = len(sys.argv) > 1 and sys.argv[1] == "debug"
     bot = Bot(debug)
     if debug:
-        bot.log("Debug mode")
+        log("Debug mode")
     try:
         bot.start()
     except KeyboardInterrupt:
-        bot.log("Exiting...")
+        log("Exiting...")
