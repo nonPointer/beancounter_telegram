@@ -66,7 +66,7 @@ GITHUB_HEADERS = {
 }
 
 
-def parse_accounts():
+def parse_accounts(log=None):
     now = time.time()
     if _accounts_cache["accounts"] is not None and now - _accounts_cache["ts"] < ACCOUNTS_CACHE_TTL:
         return _accounts_cache["accounts"]
@@ -106,7 +106,7 @@ def parse_accounts():
 
 
 def match_account(account_suffix: str, log=None) -> str | None:
-    accounts = parse_accounts()
+    accounts = parse_accounts(log=log)
     suffix_lower = account_suffix.lower()
     matches = [a for a in accounts if a.lower().endswith(suffix_lower)]
     if not matches and log:
