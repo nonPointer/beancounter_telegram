@@ -324,6 +324,25 @@ class Bot:
                     "comment": comment.strip()
                 })
 
+            if len(postings) == 2:
+                a0, a1 = float(postings[0]["amount"]), float(postings[1]["amount"])
+                c0, c1 = postings[0]["currency"], postings[1]["currency"]
+                r0, r1 = postings[0]["rest"], postings[1]["rest"]
+
+                if a0 * a1 >= 0:
+                    reply("两条 posting 必须一正一负。")
+                    return
+
+                if c0 == c1:
+                    if a0 + a1 != 0:
+                        reply(f"同币种 {c0} 的两条 posting 金额不平衡：{a0} + {a1} != 0")
+                        return
+                else:
+                    has_cost_or_price = any(('@' in r or '{' in r) for r in [r0, r1])
+                    if not has_cost_or_price:
+                        reply(f"不同币种 ({c0}/{c1}) 的交易需要标记成本 {{}} 或价格 @。")
+                        return
+
             appendix = jinja2.get_template("transaction.bean.j2").render(
                 date=date_str, payee=payee, narration=narration,
                 postings=postings, tag=tag, link=link, datetime=datetime_str,
