@@ -21,8 +21,7 @@
 
 ## 功能
 
-- [x] `open`
-- [x] `balance`
+- [x] `open`, `balance`, `pad`
 - [x] 记账，根据后缀自动匹配对应账户
 - [ ] 记账时自动补全货币
 - [x] `/tz <timezone>` 设置时区
@@ -41,6 +40,12 @@
 
   ```
   balance Alipay 200 CNY
+  ```
+
+- pad
+
+  ```
+  pad Alipay Opening-Balances
   ```
 
 - 记账：date、link 和 tag 可选。

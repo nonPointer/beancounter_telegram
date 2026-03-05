@@ -38,6 +38,9 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 
+print_lock = threading.Lock()
+
+
 class rotating_loading:
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
@@ -45,11 +48,13 @@ class rotating_loading:
     def start(self):
         symbols = ['/', '-', '\\', '|']
         duration = 0.2
-        while not self.stop_event.is_set():
-            for symbol in symbols:
-                print('\r' + symbol, end='', flush=True)
-                time.sleep(duration)
-        print("\r", end='')
+        i = 0
+        while not self.stop_event.wait(duration):
+            with print_lock:
+                print('\r' + symbols[i % len(symbols)], end='', flush=True)
+            i += 1
+        with print_lock:
+            print('\r \r', end='', flush=True)
 
 
 def parse_accounts():
@@ -82,12 +87,13 @@ class Bot:
         self.api_base = "https://api.telegram.org/bot{}".format(config["TELEGRAM_BOT_TOKEN"])
 
     def log(self, message):
-        print(f"{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
-        if isinstance(message, str):
-            print(" " + message)
-        else:
-            print()
-            pprint(message)
+        with print_lock:
+            print(f"\r \r{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
+            if isinstance(message, str):
+                print(" " + message)
+            else:
+                print()
+                pprint(message)
 
     def send_message(self, chat_id, text):
         data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -210,6 +216,24 @@ class Bot:
             currency = matches[0][2]
             appendix = jinja2.get_template("balance.bean.j2").render(
                 date=date_str, account=account, amount=amount, currency=currency, datetime=datetime_str
+            )
+
+        elif text.lower().startswith("pad"):
+            self.log("/pad command detected")
+            matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
+            if not matches or len(matches[0]) < 2:
+                reply("Invalid pad command format.")
+                return
+            account = match_account(matches[0][0], log=self.log)
+            if not account:
+                reply(f"No matching account found for suffix: {matches[0][0]}")
+                return
+            pad_account = match_account(matches[0][1], log=self.log)
+            if not pad_account:
+                reply(f"No matching account found for suffix: {matches[0][1]}")
+                return
+            appendix = jinja2.get_template("pad.bean.j2").render(
+                date=date_str, account=account, pad_account=pad_account, datetime=datetime_str
             )
 
         else:
