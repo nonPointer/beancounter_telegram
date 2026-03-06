@@ -357,6 +357,8 @@ class Bot:
             "Treat 'wechat' (or 微信) as a valid account hint and map it to a matching account from the list. "
             "If user input does not clearly provide at least one account name/suffix, do NOT create a transaction; "
             "instead output exactly one plain text line starting with 'NEED_ACCOUNT:' and explain what account is missing and ask user to edit the input. "
+            "For the transaction header, payee must be the merchant/service target, not the payment channel. "
+            "Example: for '微信充值原神', use payee '原神' (not '微信充值原神'). "
             "Write the transaction narration (the second quoted string on the header line) in Chinese, unless the user's input is in English. "
             "Capitalise the first letter of each word in person names (e.g. 'john wick' → 'John Wick'). "
             "In most cases, each transaction should have exactly two postings: one negative and one positive. "
