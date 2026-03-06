@@ -492,7 +492,6 @@ class Bot:
         return {
             "inline_keyboard": [[
                 {"text": "✅", "callback_data": f"approve:{pending_id}"},
-                {"text": "❌", "callback_data": f"decline:{pending_id}"},
                 {"text": "🔧", "callback_data": f"decline_reason:{pending_id}"},
                 {"text": "🗑️", "callback_data": f"discard:{pending_id}"},
             ]]
@@ -549,7 +548,7 @@ class Bot:
                 chat_id,
                 "LLM rechecked draft:\n"
                 f"<pre><code>{html.escape(new_appendix)}</code></pre>\n"
-                "Use ✅ to save, ❌ to recheck, 🔧 to provide feedback, or 🗑️ to discard.",
+                "Use ✅ to save, 🔧 to provide feedback, or 🗑️ to discard.",
                 reply_markup=self.build_review_buttons(new_pending_id),
                 parse_mode="HTML",
             )
@@ -593,16 +592,6 @@ class Bot:
             return
 
         self.edit_message_reply_markup(chat_id, message_id)
-
-        if action == "decline":
-            if not self.llm_enabled:
-                self.answer_callback_query(callback_id, "LLM unavailable")
-                self.send_message(chat_id, self.llm_unavailable_message())
-                return
-
-            self.answer_callback_query(callback_id, "Rechecking")
-            self.run_recheck(chat_id, pending_id)
-            return
 
         if action == "decline_reason":
             if not self.llm_enabled:
@@ -847,7 +836,7 @@ class Bot:
                     chat_id,
                     "LLM draft (checked padding):\n"
                     f"<pre><code>{html.escape(appendix)}</code></pre>\n"
-                    "Use ✅ to save, ❌ to recheck, 🔧 to provide feedback, or 🗑️ to discard.",
+                    "Use ✅ to save, 🔧 to provide feedback, or 🗑️ to discard.",
                     reply_markup=self.build_review_buttons(pending_id),
                     parse_mode="HTML",
                 )
