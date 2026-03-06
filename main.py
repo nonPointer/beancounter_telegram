@@ -261,6 +261,12 @@ class Bot:
         if len(postings) < 2:
             raise ValueError("LLM output must contain at least two postings.")
 
+        currencies = set(p["currency"] for p in postings)
+        if len(currencies) == 1:
+            total = sum(float(p["amount"]) for p in postings)
+            if abs(total) > 0.0001:
+                raise ValueError(f"LLM output invalid: postings do not balance (sum = {total:.4f}).")
+
         if len(postings) == 2:
             a0 = float(postings[0]["amount"])
             a1 = float(postings[1]["amount"])
@@ -367,6 +373,8 @@ class Bot:
             "Write the transaction narration (the second quoted string on the header line) in Chinese, unless the user's input is in English. "
             "Capitalise the first letter of each word in person names (e.g. 'john wick' → 'John Wick'). "
             "In most cases, each transaction should have exactly two postings: one negative and one positive. "
+            "NEVER generate an internal transfer within the same payment platform as part of a simple expense (e.g. do NOT add Assets:WeChat:Current as both debit and credit). "
+            "For a simple payment via WeChat/Alipay, use exactly one debit posting on the payment account and one credit posting on the Expenses account. "
             "When you pay the full amount for a split bill and others transfer their shares back to you, record it in ONE balanced transaction: "
             "the full payment as a negative on the paying account, the transfers received back as positive(s) on the receiving account, and the Expenses posting = total paid minus total received back (your net share only). "
             "The transaction MUST sum to zero — compute Expenses as the residual. "
