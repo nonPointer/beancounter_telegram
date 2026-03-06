@@ -22,6 +22,7 @@
 ## 功能
 
 - [x] `open`, `balance`, `pad`
+- [x] `/update [account] [account for pad] [amount] [currency]`：修正账户余额，今天插入 `pad`，明天插入 `balance`
 - [x] 记账，根据后缀自动匹配对应账户（账户列表自动从仓库 `/accounts/*.bean` 中解析 `open` 指令获取）
 - [ ] 记账时自动补全货币
 - [x] `/tz <timezone>` 设置时区
@@ -71,4 +72,10 @@
 
   ```
   /tz Asia/Shanghai
+  ```
+
+- update（今天插入 pad，明天插入 balance）
+
+  ```
+  /update Alipay Food 200 CNY
   ```

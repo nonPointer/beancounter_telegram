@@ -4,7 +4,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pprint import pprint
 
 import pytz
@@ -213,9 +213,44 @@ class Bot:
                         return
                 reply(f"Timezone set to {self.timezone}")
                 reply(f"Current time: {datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')}")
+                return
+            elif command == "update":
+                parts = payload.split()
+                if len(parts) != 4:
+                    reply("Invalid update command format. Use: /update [account] [account for pad] [amount] [currency]")
+                    return
+
+                account = match_account(parts[0])
+                if not account:
+                    reply(f"No matching account found for suffix: {parts[0]}")
+                    return
+                if not account.startswith("Expenses") and not account.startswith("Income"):
+                    commit_message += f"{account}\n"
+
+                pad_account = match_account(parts[1])
+                if not pad_account:
+                    reply(f"No matching account found for suffix: {parts[1]}")
+                    return
+
+                amount = parts[2]
+                currency = parts[3]
+
+                try:
+                    today_date = datetime.strptime(date_str, '%Y-%m-%d')
+                    tomorrow_date = (today_date + timedelta(days=1)).strftime('%Y-%m-%d')
+                except ValueError:
+                    tomorrow_date = (dt + timedelta(days=1)).strftime('%Y-%m-%d')
+
+                pad_appendix = jinja2.get_template("pad.bean.j2").render(
+                    date=date_str, account=account, pad_account=pad_account, datetime=datetime_str
+                )
+                balance_appendix = jinja2.get_template("balance.bean.j2").render(
+                    date=tomorrow_date, account=account, amount=amount, currency=currency, datetime=datetime_str
+                )
+                appendix = pad_appendix + "\n\n" + balance_appendix
             else:
                 reply(f"Unknown command: {command}")
-            return
+                return
 
         elif text.lower().startswith("open"):
             log("/open command detected")
