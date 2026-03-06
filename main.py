@@ -501,7 +501,7 @@ class Bot:
             "inline_keyboard": [[
                 {"text": "✅", "callback_data": f"approve:{pending_id}"},
                 {"text": "🔧", "callback_data": f"decline_reason:{pending_id}"},
-                {"text": "🗑️", "callback_data": f"discard:{pending_id}"},
+                {"text": "❌", "callback_data": f"discard:{pending_id}"},
             ]]
         }
 
@@ -556,7 +556,7 @@ class Bot:
                 chat_id,
                 "LLM rechecked draft:\n"
                 f"<pre><code>{html.escape(new_appendix)}</code></pre>\n"
-                "Use ✅ to save, 🔧 to provide feedback, or 🗑️ to discard.",
+                "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
                 reply_markup=self.build_review_buttons(new_pending_id),
                 parse_mode="HTML",
             )
@@ -844,7 +844,7 @@ class Bot:
                     chat_id,
                     "LLM draft (checked padding):\n"
                     f"<pre><code>{html.escape(appendix)}</code></pre>\n"
-                    "Use ✅ to save, 🔧 to provide feedback, or 🗑️ to discard.",
+                    "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
                     reply_markup=self.build_review_buttons(pending_id),
                     parse_mode="HTML",
                 )
