@@ -11,9 +11,13 @@
   ```
 
 - 配置
-  - 在 `config.yaml` 中填写 Telegram 机器人的 Token、Github 仓库信息和你的 Chat ID。
-  - 你可以通过 [BotFather](https://core.telegram.org/bots) 创建一个新的 Telegram 机器人，并获取 Token。
-  - 你可以通过向你的机器人发送一条消息，然后访问 `https://api.telegram.org/bot<YourBOTToken>/getUpdates` 来获取你的 Chat ID。
+  - 复制 `config.json.example` 为 `config.json`，填写以下字段：
+    - `TELEGRAM_BOT_TOKEN`：通过 [BotFather](https://core.telegram.org/bots) 创建机器人并获取
+    - `GITHUB_TOKEN`、`REPO_OWNER`、`REPO_NAME`、`BRANCH_NAME`、`FILE_PATH`：目标仓库信息
+    - `CHAT_ID`：向机器人发一条消息后访问 `https://api.telegram.org/bot<TOKEN>/getUpdates` 获取
+    - `TIMEZONE`：时区，如 `Asia/Shanghai`、`Europe/London`
+    - `LLM_API_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`：兼容 OpenAI API 的 LLM，用于自然语言记账（可选）
+
 - 运行
   ```bash
   python main.py
@@ -21,13 +25,41 @@
 
 ## 功能
 
-- [x] `open`, `balance`, `pad`
+- [x] `open`、`balance`、`pad` 指令
 - [x] `/update [account] [account for pad] [amount] [currency]`：修正账户余额，今天插入 `pad`，明天插入 `balance`
-- [x] 记账，根据后缀自动匹配对应账户（账户列表自动从仓库 `/accounts/*.bean` 中解析 `open` 指令获取）
-- [ ] 记账时自动补全货币
+- [x] 手动记账，根据后缀自动匹配对应账户（账户列表自动从仓库 `/accounts/*.bean` 中解析 `open` 指令获取）
 - [x] `/tz <timezone>` 设置时区
+- [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
 - [ ] `/view [date]` 查看指定日期的记账记录
-- [ ] 终极懒鬼：让 LLM 来解析自然语言的记账内容
+
+## LLM 自然语言记账
+
+发送一行自然语言描述，机器人会调用 LLM 生成草稿并发送审核按钮：
+
+| 按钮 | 操作 |
+|------|------|
+| ✅ | 保存到仓库 |
+| 🔧 | 输入反馈后重新生成 |
+| 🗑️ | 丢弃 |
+
+**支持的输入示例：**
+
+```
+KFC 花了 20 GBP 微信支付
+```
+```
+和 John Wick 吃饭 96 GBP，他转给我 48
+```
+```
+支付宝买了杯咖啡 35
+```
+
+**规则说明：**
+- 单行文本自动走 LLM 流程；多行文本走手动记账流程
+- 未说明货币时，若全文只出现一种货币则以此为默认
+- 未说明支付方式时，默认使用微信/支付宝余额账户（非理财子账户）
+- 分摊消费：付全款、他人转账回来的金额从支付账户正向抵消，`Expenses` 仅记录自己的净份额
+- 人名默认首字母大写；narration 默认中文（英文输入时用英文）
 
 # Example
 
@@ -49,7 +81,7 @@
   pad Alipay Opening-Balances
   ```
 
-- 记账：date、link 和 tag 可选。
+- 手动记账：date、link 和 tag 可选。
 
   ```
   KFC
@@ -60,7 +92,7 @@
   WeChat -20 CNY
   ```
 
-- 记账：当没有 payee，仅 narration 时，填写 payee，将 narration 留空。
+- 手动记账：当没有 payee，仅 narration 时，填写 payee，将 narration 留空。
 
   ```
   test only narration
@@ -68,6 +100,7 @@
   HSBC:current 200 GBP
   assets:cash -200 GBP
   ```
+
 - 设置时区
 
   ```
