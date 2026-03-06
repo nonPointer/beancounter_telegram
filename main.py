@@ -136,6 +136,9 @@ class Bot:
         if not text:
             return False
 
+        if "微信" in user_input or "wechat" in text:
+            return True
+
         # Explicit beancount-like account path in free text.
         if re.search(r'\b[A-Z][A-Za-z0-9_-]*:[A-Za-z0-9_:-]+\b', user_input):
             return True
@@ -351,6 +354,7 @@ class Bot:
             "Convert user natural language to ONE beancount entry. "
             "Use only accounts from the provided account list. "
             "Treat 'cash' (or 现金) as a valid account hint and map it to a cash account from the list (for example Assets:Cash). "
+            "Treat 'wechat' (or 微信) as a valid account hint and map it to a matching account from the list. "
             "If user input does not clearly provide at least one account name/suffix, do NOT create a transaction; "
             "instead output exactly one plain text line starting with 'NEED_ACCOUNT:' and explain what account is missing and ask user to edit the input. "
             "Write the transaction narration (the second quoted string on the header line) in Chinese, unless the user's input is in English. "
