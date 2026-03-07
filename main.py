@@ -524,6 +524,7 @@ class Bot:
             }
             self.pending_llm_entries.pop(pending_id, None)
 
+            log("LLM rechecked draft:\n" + new_appendix)
             self.send_message(
                 chat_id,
                 "LLM rechecked draft:\n"
@@ -574,6 +575,7 @@ class Bot:
         self.edit_message_reply_markup(chat_id, message_id)
 
         if action == "decline_reason":
+            log(f"User requested recheck for pending {pending_id}")
             if not self.llm_enabled:
                 self.answer_callback_query(callback_id, "LLM unavailable")
                 self.send_message(chat_id, self.llm_unavailable_message())
@@ -585,6 +587,7 @@ class Bot:
             return
 
         if action == "discard":
+            log(f"User discarded pending {pending_id}")
             self.pending_llm_entries.pop(pending_id, None)
             self.answer_callback_query(callback_id, "Discarded")
             self.send_message(chat_id, "Discarded. Entry was not saved.")
@@ -594,6 +597,7 @@ class Bot:
             self.answer_callback_query(callback_id, "Unknown action")
             return
 
+        log(f"User approved pending {pending_id}")
         f = self.github_download_file()
         if not f:
             self.answer_callback_query(callback_id, "Failed")
@@ -840,6 +844,7 @@ class Bot:
                     "date_str": date_str,
                 }
 
+                log("LLM draft:\n" + appendix)
                 self.send_message(
                     chat_id,
                     "LLM draft (checked padding):\n"
