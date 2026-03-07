@@ -12,6 +12,8 @@ import pytz
 import requests
 from jinja2 import Environment, FileSystemLoader
 
+from prompts import BEANCOUNT_SYSTEM_PROMPT, build_user_prompt
+
 with open("config.json", "r") as f:
     config = json.load(f)
 
@@ -213,10 +215,12 @@ class Bot:
         if account.lower() in accounts_by_lower:
             return accounts_by_lower[account.lower()]
 
-        if ":current" not in account.lower():
-            current_candidate = f"{account}:Current"
-            if current_candidate.lower() in accounts_by_lower:
-                return accounts_by_lower[current_candidate.lower()]
+        # Don't add :Current suffix for Liabilities accounts (credit cards)
+        if not account.lower().startswith("liabilities:"):
+            if ":current" not in account.lower():
+                current_candidate = f"{account}:Current"
+                if current_candidate.lower() in accounts_by_lower:
+                    return accounts_by_lower[current_candidate.lower()]
 
         return account
 
@@ -355,60 +359,8 @@ class Bot:
             raise ValueError(self.llm_unavailable_message())
 
         url = f"{LLM_API_BASE_URL}/chat/completions"
-        system_prompt = (
-            "You are a Beancount assistant. "
-            "Convert user natural language to ONE beancount entry. "
-            "Use only accounts from the provided account list. "
-            "Treat common payment method names as account hints and map them to the best matching Assets account from the list: "
-            "'cash' / 现金 → cash account (e.g. Assets:Cash); "
-            "'wechat' / 微信 / 微信支付 → WeChat Pay account; "
-            "'alipay' / 支付宝 → Alipay account; "
-            "'card' / 刷卡 / 银行卡 → bank or card account. "
-            "If the account list contains partial matches (e.g. 'Alipay', 'WeChat', 'WechatPay'), prefer the closest match. "
-            "When no payment method is mentioned, default to the WeChat Pay or Alipay current/balance account (e.g. :Current or :Balance), NOT investment sub-accounts such as 余额宝 or any account containing 'Fund', 'Investment', or '理财'. "
-            "If user input does not clearly provide at least one account name/suffix, do NOT create a transaction; "
-            "instead output exactly one plain text line starting with 'NEED_ACCOUNT:' and explain what account is missing and ask user to edit the input. "
-            "For the transaction header, payee must be the merchant/service target, not the payment channel. "
-            "Example: for '微信充值原神', use payee '原神' (not '微信充值原神'). "
-            "Write the transaction narration (the second quoted string on the header line) in Chinese, unless the user's input is in English. "
-            "Capitalise the first letter of each word in person names (e.g. 'john wick' → 'John Wick'). "
-            "CRITICAL: For internal transfers BETWEEN ASSETS ACCOUNTS (e.g., '转账', 'transfer', moving money from one bank to another), generate EXACTLY TWO postings: one negative from the source Assets account and one positive to the destination Assets account. "
-            "DO NOT add any Expenses or Income accounts for pure asset transfers. Asset transfers are zero-sum: one account decreases, another increases by the same amount. "
-            "For transfers between the user's OWN accounts (e.g., 'chase转给globalmoney', 'alipay转到wechat'), use the single-string header format without payee: 'YYYY-MM-DD * \"转账\"' or 'YYYY-MM-DD * \"Transfer\"'. "
-            "For transfers TO ANOTHER PERSON (e.g., '转账给张三', 'transfer to John'), include the recipient's name as payee: 'YYYY-MM-DD * \"Zhang San\" \"转账\"' or 'YYYY-MM-DD * \"John\" \"Transfer\"'. "
-            "In most cases, each transaction should have exactly two postings: one negative and one positive. "
-            "NEVER generate an internal transfer within the same payment platform as part of a simple expense (e.g. do NOT add Assets:WeChat:Current as both debit and credit). "
-            "For a simple payment via WeChat/Alipay, use exactly one debit posting on the payment account and one credit posting on the Expenses account. "
-            "When you pay the full amount for a split bill and others transfer their shares back to you, record it in ONE balanced transaction: "
-            "the full payment as a negative on the paying account, the transfers received back as positive(s) on the receiving account, and the Expenses posting = total paid minus total received back (your net share only). "
-            "The transaction MUST sum to zero — compute Expenses as the residual. "
-            "If the user says each person transfers N, use one posting of N per person (not a consolidated sum). "
-            "When a person's name is associated with a specific posting (e.g. they transferred that amount), add their name as a inline comment on that posting line using ';'. "
-            "Example: you pay 84 GBP for 4 people; A, B, C each transfer 21 GBP back — postings are: Assets:Bank -84 GBP, Assets:Bank 21 GBP ; A, Assets:Bank 21 GBP ; B, Assets:Bank 21 GBP ; C, Expenses:Food 21 GBP (= 84 - 3×21). "
-            "If only a total transfer amount is given, one consolidated posting is fine. "
-            "WRONG: Expenses:Food 84 GBP with Assets:Bank 63 GBP does NOT balance and is incorrect. "
-            "Never use Income or Assets:Receivable for money transferred back from a split expense. "
-            "If only one currency appears in the user's input, treat it as the default currency for all amounts in the transaction. "
-            "Use ISO currency code CNY (not RMB) for Chinese Yuan. "
-            "Prefer matching Expenses/Income/Assets/Liabilities accounts based on intent. "
-            "When both parent account and ':Current' child are plausible for payment/deduction, always use the ':Current' account if it exists. "
-            "For currency conversion, detect the implied FX rate from amounts and include cost/price using '@' or '@@'. "
-            "Output beancount text only, no markdown, no explanations.\n\n"
-            "Use this posting style (replace MerchantName and Description with actual values):\n"
-            "YYYY-MM-DD * \"MerchantName\" \"Description\"\n"
-            "  Account:Name  -10 USD\n"
-            "  Account:Other  10 USD\n"
-        )
-        user_prompt = (
-            f"Transaction date is {txn_date}. Use this exact date in the output.\n"
-            "Account list:\n"
-            + "\n".join(accounts)
-            + "\n\n"
-            f"User input: {user_input}\n"
-            + (f"Previous declined draft:\n{previous_draft}\n\n" if previous_draft else "")
-            + (f"Decline reason from user:\n{decline_reason}\n\n" if decline_reason else "")
-            + "Generate a valid, balanced beancount transaction."
-        )
+        system_prompt = BEANCOUNT_SYSTEM_PROMPT
+        user_prompt = build_user_prompt(txn_date, accounts, user_input, previous_draft, decline_reason)
 
         payload = {
             "model": LLM_MODEL,
