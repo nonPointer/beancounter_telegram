@@ -36,7 +36,7 @@
 - [x] 手动记账，根据后缀自动匹配对应账户（账户列表自动从仓库 `/accounts/*.bean` 中解析 `open` 指令获取）
 - [x] `/tz <timezone>` 设置时区
 - [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
-- [ ] `/view [date]` 查看指定日期的记账记录
+- [x] `/view` 触发当月 Sankey 图生成（调用账本仓库的 `monthly-report.yml` workflow）
 
 ## LLM 自然语言记账
 
