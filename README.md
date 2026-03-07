@@ -127,3 +127,9 @@ YYYY-MM-DD * "咖啡店" "咖啡"
   ```
   /update Alipay Food 200 CNY
   ```
+
+- 触发当月 Sankey 报告生成
+
+  ```
+  /view
+  ```
