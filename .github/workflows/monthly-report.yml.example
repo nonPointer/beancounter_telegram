@@ -1,0 +1,127 @@
+name: monthly report
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 08:00 UTC = 08:00 GMT (winter) / 09:00 BST (summer)
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/monthly-report.yml"
+  workflow_dispatch:
+    inputs:
+      year_month:
+        description: "Month to report (YYYY-MM), defaults to current month"
+        required: false
+        default: ""
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --user beanquery
+          npm install -g @mermaid-js/mermaid-cli
+
+      - name: Compute month range
+        id: daterange
+        run: |
+          if [ -n "${{ github.event.inputs.year_month }}" ]; then
+            FIRST_DAY="${{ github.event.inputs.year_month }}-01"
+          else
+            FIRST_DAY="$(date -u +'%Y-%m-01')"
+          fi
+          NEXT_MONTH="$(date -u -d "$FIRST_DAY +1 month" +'%Y-%m-01')"
+          MONTH_LABEL="$(date -u -d "$FIRST_DAY" +'%Y-%m')"
+          echo "first_day=$FIRST_DAY" >> "$GITHUB_OUTPUT"
+          echo "next_month=$NEXT_MONTH" >> "$GITHUB_OUTPUT"
+          echo "month_label=$MONTH_LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Sankey PNG
+        id: sankey
+        env:
+          FIRST_DAY: ${{ steps.daterange.outputs.first_day }}
+          NEXT_MONTH: ${{ steps.daterange.outputs.next_month }}
+        run: |
+          set -euo pipefail
+
+          python3 << 'PYEOF'
+          import subprocess, re, os, sys, json
+
+          first_day = os.environ['FIRST_DAY']
+          next_month = os.environ['NEXT_MONTH']
+
+          def run_query(q):
+              r = subprocess.run(
+                  ['bean-query', '-q', 'main.bean', q],
+                  capture_output=True, text=True
+              )
+              return r.stdout
+
+          GBP_PER_CNY = 1 / 9  # 1 GBP = 9 CNY
+
+          def to_gbp(amount, currency):
+              if currency == 'CNY':
+                  return amount * GBP_PER_CNY
+              return amount
+
+          def parse_amounts(output):
+              totals = {}
+              for line in output.strip().split('\n')[2:]:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  m = re.match(r'(\S+)\s+(-?[\d,]+\.?\d*)\s+([A-Z]+)', line)
+                  if m:
+                      account = m.group(1)
+                      amount = float(m.group(2).replace(',', ''))
+                      currency = m.group(3)
+                      totals[account] = totals.get(account, 0) + to_gbp(amount, currency)
+              return totals
+
+          expense_data = {k: v for k, v in parse_amounts(run_query(
+              f"SELECT account, cost(sum(position)) "
+              f"WHERE account ~ '^Expenses:' AND date >= {first_day} AND date < {next_month} "
+              f"GROUP BY account ORDER BY account"
+          )).items() if v > 0}
+
+          if not expense_data:
+              print("No expense data, skipping.")
+              sys.exit(0)
+
+          rows = []
+          for account, amount in sorted(expense_data.items()):
+              name = account.replace('Expenses:', '', 1)
+              rows.append(f'"Expenses (GBP)","{name}",{amount:.0f}')
+
+          mermaid_code = 'sankey-beta\n\n' + '\n'.join(rows)
+          print("Mermaid:\n" + mermaid_code)
+
+          with open('/tmp/sankey.mmd', 'w') as f:
+              f.write(mermaid_code)
+
+          with open('/tmp/puppeteer-config.json', 'w') as f:
+              json.dump({'args': ['--no-sandbox', '--disable-setuid-sandbox']}, f)
+          PYEOF
+
+          if [ -f /tmp/sankey.mmd ]; then
+            mmdc -i /tmp/sankey.mmd -o /tmp/sankey.png \
+              -p /tmp/puppeteer-config.json \
+              --width 900 --height 600
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Sankey to Telegram
+        if: steps.sankey.outputs.generated == 'true'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MONTH_LABEL: ${{ steps.daterange.outputs.month_label }}
+        run: |
+          curl -sS -X POST \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "photo=@/tmp/sankey.png" \
+            -F "caption=Monthly Expenses — ${MONTH_LABEL} (GBP, 1 GBP = 9 CNY)" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto" | jq

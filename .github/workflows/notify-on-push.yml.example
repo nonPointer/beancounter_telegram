@@ -1,0 +1,74 @@
+name: notify on push
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  notify-on-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: python3 -m pip install --user beanquery
+
+      - name: Compute current month range
+        id: daterange
+        run: |
+          FIRST_DAY="$(date -u +'%Y-%m-01')"
+          NEXT_MONTH="$(date -u -d "$(date -u +'%Y-%m-01') +1 month" +'%Y-%m-01')"
+          echo "first_day=$FIRST_DAY" >> "$GITHUB_OUTPUT"
+          echo "next_month=$NEXT_MONTH" >> "$GITHUB_OUTPUT"
+
+      - name: Notify monthly expenses
+        env:
+          FIRST_DAY: ${{ steps.daterange.outputs.first_day }}
+          NEXT_MONTH: ${{ steps.daterange.outputs.next_month }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          BREAKDOWN=$(bean-query -q main.bean \
+            "SELECT account, cost(sum(position))
+             WHERE account ~ '^Expenses:' AND date >= $FIRST_DAY AND date < $NEXT_MONTH
+             GROUP BY account ORDER BY account" \
+            | sed 's/Expenses://g')
+
+          TOTAL=$(bean-query -q main.bean \
+            "SELECT cost(sum(position))
+             WHERE account ~ '^Expenses:' AND date >= $FIRST_DAY AND date < $NEXT_MONTH")
+
+          MSG=$(printf '```\n%s\n---\nTotal: %s\n```' "$BREAKDOWN" "$TOTAL")
+
+          curl -sS -X POST \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=$MSG" \
+            --data-urlencode "parse_mode=Markdown" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" | jq
+
+      - name: Notify account balances
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          LEDGER="main.bean"
+          OUTPUT=""
+
+          while IFS= read -r account; do
+            [[ -z "$account" ]] && continue
+            BALANCE=$(bean-query -q "$LEDGER" \
+              "SELECT sum(position) WHERE account = '$account'")
+            OUTPUT="${OUTPUT}${account}: ${BALANCE}\n"
+          done < <(git log -1 --pretty=%b | sed '/^\s*$/d')
+
+          MSG=$(printf '```\n%b```' "$OUTPUT")
+
+          curl -sS -X POST \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=$MSG" \
+            --data-urlencode "parse_mode=Markdown" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" | jq
