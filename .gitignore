@@ -212,4 +212,4 @@ __marimo__/
 accounts/*
 config.json
 .dev.vars
-node_modules/
+node_modules/.cspell.json
