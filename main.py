@@ -643,8 +643,8 @@ class Bot:
             self.answer_callback_query(callback_id, "Failed")
             self.send_message(chat_id, "Failed to upload to GitHub.")
 
-    def github_download_file(self) -> dict | None:
-        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}?ref={BRANCH_NAME}"
+    def github_download_file(self, file_path: str = FILE_PATH) -> dict | None:
+        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{file_path}?ref={BRANCH_NAME}"
         r = requests.get(url=url, headers=GITHUB_HEADERS)
         if r.status_code == 200:
             return {
@@ -658,14 +658,15 @@ class Bot:
             log(f"Error: {r.status_code}")
             return None
 
-    def github_upload_file(self, content: str, sha: str, commit_message: str) -> bool:
-        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
+    def github_upload_file(self, content: str, sha: str, commit_message: str, file_path: str = FILE_PATH) -> bool:
+        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{file_path}"
         data = {
             "message": commit_message,
             "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
             "branch": BRANCH_NAME,
-            "sha": sha
         }
+        if sha:
+            data["sha"] = sha
         r = requests.put(url=url, headers=GITHUB_HEADERS, json=data)
         if r.status_code in [200, 201]:
             return True
@@ -709,6 +710,7 @@ class Bot:
 
         commit_message = 'Add entry by Telegram Bot\n\n'
         appendix = ""
+        target_file_path = FILE_PATH
 
         if text.startswith('/'):
             text = text[1:]
@@ -775,6 +777,15 @@ class Bot:
                 return
             account = matches[0][0]
             currency = matches[0][1]
+            account_type_map = {
+                "assets": "accounts/assets.bean",
+                "liabilities": "accounts/liabilities.bean",
+                "equity": "accounts/equity.bean",
+                "income": "accounts/income.bean",
+                "expenses": "accounts/expenses.bean",
+            }
+            prefix = account.split(":")[0].lower()
+            target_file_path = account_type_map.get(prefix, FILE_PATH)
             appendix = jinja2.get_template("open.bean.j2").render(
                 date=date_str, account=account, currency=currency, datetime=datetime_str
             )
@@ -943,12 +954,16 @@ class Bot:
                 postings=postings, tag=tag, link=link, datetime=datetime_str,
             )
 
-        f = self.github_download_file()
+        f = self.github_download_file(target_file_path)
         if not f:
             reply("Failed to download from GitHub.")
             return
-        if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip()):
-            reply("Created entry" + (f":\n```beancount\n{appendix}```" if appendix else ""))
+        if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip(), target_file_path):
+            self.send_message(
+                chat_id,
+                f"Created entry:\n<pre><code>{html.escape(appendix)}</code></pre>" if appendix else "Created entry",
+                parse_mode="HTML",
+            )
             log("Logged entry:\n" + appendix)
         else:
             reply("Failed to upload to GitHub.")
