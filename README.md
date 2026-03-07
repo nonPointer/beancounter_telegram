@@ -38,6 +38,28 @@
 - [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
 - [x] `/view` 触发当月 Sankey 图生成（调用账本仓库的 `monthly-report.yml` workflow）
 
+## 账本仓库 GitHub Actions
+
+`.github/workflows/` 下提供了两个可选的 workflow 示例文件，需复制到**账本仓库**（即 `REPO_NAME` 所指向的仓库）并去掉 `.example` 后缀后使用。
+
+在账本仓库的 **Settings → Secrets and variables → Actions** 中配置以下 secrets：
+
+| Secret | 说明 |
+|--------|------|
+| `TELEGRAM_TOKEN` | Telegram Bot Token |
+| `TELEGRAM_CHAT_ID` | 接收通知的 Chat ID |
+
+### monthly-report.yml
+
+每天 08:00 UTC 自动运行，查询当月 `Expenses:*` 账户支出，生成 Sankey 图并发送到 Telegram。也可通过 `/view` 指令或手动 `workflow_dispatch` 触发，支持传入 `year_month`（`YYYY-MM`）指定月份。
+
+### notify-on-push.yml
+
+每次 push 到 `main` 分支时触发，发送两条通知：
+
+1. 当月各 `Expenses` 子账户明细及总计
+2. 本次 commit message body 中列出的账户的当前余额
+
 ## LLM 自然语言记账
 
 发送一行自然语言描述，机器人会调用 LLM 生成草稿并发送审核按钮：
