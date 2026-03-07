@@ -1,6 +1,6 @@
 # beancounter_telegram
 
-追加记账记录到特定 GitHub 仓库的特定文件，随时随地用 Telegram 也可以记录生活消费，且不影响现有的 Beancounter 工作流。
+追加记账记录到特定 GitHub 仓库的特定文件，随时随地用 Telegram 也可以记录生活消费，且不影响现有的 Beancount 工作流。
 
 ## Quick Start
 
