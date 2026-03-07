@@ -372,6 +372,8 @@ class Bot:
             "Example: for '微信充值原神', use payee '原神' (not '微信充值原神'). "
             "Write the transaction narration (the second quoted string on the header line) in Chinese, unless the user's input is in English. "
             "Capitalise the first letter of each word in person names (e.g. 'john wick' → 'John Wick'). "
+            "CRITICAL: For internal transfers BETWEEN ASSETS ACCOUNTS (e.g., '转账', 'transfer', moving money from one bank to another), generate EXACTLY TWO postings: one negative from the source Assets account and one positive to the destination Assets account. "
+            "DO NOT add any Expenses or Income accounts for pure asset transfers. Asset transfers are zero-sum: one account decreases, another increases by the same amount. "
             "In most cases, each transaction should have exactly two postings: one negative and one positive. "
             "NEVER generate an internal transfer within the same payment platform as part of a simple expense (e.g. do NOT add Assets:WeChat:Current as both debit and credit). "
             "For a simple payment via WeChat/Alipay, use exactly one debit posting on the payment account and one credit posting on the Expenses account. "
