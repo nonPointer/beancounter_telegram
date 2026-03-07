@@ -374,6 +374,8 @@ class Bot:
             "Capitalise the first letter of each word in person names (e.g. 'john wick' → 'John Wick'). "
             "CRITICAL: For internal transfers BETWEEN ASSETS ACCOUNTS (e.g., '转账', 'transfer', moving money from one bank to another), generate EXACTLY TWO postings: one negative from the source Assets account and one positive to the destination Assets account. "
             "DO NOT add any Expenses or Income accounts for pure asset transfers. Asset transfers are zero-sum: one account decreases, another increases by the same amount. "
+            "For transfers between the user's OWN accounts (e.g., 'chase转给globalmoney', 'alipay转到wechat'), use the single-string header format without payee: 'YYYY-MM-DD * \"转账\"' or 'YYYY-MM-DD * \"Transfer\"'. "
+            "For transfers TO ANOTHER PERSON (e.g., '转账给张三', 'transfer to John'), include the recipient's name as payee: 'YYYY-MM-DD * \"Zhang San\" \"转账\"' or 'YYYY-MM-DD * \"John\" \"Transfer\"'. "
             "In most cases, each transaction should have exactly two postings: one negative and one positive. "
             "NEVER generate an internal transfer within the same payment platform as part of a simple expense (e.g. do NOT add Assets:WeChat:Current as both debit and credit). "
             "For a simple payment via WeChat/Alipay, use exactly one debit posting on the payment account and one credit posting on the Expenses account. "
