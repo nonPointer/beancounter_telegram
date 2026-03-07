@@ -683,15 +683,16 @@ class Bot:
             log(r.text)
             return False
 
-    def github_trigger_workflow(self, workflow_file: str, inputs: dict) -> bool:
+    def github_trigger_workflow(self, workflow_file: str, inputs: dict) -> tuple[bool, str]:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{workflow_file}/dispatches"
         data = {"ref": BRANCH_NAME, "inputs": inputs}
         r = requests.post(url=url, headers=GITHUB_HEADERS, json=data)
         if r.status_code == 204:
-            return True
+            return True, ""
         else:
-            log(f"Error triggering workflow: {r.status_code} {r.text}")
-            return False
+            error = f"{r.status_code} {r.text}"
+            log(f"Error triggering workflow: {error}")
+            return False, error
 
     def handle_message(self, message):
         text = message["message"]["text"]
@@ -785,11 +786,11 @@ class Bot:
                 appendix = pad_appendix + "\n\n" + balance_appendix
             elif command == "view":
                 month = date_str[:7]
-                ok = self.github_trigger_workflow("monthly-report.yml", {"month": month})
+                ok, err = self.github_trigger_workflow("monthly-report.yml", {"month": month})
                 if ok:
                     reply(f"Sankey report for {month} is being generated.")
                 else:
-                    reply("Failed to trigger the report workflow.")
+                    reply(f"Failed to trigger the report workflow: {err}")
                 return
             else:
                 reply(f"Unknown command: {command}")
