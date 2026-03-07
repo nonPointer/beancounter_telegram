@@ -147,43 +147,6 @@ class Bot:
             f"Missing: {missing}."
         )
 
-    def has_account_or_payment_hint(self, user_input: str, accounts: list[str]) -> bool:
-        text = user_input.strip().lower()
-        if not text:
-            return False
-
-        if "微信" in user_input or "wechat" in text:
-            return True
-
-        # Explicit beancount-like account path in free text.
-        if re.search(r'\b[A-Z][A-Za-z0-9_-]*:[A-Za-z0-9_:-]+\b', user_input):
-            return True
-
-        # Match input against known account segments/suffixes.
-        for account in accounts:
-            account_lower = account.lower()
-            orig_segments = [s for s in account.split(":") if len(s) >= 3]
-            segments = [s.lower() for s in orig_segments]
-            candidates = {account_lower}
-            candidates.update(segments)
-            # Also add camelCase-split variants (e.g. "GlobalMoney" → "global money")
-            for orig_seg in orig_segments:
-                spaced = re.sub(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', orig_seg).lower()
-                if spaced != orig_seg.lower():
-                    candidates.add(spaced)
-            if len(segments) >= 2:
-                candidates.add(segments[-2] + ":" + segments[-1])
-            if any(candidate and candidate in text for candidate in candidates):
-                return True
-
-        return False
-
-    def missing_account_hint_message(self) -> str:
-        return (
-            "无法判断付款账户，请补充账户线索后重试。"
-            "例如：账户后缀（HSBC:Current）或完整账户名（Assets:HSBC:Current）。"
-        )
-
     def parse_accounts(self):
         now = time.time()
         if self._accounts_cache["accounts"] is not None and now - self._accounts_cache["ts"] < ACCOUNTS_CACHE_TTL:
@@ -537,11 +500,6 @@ class Bot:
             self.send_message(chat_id, "No accounts available. Please check GitHub account parsing first.")
             return
 
-        hint_text = pending["user_input"] + (f"\n{decline_reason}" if decline_reason else "")
-        if not self.has_account_or_payment_hint(hint_text, accounts):
-            self.send_message(chat_id, self.missing_account_hint_message())
-            return
-
         try:
             new_appendix = self.call_openai_compatible(
                 pending["user_input"],
@@ -867,9 +825,6 @@ class Bot:
             if not accounts:
                 reply("No accounts available. Please check GitHub account parsing first.")
                 return
-            if not self.has_account_or_payment_hint(text, accounts):
-                reply(self.missing_account_hint_message())
-                return
             try:
                 appendix = self.call_openai_compatible(text, accounts, date_str)
                 appendix = self.prepend_natural_language_comment(appendix, text)
@@ -1041,7 +996,7 @@ class Bot:
 
         for callback in callback_queries:
             self.update_id = callback["update_id"]
-            hd = threading.Thread(target=self.handle_callback_query, args=(callback,))
+            hd = threading.Thread(target=self.handle_callback_query, args=(callback,), daemon=True)
             hd.start()
 
         for message in messages:
@@ -1055,7 +1010,7 @@ class Bot:
 
             fmt = f"{bcolors.OKBLUE}[{chat_id}]{bcolors.ENDC} {first_name} {last_name} (@{username}):"
             if text:
-                hd = threading.Thread(target=self.handle_message, args=(message,))
+                hd = threading.Thread(target=self.handle_message, args=(message,), daemon=True)
                 hd.start()
                 if len(text.splitlines()) > 1:
                     log(f"{fmt} \n{text}")
