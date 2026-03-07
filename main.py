@@ -360,11 +360,34 @@ class Bot:
         if not lines:
             return entry_text
 
-        has_datetime = any(re.match(r'^\s*datetime\s*:\s*".*"\s*$', line) for line in lines[1:])
+        has_datetime = any(re.match(r'^\s*datetime\s*:\s*".*"\s*$', line) for line in lines)
         if has_datetime:
             return entry_text
 
-        return "\n".join([lines[0], f'  datetime: "{datetime_str}"'] + lines[1:])
+        # Insert datetime after the transaction header, even when leading comment lines exist.
+        header_idx = None
+        for idx, line in enumerate(lines):
+            if re.match(r'^\d{4}-\d{2}-\d{2}\s+\*\s+', line.strip()):
+                header_idx = idx
+                break
+
+        if header_idx is None:
+            header_idx = 0
+
+        return "\n".join(lines[: header_idx + 1] + [f'  datetime: "{datetime_str}"'] + lines[header_idx + 1 :])
+
+    def prepend_natural_language_comment(self, entry_text: str, user_input: str) -> str:
+        # Keep original natural-language input as a beancount comment above the generated journal.
+        normalized = " ".join((user_input or "").strip().splitlines()).strip()
+        if not normalized:
+            return entry_text
+
+        comment_line = f"; {normalized}"
+        stripped_lines = [line.strip() for line in entry_text.splitlines() if line.strip()]
+        if stripped_lines and stripped_lines[0] == comment_line:
+            return entry_text
+
+        return f"{comment_line}\n{entry_text}"
 
     def call_openai_compatible(
         self,
@@ -521,6 +544,7 @@ class Bot:
                 previous_draft=pending["appendix"],
                 decline_reason=decline_reason,
             )
+            new_appendix = self.prepend_natural_language_comment(new_appendix, pending["user_input"])
             new_commit_message = self.add_non_pnl_accounts_to_commit_message(
                 'Add entry by Telegram Bot\n\n', new_appendix
             )
@@ -823,6 +847,7 @@ class Bot:
                 return
             try:
                 appendix = self.call_openai_compatible(text, accounts, date_str)
+                appendix = self.prepend_natural_language_comment(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
                 pending_id = self.next_pending_id()

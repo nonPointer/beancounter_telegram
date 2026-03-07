@@ -50,18 +50,27 @@
 
 **支持的输入示例：**
 
-```
-KFC 花了 20 GBP 微信支付
-```
-```
-和 John Wick 吃饭 96 GBP，他转给我 48
-```
-```
-支付宝买了杯咖啡 35
+```beancount
+; KFC 花了 20 USD 微信支付
+YYYY-MM-DD * "KFC" "餐饮"
+  Assets:Bank:WeChat     -20 USD
+  Expenses:Food           20 USD
+
+; 和 John Wick 吃晚餐萨莉亚 96 GBP，刷的 chase 信用卡，他给我 48 GBP 现金
+YYYY-MM-DD * "萨莉亚" "晚餐"
+  Liabilities:CreditCard:Chase     -96 GBP
+  Assets:Cash                       48 GBP
+  Expenses:Food                     48 GBP
+
+; 支付宝买了杯咖啡 35 CNY
+YYYY-MM-DD * "咖啡店" "咖啡"
+  Assets:Bank:Alipay:Current     -35 CNY
+  Expenses:Food                   35 CNY
 ```
 
 **规则说明：**
 - 单行文本自动走 LLM 流程；多行文本走手动记账流程
+- 输入里需要至少暗示扣款账户（如 `微信` / `支付宝` / `现金` / `HSBC`）和货币（如 `CNY` / `GBP`）；信息不足时机器人会提示补充
 - 未说明货币时，若全文只出现一种货币则以此为默认
 - 未说明支付方式时，默认使用微信/支付宝余额账户（非理财子账户）
 - 分摊消费：付全款、他人转账回来的金额从支付账户正向抵消，`Expenses` 仅记录自己的净份额
