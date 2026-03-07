@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pprint import pprint
 
@@ -194,27 +195,32 @@ class Bot:
             "X-GitHub-Api-Version": "2022-11-28"
         }
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/accounts?ref={BRANCH_NAME}"
-        r = requests.get(url, headers=list_headers)
+        r = requests.get(url, headers=list_headers, timeout=30)
         if r.status_code != 200:
             log(f"Error fetching accounts: {r.status_code}")
             log(r.text)
             return []
-        accounts = []
-        for item in r.json():
-            if not item["name"].endswith(".bean"):
-                continue
-            file_r = requests.get(item["url"], headers=list_headers)
-            if file_r.status_code != 200:
-                continue
-            content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
-            for m in re.findall(r'\d{4}-\d{2}-\d{2} open (.*)', content):
-                accounts.append(m.strip().split(" ", 1)[0])
-            for m in re.findall(r'\d{4}-\d{2}-\d{2} close (.*)', content):
-                closed = m.strip().split(" ", 1)[0]
-                if closed in accounts:
-                    accounts.remove(closed)
+        bean_items = [item for item in r.json() if item["name"].endswith(".bean")]
 
-        accounts.sort()
+        def fetch_account_file(item):
+            file_r = requests.get(item["url"], headers=list_headers, timeout=30)
+            if file_r.status_code != 200:
+                return [], []
+            content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
+            opened = [m.strip().split(" ", 1)[0] for m in re.findall(r'\d{4}-\d{2}-\d{2} open (.*)', content)]
+            closed = [m.strip().split(" ", 1)[0] for m in re.findall(r'\d{4}-\d{2}-\d{2} close (.*)', content)]
+            return opened, closed
+
+        all_opened = set()
+        all_closed = set()
+        with ThreadPoolExecutor(max_workers=min(8, len(bean_items) or 1)) as pool:
+            futures = {pool.submit(fetch_account_file, item): item for item in bean_items}
+            for future in as_completed(futures):
+                opened, closed = future.result()
+                all_opened.update(opened)
+                all_closed.update(closed)
+
+        accounts = sorted(all_opened - all_closed)
         self._accounts_cache["accounts"] = accounts
         self._accounts_cache["ts"] = now
         return accounts
@@ -446,7 +452,7 @@ class Bot:
             data["parse_mode"] = parse_mode
         if reply_markup is not None:
             data["reply_markup"] = reply_markup
-        response = requests.post(self.api_base + "/sendMessage", json=data)
+        response = requests.post(self.api_base + "/sendMessage", json=data, timeout=30)
         if response.status_code != 200:
             log(f"Error sending message: {response.status_code}")
             log(response.text)
@@ -456,7 +462,7 @@ class Bot:
         data = {"callback_query_id": callback_query_id}
         if text:
             data["text"] = text
-        requests.post(self.api_base + "/answerCallbackQuery", json=data)
+        requests.post(self.api_base + "/answerCallbackQuery", json=data, timeout=30)
 
     def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
         data = {
@@ -464,7 +470,7 @@ class Bot:
             "message_id": message_id,
             "reply_markup": reply_markup or {"inline_keyboard": []},
         }
-        requests.post(self.api_base + "/editMessageReplyMarkup", json=data)
+        requests.post(self.api_base + "/editMessageReplyMarkup", json=data, timeout=30)
 
     def next_pending_id(self) -> str:
         self.pending_llm_id += 1
@@ -653,11 +659,12 @@ class Bot:
 
     def github_download_file(self, file_path: str = FILE_PATH) -> dict | None:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{file_path}?ref={BRANCH_NAME}"
-        r = requests.get(url=url, headers=GITHUB_HEADERS)
+        r = requests.get(url=url, headers=GITHUB_HEADERS, timeout=30)
         if r.status_code == 200:
+            data = r.json()
             return {
-                "content": base64.b64decode(r.json()["content"]).decode("utf-8"),
-                "sha": r.json()["sha"]
+                "content": base64.b64decode(data["content"]).decode("utf-8"),
+                "sha": data["sha"]
             }
         elif r.status_code == 404:
             log("File not found.")
@@ -675,7 +682,7 @@ class Bot:
         }
         if sha:
             data["sha"] = sha
-        r = requests.put(url=url, headers=GITHUB_HEADERS, json=data)
+        r = requests.put(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
         if r.status_code in [200, 201]:
             return True
         else:
@@ -686,7 +693,7 @@ class Bot:
     def github_trigger_workflow(self, workflow_file: str, inputs: dict) -> tuple[bool, str]:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{workflow_file}/dispatches"
         data = {"ref": BRANCH_NAME, "inputs": inputs}
-        r = requests.post(url=url, headers=GITHUB_HEADERS, json=data)
+        r = requests.post(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
         if r.status_code == 204:
             return True, ""
         else:
@@ -1001,7 +1008,7 @@ class Bot:
             loading_stop_event = threading.Event()
             loading = threading.Thread(target=rotating_loading(loading_stop_event).start)
             loading.start()
-            response = requests.get(self.api_base + "/getUpdates", data=params, timeout=params["timeout"] + 1)
+            response = requests.get(self.api_base + "/getUpdates", params=params, timeout=params["timeout"] + 1)
             loading_stop_event.set()
 
             if response.status_code != 200:
