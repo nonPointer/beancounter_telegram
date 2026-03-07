@@ -16,7 +16,13 @@
     - `GITHUB_TOKEN`、`REPO_OWNER`、`REPO_NAME`、`BRANCH_NAME`、`FILE_PATH`：目标仓库信息
     - `CHAT_ID`：向机器人发一条消息后访问 `https://api.telegram.org/bot<TOKEN>/getUpdates` 获取
     - `TIMEZONE`：时区，如 `Asia/Shanghai`、`Europe/London`
-    - `LLM_API_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`：兼容 OpenAI API 的 LLM，用于自然语言记账（可选）
+    - `LLM_BACKENDS`：兼容 OpenAI API 的 LLM 后端列表，用于自然语言记账（可选）。按顺序尝试，前一个失败自动 fallback 到下一个：
+      ```json
+      "LLM_BACKENDS": [
+          { "LLM_API_BASE_URL": "https://api.openai.com/v1", "LLM_API_KEY": "sk-...", "LLM_MODEL": "gpt-4o-mini" },
+          { "LLM_API_BASE_URL": "https://api.example.com/v1", "LLM_API_KEY": "sk-...", "LLM_MODEL": "gpt-4o" }
+      ]
+      ```
 
 - 运行
   ```bash

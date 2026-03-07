@@ -161,9 +161,15 @@ class Bot:
         # Match input against known account segments/suffixes.
         for account in accounts:
             account_lower = account.lower()
-            segments = [s for s in account_lower.split(":") if len(s) >= 3]
+            orig_segments = [s for s in account.split(":") if len(s) >= 3]
+            segments = [s.lower() for s in orig_segments]
             candidates = {account_lower}
             candidates.update(segments)
+            # Also add camelCase-split variants (e.g. "GlobalMoney" → "global money")
+            for orig_seg in orig_segments:
+                spaced = re.sub(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', ' ', orig_seg).lower()
+                if spaced != orig_seg.lower():
+                    candidates.add(spaced)
             if len(segments) >= 2:
                 candidates.add(segments[-2] + ":" + segments[-1])
             if any(candidate and candidate in text for candidate in candidates):

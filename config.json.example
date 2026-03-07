@@ -7,9 +7,13 @@
     "FILE_PATH": "journals/telegram.bean",
     "TIMEZONE": "Asia/Shanghai",
     "CHAT_ID": "",
-    "LLM_API_BASE_URL": "https://api.openai.com/v1",
-    "LLM_API_KEY": "",
-    "LLM_MODEL": "gpt-4o-mini",
+    "LLM_BACKENDS": [
+        {
+            "LLM_API_BASE_URL": "https://api.openai.com/v1",
+            "LLM_API_KEY": "",
+            "LLM_MODEL": "gpt-4o-mini"
+        }
+    ],
     "ACCOUNTS_CACHE_TTL": 300,
     "DRAFT_TTL_SECONDS": 30
 }
