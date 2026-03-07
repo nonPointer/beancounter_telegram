@@ -186,48 +186,75 @@ def normalize_and_validate_llm_entry(entry_text: str, accounts: list[str]) -> st
     return "\n".join(out)
 
 
+def parse_llm_backends(config) -> list[dict]:
+    """从 config 解析 LLM 后端列表，支持新数组格式和旧单配置项格式"""
+    raw = config.get("LLM_BACKENDS")
+    if isinstance(raw, list):
+        backends = []
+        for b in raw:
+            url = b.get("LLM_API_BASE_URL", "").rstrip("/")
+            key = b.get("LLM_API_KEY", "")
+            model = b.get("LLM_MODEL", "")
+            if url and key and model:
+                backends.append({"base_url": url, "api_key": key, "model": model})
+        return backends
+    # Backward compat: single-backend keys
+    url = config.get("LLM_API_BASE_URL", "").rstrip("/")
+    key = config.get("LLM_API_KEY", "")
+    model = config.get("LLM_MODEL", "")
+    if url and key and model:
+        return [{"base_url": url, "api_key": key, "model": model}]
+    return []
+
+
 def call_llm(config, user_input: str, accounts: list[str], txn_date: str) -> str:
-    """调用 LLM API 生成 beancount 记录"""
+    """调用 LLM API 生成 beancount 记录，按顺序尝试所有后端，失败则 fallback"""
     # 重新加载 prompts 模块以获取最新的 prompt 定义
     importlib.reload(prompts)
-    
-    LLM_API_BASE_URL = config.get("LLM_API_BASE_URL", "").rstrip("/")
-    LLM_API_KEY = config.get("LLM_API_KEY", "")
-    LLM_MODEL = config.get("LLM_MODEL", "")
-    
-    if not all([LLM_API_BASE_URL, LLM_API_KEY, LLM_MODEL]):
-        raise ValueError("LLM configuration incomplete. Check LLM_API_BASE_URL, LLM_API_KEY, and LLM_MODEL in config.json")
-    
-    url = f"{LLM_API_BASE_URL}/chat/completions"
+
+    backends = parse_llm_backends(config)
+    if not backends:
+        raise ValueError("LLM configuration incomplete. Set LLM_BACKENDS array (or LLM_API_BASE_URL/LLM_API_KEY/LLM_MODEL) in config.json")
+
     system_prompt = prompts.BEANCOUNT_SYSTEM_PROMPT
     user_prompt = prompts.build_user_prompt(txn_date, accounts, user_input)
-    
     payload = {
-        "model": LLM_MODEL,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    
-    response = requests.post(url, headers=headers, json=payload, timeout=60)
-    response.raise_for_status()
-    data = response.json()
-    raw_text = data["choices"][0]["message"]["content"].strip()
-    
-    if raw_text.upper().startswith("NEED_ACCOUNT:"):
-        guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
-        raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀）")
-    
-    try:
-        return normalize_and_validate_llm_entry(raw_text, accounts)
-    except Exception as e:
-        raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+
+    last_error: Exception | None = None
+    for backend in backends:
+        try:
+            url = f"{backend['base_url']}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {backend['api_key']}",
+                "Content-Type": "application/json",
+            }
+            response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            raw_text = data["choices"][0]["message"]["content"].strip()
+
+            if raw_text.upper().startswith("NEED_ACCOUNT:"):
+                guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
+                raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀）")
+
+            try:
+                return normalize_and_validate_llm_entry(raw_text, accounts)
+            except Exception as e:
+                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+
+        except ValueError:
+            raise
+        except Exception as e:
+            print(f"  ⚠ Backend '{backend['model']}' failed: {e}, trying next...")
+            last_error = e
+
+    raise ValueError(f"All LLM backends failed. Last error: {last_error}")
 
 
 def main():

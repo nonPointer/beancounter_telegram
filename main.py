@@ -37,18 +37,31 @@ REPO_NAME = config["REPO_NAME"]
 BRANCH_NAME = config["BRANCH_NAME"]
 FILE_PATH = config["FILE_PATH"]
 CHAT_ID = config.get("CHAT_ID", None)
-LLM_API_BASE_URL = config.get("LLM_API_BASE_URL", "").rstrip("/")
-LLM_API_KEY = config.get("LLM_API_KEY", "")
-LLM_MODEL = config.get("LLM_MODEL", "")
-LLM_MISSING_CONFIG_KEYS = [
-    key for key, value in [
-        ("LLM_API_BASE_URL", LLM_API_BASE_URL),
-        ("LLM_API_KEY", LLM_API_KEY),
-        ("LLM_MODEL", LLM_MODEL),
-    ]
-    if not value
-]
-LLM_ENABLED = len(LLM_MISSING_CONFIG_KEYS) == 0
+
+
+def _parse_llm_backends() -> list[dict]:
+    raw = config.get("LLM_BACKENDS")
+    if isinstance(raw, list):
+        backends = []
+        for b in raw:
+            url = b.get("LLM_API_BASE_URL", "").rstrip("/")
+            key = b.get("LLM_API_KEY", "")
+            model = b.get("LLM_MODEL", "")
+            if url and key and model:
+                backends.append({"base_url": url, "api_key": key, "model": model})
+        return backends
+    # Backward compat: single-backend keys
+    url = config.get("LLM_API_BASE_URL", "").rstrip("/")
+    key = config.get("LLM_API_KEY", "")
+    model = config.get("LLM_MODEL", "")
+    if url and key and model:
+        return [{"base_url": url, "api_key": key, "model": model}]
+    return []
+
+
+LLM_BACKENDS = _parse_llm_backends()
+LLM_ENABLED = len(LLM_BACKENDS) > 0
+LLM_MISSING_CONFIG_KEYS = [] if LLM_ENABLED else ["LLM_BACKENDS"]
 
 jinja2 = Environment(loader=FileSystemLoader(searchpath="./templates"))
 
@@ -358,36 +371,45 @@ class Bot:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
-        url = f"{LLM_API_BASE_URL}/chat/completions"
         system_prompt = BEANCOUNT_SYSTEM_PROMPT
         user_prompt = build_user_prompt(txn_date, accounts, user_input, previous_draft, decline_reason)
-
         payload = {
-            "model": LLM_MODEL,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json",
-        }
 
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        raw_text = data["choices"][0]["message"]["content"].strip()
+        last_error: Exception | None = None
+        for backend in LLM_BACKENDS:
+            try:
+                url = f"{backend['base_url']}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {backend['api_key']}",
+                    "Content-Type": "application/json",
+                }
+                response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
+                response.raise_for_status()
+                data = response.json()
+                raw_text = data["choices"][0]["message"]["content"].strip()
 
-        if raw_text.upper().startswith("NEED_ACCOUNT:"):
-            guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
-            raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
+                if raw_text.upper().startswith("NEED_ACCOUNT:"):
+                    guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
+                    raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
 
-        try:
-            return self.normalize_and_validate_llm_entry(raw_text, accounts)
-        except Exception as e:
-            raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+                try:
+                    return self.normalize_and_validate_llm_entry(raw_text, accounts)
+                except Exception as e:
+                    raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+
+            except ValueError:
+                raise
+            except Exception as e:
+                log(f"LLM backend '{backend['model']}' failed: {e}, trying next...")
+                last_error = e
+
+        raise ValueError(f"All LLM backends failed. Last error: {last_error}")
 
     def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
         data = {"chat_id": chat_id, "text": text}
