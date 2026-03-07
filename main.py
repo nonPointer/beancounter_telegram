@@ -785,10 +785,9 @@ class Bot:
                 )
                 appendix = pad_appendix + "\n\n" + balance_appendix
             elif command == "view":
-                month = date_str[:7]
-                ok, err = self.github_trigger_workflow("monthly-report.yml", {"month": month})
+                ok, err = self.github_trigger_workflow("monthly-report.yml", {})
                 if ok:
-                    reply(f"Sankey report for {month} is being generated.")
+                    reply("Sankey report is being generated.")
                 else:
                     reply(f"Failed to trigger the report workflow: {err}")
                 return
