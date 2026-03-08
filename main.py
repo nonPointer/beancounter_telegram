@@ -911,7 +911,11 @@ class Bot:
             if not matches:
                 reply("Invalid close command format. Use: close [account]")
                 return
-            account = matches[0][0] if isinstance(matches[0], tuple) else matches[0]
+            account_input = matches[0][0] if isinstance(matches[0], tuple) else matches[0]
+            account = self.match_account(account_input)
+            if not account:
+                reply(f"Account not found (no open record): {account_input}")
+                return
             account_type_map = {
                 "assets": "accounts/assets.bean",
                 "liabilities": "accounts/liabilities.bean",
