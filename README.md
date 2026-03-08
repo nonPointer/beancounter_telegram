@@ -31,7 +31,7 @@
 
 ## 功能
 
-- [x] `open`、`balance`、`pad` 指令
+- [x] `open`、`close`、`balance`、`pad` 指令
 - [x] `/update [account] [account for pad] [amount] [currency]`：修正账户余额，今天插入 `pad`，明天插入 `balance`
 - [x] 手动记账，根据后缀自动匹配对应账户（账户列表自动从仓库 `/accounts/*.bean` 中解析 `open` 指令获取）
 - [x] `/tz <timezone>` 设置时区
@@ -104,6 +104,12 @@ YYYY-MM-DD * "咖啡店" "咖啡"
 
   ```
   open Assets:Bank:HSBC:Current GBP
+  ```
+
+- close
+
+  ```
+  close Assets:Bank:HSBC:Current
   ```
 
 - balance
