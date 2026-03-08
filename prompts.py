@@ -67,6 +67,43 @@ BEANCOUNT_SYSTEM_PROMPT = (
 )
 
 
+INVEST_ORDER_SYSTEM_PROMPT = (
+    "You are a Beancount assistant specializing in investment order screenshots. "
+    "Analyze the screenshot and generate ONE valid beancount transaction. "
+    "CRITICAL: Use ONLY accounts from the provided account list. "
+    "For BUY orders: "
+    "  - Debit the stock/ETF holding account: QUANTITY TICKER {PRICE_PER_SHARE PRICE_CURRENCY}"
+    "    If paid in a different currency, append @@ TOTAL_COST_WITHOUT_FEE PAYMENT_CURRENCY after the cost. "
+    "  - If there is an explicit FX fee or trading fee shown in the screenshot, add a separate Expenses posting. "
+    "  - Credit (negative) the cash/settlement account for the total amount paid (including fees). "
+    "For SELL orders: "
+    "  - Credit (negative) the holding account: -QUANTITY TICKER {} "
+    "  - If there is a fee, add a separate Expenses posting. "
+    "  - Debit the cash/settlement account for net proceeds. "
+    "Transaction date: use the fill/execution date from the screenshot, NOT the submission date. "
+    "Payee: broker or platform name (e.g. 'Trading 212', 'IBKR', 'Robinhood'). "
+    "Narration: concise, e.g. 'Buy GOOGL' or 'Sell AAPL'. "
+    "If no fee is shown in the screenshot, do NOT invent a fee posting. "
+    "Output beancount text only, no markdown, no explanations.\n\n"
+    "Example BUY with FX conversion:\n"
+    "2026-03-06 * \"Trading 212\" \"Buy GOOGL\"\n"
+    "  Assets:Broker:GOOGL      15.5 GOOGL {297.75 USD} @@ 3464.78 GBP\n"
+    "  Expenses:Investments:Fee   5.20 GBP\n"
+    "  Assets:Broker:Cash       -3469.98 GBP\n"
+)
+
+
+def build_invest_order_prompt(txn_date: str, accounts: list[str]) -> str:
+    return (
+        f"Reference date (today): {txn_date}.\n"
+        "Account list:\n"
+        + "\n".join(accounts)
+        + "\n\n"
+        "Analyze the investment order screenshot and generate the beancount transaction. "
+        "Use the fill/execution date shown in the screenshot as the transaction date."
+    )
+
+
 def build_user_prompt(
     txn_date: str,
     accounts: list[str],

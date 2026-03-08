@@ -13,7 +13,7 @@ import pytz
 import requests
 from jinja2 import Environment, FileSystemLoader
 
-from prompts import BEANCOUNT_SYSTEM_PROMPT, build_user_prompt
+from prompts import BEANCOUNT_SYSTEM_PROMPT, build_user_prompt, INVEST_ORDER_SYSTEM_PROMPT, build_invest_order_prompt
 
 with open("config.json", "r") as f:
     config = json.load(f)
@@ -408,6 +408,126 @@ class Bot:
                 last_error = e
 
         raise ValueError(f"All LLM backends failed. Last error: {last_error}")
+
+    def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
+        r = requests.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
+        if r.status_code != 200:
+            log(f"Error getting file info: {r.status_code}")
+            return None
+        file_path = r.json()["result"]["file_path"]
+        token = config["TELEGRAM_BOT_TOKEN"]
+        dl = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=60)
+        if dl.status_code != 200:
+            log(f"Error downloading file: {dl.status_code}")
+            return None
+        return dl.content
+
+    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str) -> str:
+        if not self.llm_enabled:
+            raise ValueError(self.llm_unavailable_message())
+
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        payload = {
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": INVEST_ORDER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {"type": "text", "text": build_invest_order_prompt(txn_date, accounts)},
+                    ],
+                },
+            ],
+        }
+
+        last_error: Exception | None = None
+        for backend in LLM_BACKENDS:
+            try:
+                url = f"{backend['base_url']}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {backend['api_key']}",
+                    "Content-Type": "application/json",
+                }
+                response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
+                response.raise_for_status()
+                raw_text = response.json()["choices"][0]["message"]["content"].strip()
+                try:
+                    return self.normalize_and_validate_llm_entry(raw_text, accounts)
+                except Exception as e:
+                    raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+            except ValueError:
+                raise
+            except Exception as e:
+                log(f"LLM backend '{backend['model']}' vision failed: {e}, trying next...")
+                last_error = e
+
+        raise ValueError(f"All LLM backends failed. Last error: {last_error}")
+
+    def handle_photo_message(self, message):
+        msg = message["message"]
+        chat_id = msg["chat"]["id"]
+        caption = msg.get("caption", "").strip()
+
+        def reply(text: str):
+            self.send_message(chat_id, text)
+
+        if CHAT_ID and str(chat_id) != CHAT_ID:
+            log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
+            reply("How dare you?")
+            return
+
+        if not self.llm_enabled:
+            reply(self.llm_unavailable_message())
+            return
+
+        accounts = self.parse_accounts()
+        if not accounts:
+            reply("No accounts available. Please check GitHub account parsing first.")
+            return
+
+        dt = datetime.now(self.timezone)
+        date_str = dt.strftime('%Y-%m-%d')
+
+        # Use highest-resolution photo
+        file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
+        log(f"Processing investment order screenshot (caption: {caption!r})")
+
+        image_bytes = self.get_telegram_file_bytes(file_id)
+        if not image_bytes:
+            reply("Failed to download the image.")
+            return
+
+        try:
+            appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str)
+            if caption:
+                appendix = self.prepend_natural_language_comment(appendix, caption)
+            commit_message = self.add_non_pnl_accounts_to_commit_message(
+                'Add investment entry by Telegram Bot\n\n', appendix
+            )
+
+            pending_id = self.next_pending_id()
+            self.pending_llm_entries[pending_id] = {
+                "chat_id": chat_id,
+                "appendix": appendix,
+                "commit_message": commit_message,
+                "created_at": time.time(),
+                "user_input": caption or "(investment order screenshot)",
+                "date_str": date_str,
+            }
+
+            log("Investment order draft:\n" + appendix)
+            self.send_message(
+                chat_id,
+                "Investment order draft:\n"
+                f"<pre><code>{html.escape(appendix)}</code></pre>\n"
+                "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
+                reply_markup=self.build_review_buttons(pending_id),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            log(f"Investment order processing failed: {e}")
+            reply(f"Failed to process investment order: {e}")
 
     def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
         data = {"chat_id": chat_id, "text": text}
@@ -1034,6 +1154,7 @@ class Bot:
             text = message["message"].get("text")
 
             fmt = f"{bcolors.OKBLUE}[{chat_id}]{bcolors.ENDC} {first_name} {last_name} (@{username}):"
+            photo = message["message"].get("photo")
             if text:
                 hd = threading.Thread(target=self.handle_message, args=(message,), daemon=True)
                 hd.start()
@@ -1041,6 +1162,10 @@ class Bot:
                     log(f"{fmt} \n{text}")
                 else:
                     log(f"{fmt} {text}")
+            elif photo:
+                log(f"{fmt} [photo]")
+                hd = threading.Thread(target=self.handle_photo_message, args=(message,), daemon=True)
+                hd.start()
             else:
                 obj = {k: v for k, v in message['message'].items() if k not in ['chat', 'date', 'from', 'message_id']}
                 log(f"{fmt} {obj}")
