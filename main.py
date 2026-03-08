@@ -785,6 +785,26 @@ class Bot:
                 date=date_str, account=account, currency=currency, datetime=datetime_str
             )
 
+        elif text.lower().startswith("close"):
+            log("/close command detected")
+            matches = re.findall(r'.*?\s+([^\s]+)', text, re.IGNORECASE)
+            if not matches:
+                reply("Invalid close command format. Use: close [account]")
+                return
+            account = matches[0][0] if isinstance(matches[0], tuple) else matches[0]
+            account_type_map = {
+                "assets": "accounts/assets.bean",
+                "liabilities": "accounts/liabilities.bean",
+                "equity": "accounts/equity.bean",
+                "income": "accounts/income.bean",
+                "expenses": "accounts/expenses.bean",
+            }
+            prefix = account.split(":")[0].lower()
+            target_file_path = account_type_map.get(prefix, FILE_PATH)
+            appendix = jinja2.get_template("close.bean.j2").render(
+                date=date_str, account=account, datetime=datetime_str
+            )
+
         elif text.lower().startswith("balance"):
             log("/balance command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
