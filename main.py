@@ -109,7 +109,15 @@ class rotating_loading:
 
 
 ACCOUNTS_CACHE_TTL = get_int_config("ACCOUNTS_CACHE_TTL", 300)
-DRAFT_TTL_SECONDS = get_int_config("DRAFT_TTL_SECONDS", 30)
+DRAFT_TTL_SECONDS = get_int_config("DRAFT_TTL_SECONDS", 120)
+
+ACCOUNT_TYPE_MAP = {
+    "assets": "accounts/assets.bean",
+    "liabilities": "accounts/liabilities.bean",
+    "equity": "accounts/equity.bean",
+    "income": "accounts/income.bean",
+    "expenses": "accounts/expenses.bean",
+}
 
 GITHUB_HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
@@ -358,6 +366,23 @@ class Bot:
 
         return f"{comment_line}\n{entry_text}"
 
+    def _call_llm_backends(self, payload: dict, log_prefix: str = "") -> str:
+        last_error: Exception | None = None
+        for backend in LLM_BACKENDS:
+            try:
+                url = f"{backend['base_url']}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {backend['api_key']}",
+                    "Content-Type": "application/json",
+                }
+                response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                log(f"LLM backend '{backend['model']}'{log_prefix} failed: {e}, trying next...")
+                last_error = e
+        raise ValueError(f"All LLM backends failed. Last error: {last_error}")
+
     def call_openai_compatible(
         self,
         user_input: str,
@@ -369,45 +394,25 @@ class Bot:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
-        system_prompt = BEANCOUNT_SYSTEM_PROMPT
         user_prompt = build_user_prompt(txn_date, accounts, user_input, previous_draft, decline_reason)
         payload = {
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": BEANCOUNT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
         }
 
-        last_error: Exception | None = None
-        for backend in LLM_BACKENDS:
-            try:
-                url = f"{backend['base_url']}/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {backend['api_key']}",
-                    "Content-Type": "application/json",
-                }
-                response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
-                response.raise_for_status()
-                data = response.json()
-                raw_text = data["choices"][0]["message"]["content"].strip()
+        raw_text = self._call_llm_backends(payload)
 
-                if raw_text.upper().startswith("NEED_ACCOUNT:"):
-                    guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
-                    raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
+        if raw_text.upper().startswith("NEED_ACCOUNT:"):
+            guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
+            raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
 
-                try:
-                    return self.normalize_and_validate_llm_entry(raw_text, accounts)
-                except Exception as e:
-                    raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
-
-            except ValueError:
-                raise
-            except Exception as e:
-                log(f"LLM backend '{backend['model']}' failed: {e}, trying next...")
-                last_error = e
-
-        raise ValueError(f"All LLM backends failed. Last error: {last_error}")
+        try:
+            return self.normalize_and_validate_llm_entry(raw_text, accounts)
+        except Exception as e:
+            raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
 
     def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
         r = requests.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
@@ -441,28 +446,11 @@ class Bot:
             ],
         }
 
-        last_error: Exception | None = None
-        for backend in LLM_BACKENDS:
-            try:
-                url = f"{backend['base_url']}/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {backend['api_key']}",
-                    "Content-Type": "application/json",
-                }
-                response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
-                response.raise_for_status()
-                raw_text = response.json()["choices"][0]["message"]["content"].strip()
-                try:
-                    return self.normalize_and_validate_llm_entry(raw_text, accounts)
-                except Exception as e:
-                    raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
-            except ValueError:
-                raise
-            except Exception as e:
-                log(f"LLM backend '{backend['model']}' vision failed: {e}, trying next...")
-                last_error = e
-
-        raise ValueError(f"All LLM backends failed. Last error: {last_error}")
+        raw_text = self._call_llm_backends(payload, " vision")
+        try:
+            return self.normalize_and_validate_llm_entry(raw_text, accounts)
+        except Exception as e:
+            raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
 
     def handle_photo_message(self, message):
         msg = message["message"]
@@ -507,14 +495,9 @@ class Bot:
             )
 
             pending_id = self.next_pending_id()
-            self.pending_llm_entries[pending_id] = {
-                "chat_id": chat_id,
-                "appendix": appendix,
-                "commit_message": commit_message,
-                "created_at": time.time(),
-                "user_input": caption or "(investment order screenshot)",
-                "date_str": date_str,
-            }
+            self.pending_llm_entries[pending_id] = self._make_pending_entry(
+                chat_id, appendix, commit_message, caption or "(investment order screenshot)", date_str
+            )
 
             log("Investment order draft:\n" + appendix)
             self.send_message(
@@ -554,6 +537,16 @@ class Bot:
             "reply_markup": reply_markup or {"inline_keyboard": []},
         }
         requests.post(self.api_base + "/editMessageReplyMarkup", json=data, timeout=30)
+
+    def _make_pending_entry(self, chat_id: int, appendix: str, commit_message: str, user_input: str, date_str: str) -> dict:
+        return {
+            "chat_id": chat_id,
+            "appendix": appendix,
+            "commit_message": commit_message,
+            "created_at": time.time(),
+            "user_input": user_input,
+            "date_str": date_str,
+        }
 
     def next_pending_id(self) -> str:
         self.pending_llm_id += 1
@@ -634,14 +627,9 @@ class Bot:
             )
 
             new_pending_id = self.next_pending_id()
-            self.pending_llm_entries[new_pending_id] = {
-                "chat_id": chat_id,
-                "appendix": new_appendix,
-                "commit_message": new_commit_message,
-                "created_at": time.time(),
-                "user_input": pending["user_input"],
-                "date_str": pending["date_str"],
-            }
+            self.pending_llm_entries[new_pending_id] = self._make_pending_entry(
+                chat_id, new_appendix, new_commit_message, pending["user_input"], pending["date_str"]
+            )
             self.pending_llm_entries.pop(pending_id, None)
 
             log("LLM rechecked draft:\n" + new_appendix)
@@ -799,10 +787,14 @@ class Bot:
         date_str = dt.strftime('%Y-%m-%d')
         datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        if re.match(r'^\d{4}-\d{2}-\d{2}', text.strip()):
+        _first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
+        try:
+            datetime.strptime(_first_line, '%Y-%m-%d')
             log("Custom date detected")
-            date_str = text.strip().splitlines()[0].strip()
+            date_str = _first_line
             text = '\n'.join(text.strip().splitlines()[1:]).strip()
+        except ValueError:
+            pass
 
         pending_reason_id = self.pending_decline_reasons.get(chat_id)
         if pending_reason_id is not None:
@@ -892,15 +884,8 @@ class Bot:
                 return
             account = matches[0][0]
             currency = matches[0][1]
-            account_type_map = {
-                "assets": "accounts/assets.bean",
-                "liabilities": "accounts/liabilities.bean",
-                "equity": "accounts/equity.bean",
-                "income": "accounts/income.bean",
-                "expenses": "accounts/expenses.bean",
-            }
             prefix = account.split(":")[0].lower()
-            target_file_path = account_type_map.get(prefix, FILE_PATH)
+            target_file_path = ACCOUNT_TYPE_MAP.get(prefix, FILE_PATH)
             appendix = jinja2.get_template("open.bean.j2").render(
                 date=date_str, account=account, currency=currency, datetime=datetime_str
             )
@@ -916,15 +901,8 @@ class Bot:
             if not account:
                 reply(f"Account not found (no open record): {account_input}")
                 return
-            account_type_map = {
-                "assets": "accounts/assets.bean",
-                "liabilities": "accounts/liabilities.bean",
-                "equity": "accounts/equity.bean",
-                "income": "accounts/income.bean",
-                "expenses": "accounts/expenses.bean",
-            }
             prefix = account.split(":")[0].lower()
-            target_file_path = account_type_map.get(prefix, FILE_PATH)
+            target_file_path = ACCOUNT_TYPE_MAP.get(prefix, FILE_PATH)
             appendix = jinja2.get_template("close.bean.j2").render(
                 date=date_str, account=account, datetime=datetime_str
             )
@@ -979,14 +957,9 @@ class Bot:
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
                 pending_id = self.next_pending_id()
-                self.pending_llm_entries[pending_id] = {
-                    "chat_id": chat_id,
-                    "appendix": appendix,
-                    "commit_message": commit_message,
-                    "created_at": time.time(),
-                    "user_input": text,
-                    "date_str": date_str,
-                }
+                self.pending_llm_entries[pending_id] = self._make_pending_entry(
+                    chat_id, appendix, commit_message, text, date_str
+                )
 
                 log("LLM draft:\n" + appendix)
                 self.send_message(
