@@ -786,12 +786,14 @@ class Bot:
         dt = datetime.now(self.timezone)
         date_str = dt.strftime('%Y-%m-%d')
         datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+        custom_date = False
 
         _first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
         try:
             datetime.strptime(_first_line, '%Y-%m-%d')
             log("Custom date detected")
             date_str = _first_line
+            custom_date = True
             text = '\n'.join(text.strip().splitlines()[1:]).strip()
         except ValueError:
             pass
@@ -919,8 +921,12 @@ class Bot:
                 return
             amount = matches[0][1]
             currency = matches[0][2]
+            # balance assertions take effect on the *opening* of the stated date,
+            # so the default is tomorrow (today + 1 day). Override by prefixing
+            # the message with a YYYY-MM-DD date line.
+            balance_date_str = date_str if custom_date else (dt + timedelta(days=1)).strftime('%Y-%m-%d')
             appendix = jinja2.get_template("balance.bean.j2").render(
-                date=date_str, account=account, amount=amount, currency=currency, datetime=datetime_str
+                date=balance_date_str, account=account, amount=amount, currency=currency, datetime=datetime_str
             )
 
         elif text.lower().startswith("pad"):

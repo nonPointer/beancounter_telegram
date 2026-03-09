@@ -114,6 +114,8 @@ YYYY-MM-DD * "咖啡店" "咖啡"
 
 - balance
 
+  默认日期为**次日**（beancount balance 断言在所述日期的开盘时生效，因此填次日表示"今日收盘后余额"）。如需指定日期，在消息第一行写 `YYYY-MM-DD`。
+
   ```
   balance Alipay 200 CNY
   ```
