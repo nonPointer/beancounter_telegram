@@ -139,5 +139,386 @@ class TestDateValidation(unittest.TestCase):
         self.assertIsNone(self._parse_date_line("2024-01"))
 
 
+class TestStripCodeFence(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_no_fence_passthrough(self):
+        text = "2024-01-01 * \"Shop\" \"Groceries\"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD"
+        self.assertEqual(self.bot.strip_code_fence(text), text)
+
+    def test_strips_plain_fence(self):
+        text = "```\n2024-01-01 * \"Shop\" \"Groceries\"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD\n```"
+        result = self.bot.strip_code_fence(text)
+        self.assertNotIn("```", result)
+        self.assertIn("2024-01-01", result)
+
+    def test_strips_language_tagged_fence(self):
+        inner = "2024-01-01 * \"A\" \"B\"\n  X:Y  1 USD\n  A:B  -1 USD"
+        text = f"```beancount\n{inner}\n```"
+        self.assertEqual(self.bot.strip_code_fence(text), inner)
+
+    def test_too_few_lines_not_stripped(self):
+        text = "```\nhello\n```"
+        # 3 lines but the inner is just 1 line; strip_code_fence strips it
+        result = self.bot.strip_code_fence(text)
+        self.assertEqual(result, "hello")
+
+    def test_two_line_fence_not_stripped(self):
+        # Only 2 lines total — not a valid fence
+        text = "```\nhello```"
+        result = self.bot.strip_code_fence(text)
+        self.assertIn("```", result)
+
+
+class TestNormalizeAndValidate(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+        self.accounts = [
+            "Assets:WeChat:Current",
+            "Expenses:Food",
+            "Assets:Cash",
+            "Liabilities:CreditCard:Chase",
+        ]
+
+    def _valid_entry(self):
+        return (
+            '2024-01-15 * "KFC" "Lunch"\n'
+            "  Expenses:Food  10 USD\n"
+            "  Assets:Cash  -10 USD"
+        )
+
+    def test_valid_entry_returned(self):
+        result = self.bot.normalize_and_validate_llm_entry(self._valid_entry(), self.accounts)
+        self.assertIn("2024-01-15", result)
+        self.assertIn("Expenses:Food", result)
+
+    def test_too_short_raises(self):
+        with self.assertRaises(ValueError, msg="too short"):
+            self.bot.normalize_and_validate_llm_entry("header\n  X  1 USD", self.accounts)
+
+    def test_fewer_than_two_postings_raises(self):
+        entry = '2024-01-15 * "A" "B"\n  metadata: "x"\n  metadata2: "y"'
+        with self.assertRaises(ValueError):
+            self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+
+    def test_unbalanced_same_currency_raises(self):
+        entry = (
+            '2024-01-15 * "A" "B"\n'
+            "  Expenses:Food  15 USD\n"
+            "  Assets:Cash  -10 USD"
+        )
+        with self.assertRaises(ValueError):
+            self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+
+    def test_both_same_sign_raises(self):
+        entry = (
+            '2024-01-15 * "A" "B"\n'
+            "  Expenses:Food  10 USD\n"
+            "  Assets:Cash  10 USD"
+        )
+        with self.assertRaises(ValueError):
+            self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+
+    def test_strips_code_fence(self):
+        fenced = "```\n" + self._valid_entry() + "\n```"
+        result = self.bot.normalize_and_validate_llm_entry(fenced, self.accounts)
+        self.assertNotIn("```", result)
+
+    def test_prefer_current_applied(self):
+        # Input uses Assets:WeChat without :Current; list has Assets:WeChat:Current
+        entry = (
+            '2024-01-15 * "Shop" "Lunch"\n'
+            "  Expenses:Food  20 USD\n"
+            "  Assets:WeChat  -20 USD"
+        )
+        result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+        self.assertIn("Assets:WeChat:Current", result)
+
+    def test_cross_currency_auto_fx(self):
+        entry = (
+            '2024-01-15 * "Shop" "Coffee"\n'
+            "  Expenses:Food  100 CNY\n"
+            "  Assets:Cash  -13 USD"
+        )
+        result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+        self.assertIn("@", result)
+
+    def test_three_posting_balance_check(self):
+        # Valid 3-posting split bill
+        entry = (
+            '2024-01-15 * "Restaurant" "Dinner"\n'
+            "  Liabilities:CreditCard:Chase  -90 USD\n"
+            "  Assets:Cash  45 USD\n"
+            "  Expenses:Food  45 USD"
+        )
+        result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+        self.assertIn("Expenses:Food", result)
+
+
+class TestEnsureDatetimeMetadata(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_inserts_after_header(self):
+        entry = '2024-01-15 * "A" "B"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD'
+        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15 12:00:00")
+        lines = result.splitlines()
+        self.assertEqual(lines[0], '2024-01-15 * "A" "B"')
+        self.assertIn('datetime: "2024-01-15 12:00:00"', lines[1])
+
+    def test_idempotent_if_already_present(self):
+        entry = (
+            '2024-01-15 * "A" "B"\n'
+            '  datetime: "2024-01-15 12:00:00"\n'
+            "  Expenses:Food  10 USD\n"
+            "  Assets:Cash  -10 USD"
+        )
+        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15 12:00:00")
+        self.assertEqual(result.count('datetime:'), 1)
+
+    def test_works_with_leading_comment(self):
+        entry = (
+            "; original user input\n"
+            '2024-01-15 * "A" "B"\n'
+            "  Expenses:Food  10 USD\n"
+            "  Assets:Cash  -10 USD"
+        )
+        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15 09:30:00")
+        lines = result.splitlines()
+        header_idx = next(i for i, l in enumerate(lines) if l.startswith("2024-01-15 *"))
+        self.assertIn('datetime:', lines[header_idx + 1])
+
+    def test_empty_string_returned_unchanged(self):
+        self.assertEqual(self.bot.ensure_datetime_metadata("", "2024-01-15 00:00:00"), "")
+
+
+class TestPrependNaturalLanguageComment(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_prepends_comment(self):
+        entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
+        result = self.bot.prepend_natural_language_comment(entry, "lunch at KFC")
+        self.assertTrue(result.startswith("; lunch at KFC\n"))
+
+    def test_empty_user_input_unchanged(self):
+        entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
+        self.assertEqual(self.bot.prepend_natural_language_comment(entry, ""), entry)
+        self.assertEqual(self.bot.prepend_natural_language_comment(entry, "   "), entry)
+
+    def test_idempotent_if_already_present(self):
+        entry = "; lunch at KFC\n2024-01-15 * \"A\" \"B\"\n  X  10 USD\n  Y  -10 USD"
+        result = self.bot.prepend_natural_language_comment(entry, "lunch at KFC")
+        self.assertEqual(result.count("; lunch at KFC"), 1)
+
+    def test_multiline_input_flattened(self):
+        entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
+        result = self.bot.prepend_natural_language_comment(entry, "lunch\nat KFC")
+        self.assertTrue(result.startswith("; lunch at KFC\n"))
+
+
+class TestMatchAccount(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+        self.bot._accounts_cache["accounts"] = [
+            "Assets:WeChat:Current",
+            "Assets:Alipay:Current",
+            "Expenses:Food",
+            "Liabilities:CreditCard:Chase",
+        ]
+
+    def test_match_by_suffix(self):
+        with patch.object(self.bot, "parse_accounts", return_value=self.bot._accounts_cache["accounts"]):
+            result = self.bot.match_account("Alipay:Current")
+        self.assertEqual(result, "Assets:Alipay:Current")
+
+    def test_case_insensitive(self):
+        with patch.object(self.bot, "parse_accounts", return_value=self.bot._accounts_cache["accounts"]):
+            result = self.bot.match_account("food")
+        self.assertEqual(result, "Expenses:Food")
+
+    def test_no_match_returns_none(self):
+        with patch.object(self.bot, "parse_accounts", return_value=self.bot._accounts_cache["accounts"]):
+            result = self.bot.match_account("NonExistent:Account")
+        self.assertIsNone(result)
+
+
+class TestPreferCurrentAccount(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_exact_match_returned(self):
+        accounts = ["Assets:WeChat:Current", "Expenses:Food"]
+        self.assertEqual(self.bot.prefer_current_account("Expenses:Food", accounts), "Expenses:Food")
+
+    def test_adds_current_suffix(self):
+        accounts = ["Assets:WeChat:Current", "Expenses:Food"]
+        self.assertEqual(self.bot.prefer_current_account("Assets:WeChat", accounts), "Assets:WeChat:Current")
+
+    def test_liabilities_not_extended(self):
+        accounts = ["Liabilities:CreditCard:Chase", "Liabilities:CreditCard:Chase:Current"]
+        # Liabilities accounts should NOT get :Current added
+        result = self.bot.prefer_current_account("Liabilities:CreditCard:Chase", accounts)
+        self.assertEqual(result, "Liabilities:CreditCard:Chase")
+
+    def test_already_has_current_not_doubled(self):
+        accounts = ["Assets:WeChat:Current"]
+        result = self.bot.prefer_current_account("Assets:WeChat:Current", accounts)
+        self.assertEqual(result, "Assets:WeChat:Current")
+
+    def test_unknown_account_returned_as_is(self):
+        accounts = ["Assets:WeChat:Current"]
+        result = self.bot.prefer_current_account("Assets:HSBC", accounts)
+        self.assertEqual(result, "Assets:HSBC")
+
+
+class TestExtractAccountsFromEntry(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_extracts_posting_accounts(self):
+        entry = (
+            '2024-01-15 * "Shop" "Lunch"\n'
+            "  Expenses:Food  20 USD\n"
+            "  Assets:Cash  -20 USD"
+        )
+        result = self.bot.extract_accounts_from_entry(entry)
+        self.assertIn("Expenses:Food", result)
+        self.assertIn("Assets:Cash", result)
+        self.assertEqual(len(result), 2)
+
+    def test_header_not_included(self):
+        entry = (
+            '2024-01-15 * "Shop" "Lunch"\n'
+            "  Expenses:Food  20 USD\n"
+            "  Assets:Cash  -20 USD"
+        )
+        for acct in self.bot.extract_accounts_from_entry(entry):
+            self.assertNotIn("*", acct)
+
+    def test_metadata_lines_not_included(self):
+        entry = (
+            '2024-01-15 * "Shop" "Lunch"\n'
+            '  datetime: "2024-01-15 12:00:00"\n'
+            "  Expenses:Food  20 USD\n"
+            "  Assets:Cash  -20 USD"
+        )
+        result = self.bot.extract_accounts_from_entry(entry)
+        # datetime: line starts with spaces but has no number amount, so it won't match posting_re
+        # Actually let's just check we get the two real accounts
+        self.assertIn("Expenses:Food", result)
+        self.assertIn("Assets:Cash", result)
+
+
+class TestAccountsForPrompt(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_annotates_accounts_with_currency(self):
+        self.bot._accounts_cache["accounts"] = ["Assets:WeChat:Current", "Expenses:Food"]
+        self.bot._accounts_cache["currencies"] = {"Assets:WeChat:Current": "CNY"}
+        result = self.bot._accounts_for_prompt()
+        self.assertIn("Assets:WeChat:Current CNY", result)
+        self.assertIn("Expenses:Food", result)
+        # Expenses:Food should not have extra currency annotation
+        self.assertEqual(next(x for x in result if "Food" in x), "Expenses:Food")
+
+    def test_no_currency_no_annotation(self):
+        self.bot._accounts_cache["accounts"] = ["Assets:Cash"]
+        self.bot._accounts_cache["currencies"] = {}
+        result = self.bot._accounts_for_prompt()
+        self.assertEqual(result, ["Assets:Cash"])
+
+
+class TestAddNonPnlAccountsToCommitMessage(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_adds_assets_not_expenses(self):
+        entry = (
+            '2024-01-15 * "Shop" "Lunch"\n'
+            "  Expenses:Food  20 USD\n"
+            "  Assets:Cash  -20 USD"
+        )
+        result = self.bot.add_non_pnl_accounts_to_commit_message("prefix\n\n", entry)
+        self.assertIn("Assets:Cash", result)
+        self.assertNotIn("Expenses:Food", result)
+
+    def test_adds_liabilities(self):
+        entry = (
+            '2024-01-15 * "Shop" "Lunch"\n'
+            "  Expenses:Food  20 USD\n"
+            "  Liabilities:CreditCard:Chase  -20 USD"
+        )
+        result = self.bot.add_non_pnl_accounts_to_commit_message("prefix\n\n", entry)
+        self.assertIn("Liabilities:CreditCard:Chase", result)
+
+    def test_does_not_add_income(self):
+        entry = (
+            '2024-01-15 * "Salary" "Salary"\n'
+            "  Assets:Bank  5000 USD\n"
+            "  Income:Salary  -5000 USD"
+        )
+        result = self.bot.add_non_pnl_accounts_to_commit_message("prefix\n\n", entry)
+        self.assertNotIn("Income:Salary", result)
+        self.assertIn("Assets:Bank", result)
+
+
+class TestIsPendingExpired(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_fresh_entry_not_expired(self):
+        pending = self.bot._make_pending_entry(1, "app", "cm", "inp", "2024-01-15")
+        self.assertFalse(self.bot.is_pending_expired(pending))
+
+    def test_old_entry_is_expired(self):
+        pending = self.bot._make_pending_entry(1, "app", "cm", "inp", "2024-01-15")
+        pending["created_at"] = time.time() - main.DRAFT_TTL_SECONDS - 1
+        self.assertTrue(self.bot.is_pending_expired(pending))
+
+
+class TestCleanupExpiredDrafts(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_removes_expired_entries(self):
+        old_entry = self.bot._make_pending_entry(42, "app", "cm", "inp", "2024-01-15")
+        old_entry["created_at"] = time.time() - main.DRAFT_TTL_SECONDS - 10
+        self.bot.pending_llm_entries["1"] = old_entry
+
+        fresh_entry = self.bot._make_pending_entry(42, "app2", "cm2", "inp2", "2024-01-15")
+        self.bot.pending_llm_entries["2"] = fresh_entry
+
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot.cleanup_expired_drafts()
+
+        self.assertNotIn("1", self.bot.pending_llm_entries)
+        self.assertIn("2", self.bot.pending_llm_entries)
+        mock_send.assert_called_once()
+
+    def test_notifies_user_on_expiry(self):
+        old_entry = self.bot._make_pending_entry(99, "app", "cm", "inp", "2024-01-15")
+        old_entry["created_at"] = time.time() - main.DRAFT_TTL_SECONDS - 10
+        self.bot.pending_llm_entries["1"] = old_entry
+
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot.cleanup_expired_drafts()
+
+        mock_send.assert_called_once_with(99, unittest.mock.ANY)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

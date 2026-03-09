@@ -56,7 +56,7 @@ const ACCOUNT_TYPE_MAP: Record<string, string> = {
 
 // --- HTML escaping ---
 
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
 	return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
@@ -104,7 +104,7 @@ function formatInTimezone(tz: string): { dateStr: string; datetimeStr: string } 
 	return { dateStr, datetimeStr };
 }
 
-function addDays(dateStr: string, days: number): string {
+export function addDays(dateStr: string, days: number): string {
 	const d = new Date(dateStr + 'T00:00:00Z');
 	d.setUTCDate(d.getUTCDate() + days);
 	return d.toISOString().slice(0, 10);
@@ -308,7 +308,7 @@ async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string
 	return { accounts, currencies };
 }
 
-function accountsForPrompt(accounts: string[], currencies: Record<string, string>): string[] {
+export function accountsForPrompt(accounts: string[], currencies: Record<string, string>): string[] {
 	return accounts.map((a) => (currencies[a] ? `${a} ${currencies[a]}` : a));
 }
 
@@ -404,7 +404,7 @@ const INVEST_ORDER_SYSTEM_PROMPT =
 	'  Expenses:Investments:Fee   5.20 GBP\n' +
 	'  Assets:Broker:Cash       -3469.98 GBP\n';
 
-function buildUserPrompt(
+export function buildUserPrompt(
 	txnDate: string,
 	accountsWithCurrencies: string[],
 	userInput: string,
@@ -437,7 +437,7 @@ function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[
 
 // --- LLM functions ---
 
-function getLLMBackends(env: Env): LLMBackend[] {
+export function getLLMBackends(env: Env): LLMBackend[] {
 	if (env.LLM_BACKENDS) {
 		try {
 			const parsed = JSON.parse(env.LLM_BACKENDS) as LLMBackend[];
@@ -494,7 +494,7 @@ async function callLLMRaw(env: Env, messages: unknown[], temperature: number): P
 	throw new Error(`All LLM backends failed. Last error: ${lastError?.message}`);
 }
 
-function preferCurrentAccount(account: string, accounts: string[]): string {
+export function preferCurrentAccount(account: string, accounts: string[]): string {
 	const accountsLower = new Map(accounts.map((a) => [a.toLowerCase(), a]));
 
 	const lower = account.toLowerCase();
@@ -508,7 +508,7 @@ function preferCurrentAccount(account: string, accounts: string[]): string {
 	return account;
 }
 
-function stripCodeFence(text: string): string {
+export function stripCodeFence(text: string): string {
 	const stripped = text.trim();
 	if (stripped.startsWith('```') && stripped.endsWith('```')) {
 		const lines = stripped.split('\n');
@@ -517,7 +517,7 @@ function stripCodeFence(text: string): string {
 	return stripped;
 }
 
-function normalizeAndValidateLLMEntry(entryText: string, accounts: string[]): string {
+export function normalizeAndValidateLLMEntry(entryText: string, accounts: string[]): string {
 	const text = stripCodeFence(entryText);
 	const rawLines = text
 		.split('\n')
@@ -664,14 +664,14 @@ async function callLLMVision(
 
 // --- Account matching ---
 
-function matchAccount(suffix: string, accounts: string[]): string | null {
+export function matchAccount(suffix: string, accounts: string[]): string | null {
 	const suffixLower = suffix.toLowerCase();
 	return accounts.find((a) => a.toLowerCase().endsWith(suffixLower)) ?? null;
 }
 
 // --- Entry post-processing ---
 
-function extractNonPnlAccounts(entryText: string): string[] {
+export function extractNonPnlAccounts(entryText: string): string[] {
 	const accounts: string[] = [];
 	for (const line of entryText.split('\n')) {
 		const m = /^\s+(\S+)\s+/.exec(line);
@@ -682,7 +682,7 @@ function extractNonPnlAccounts(entryText: string): string[] {
 	return accounts;
 }
 
-function buildCommitMessage(prefix: string, entryText: string): string {
+export function buildCommitMessage(prefix: string, entryText: string): string {
 	let msg = prefix;
 	for (const account of extractNonPnlAccounts(entryText)) {
 		msg += `${account}\n`;
@@ -690,9 +690,9 @@ function buildCommitMessage(prefix: string, entryText: string): string {
 	return msg;
 }
 
-function ensureDatetimeMetadata(entryText: string, datetimeStr: string): string {
+export function ensureDatetimeMetadata(entryText: string, datetimeStr: string): string {
+	if (!entryText) return entryText;
 	const lines = entryText.split('\n');
-	if (!lines.length) return entryText;
 
 	const hasDatetime = lines.some((l) => /^\s*datetime\s*:\s*".*"\s*$/.test(l));
 	if (hasDatetime) return entryText;
@@ -712,7 +712,7 @@ function ensureDatetimeMetadata(entryText: string, datetimeStr: string): string 
 	].join('\n');
 }
 
-function prependNaturalLanguageComment(entryText: string, userInput: string): string {
+export function prependNaturalLanguageComment(entryText: string, userInput: string): string {
 	const normalized = (userInput || '')
 		.trim()
 		.split('\n')
@@ -729,19 +729,19 @@ function prependNaturalLanguageComment(entryText: string, userInput: string): st
 
 // --- Templates ---
 
-function renderOpen(date: string, account: string, currency: string, datetime: string): string {
+export function renderOpen(date: string, account: string, currency: string, datetime: string): string {
 	return `${date} open ${account} ${currency} ; opened at ${datetime}`;
 }
 
-function renderClose(date: string, account: string, datetime: string): string {
+export function renderClose(date: string, account: string, datetime: string): string {
 	return `${date} close ${account} ; closed at ${datetime}`;
 }
 
-function renderBalance(date: string, account: string, amount: string, currency: string, datetime: string): string {
+export function renderBalance(date: string, account: string, amount: string, currency: string, datetime: string): string {
 	return `${date} balance ${account} ${amount} ${currency} ; updated at ${datetime}`;
 }
 
-function renderPad(date: string, account: string, padAccount: string, datetime: string): string {
+export function renderPad(date: string, account: string, padAccount: string, datetime: string): string {
 	return `${date} pad ${account} ${padAccount} ; updated at ${datetime}`;
 }
 
