@@ -2,7 +2,18 @@
 
 追加记账记录到特定 GitHub 仓库的特定文件，随时随地用 Telegram 也可以记录生活消费，且不影响现有的 Beancount 工作流。
 
-## Quick Start
+## 部署方式
+
+本项目支持两种部署方式，功能相同：
+
+| | Python Bot | Cloudflare Worker |
+|---|---|---|
+| 目录 | 根目录 | `worker/` |
+| 运行方式 | 长轮询（polling） | Webhook（无服务器） |
+| 状态存储 | 内存 | Cloudflare KV |
+| LLM 配置 | `config.json` 中 `LLM_BACKENDS` 数组 | `wrangler secret` 单后端 |
+
+## Quick Start（Python Bot）
 
 - 依赖
 
@@ -28,6 +39,19 @@
   ```bash
   python main.py
   ```
+
+## Quick Start（Cloudflare Worker）
+
+详见 [`worker/README.md`](worker/README.md)。简要步骤：
+
+1. 配置 `worker/wrangler.toml` 中的基本变量（`REPO_OWNER`、`REPO_NAME` 等）
+2. 设置 secrets：`TELEGRAM_BOT_TOKEN`、`GITHUB_TOKEN`、`WEBHOOK_SECRET`、`LLM_API_KEY`、`LLM_API_BASE_URL`、`LLM_MODEL`
+3. 创建 KV 命名空间：`wrangler kv namespace create KV`，将 ID 填入 `wrangler.toml`
+4. 部署：`cd worker && npm install && wrangler deploy`
+5. 注册 Webhook：
+   ```bash
+   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<worker-url>.workers.dev&secret_token=<WEBHOOK_SECRET>"
+   ```
 
 ## 功能
 
