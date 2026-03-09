@@ -136,7 +136,7 @@ class Bot:
         self.pending_llm_entries = {}
         self.pending_llm_id = 0
         self.pending_decline_reasons = {}
-        self._accounts_cache = {"accounts": None, "ts": 0}
+        self._accounts_cache = {"accounts": None, "currencies": {}, "ts": 0}
         self.llm_enabled = LLM_ENABLED
 
         if not self.llm_enabled:
@@ -176,13 +176,16 @@ class Bot:
         def fetch_account_file(item):
             file_r = requests.get(item["url"], headers=list_headers, timeout=30)
             if file_r.status_code != 200:
-                return [], []
+                return {}, []
             content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
-            opened = [m.strip().split(" ", 1)[0] for m in re.findall(r'\d{4}-\d{2}-\d{2} open (.*)', content)]
+            opened = {}
+            for m in re.findall(r'\d{4}-\d{2}-\d{2} open (\S+)(?:\s+([A-Z][A-Z0-9]{0,9}))?', content):
+                name, currency = m[0], m[1] if m[1] else None
+                opened[name] = currency
             closed = [m.strip().split(" ", 1)[0] for m in re.findall(r'\d{4}-\d{2}-\d{2} close (.*)', content)]
             return opened, closed
 
-        all_opened = set()
+        all_opened = {}
         all_closed = set()
         with ThreadPoolExecutor(max_workers=min(8, len(bean_items) or 1)) as pool:
             futures = {pool.submit(fetch_account_file, item): item for item in bean_items}
@@ -191,10 +194,18 @@ class Bot:
                 all_opened.update(opened)
                 all_closed.update(closed)
 
-        accounts = sorted(all_opened - all_closed)
+        currencies = {k: v for k, v in all_opened.items() if k not in all_closed and v}
+        accounts = sorted(k for k in all_opened if k not in all_closed)
         self._accounts_cache["accounts"] = accounts
+        self._accounts_cache["currencies"] = currencies
         self._accounts_cache["ts"] = now
         return accounts
+
+    def _accounts_for_prompt(self) -> list[str]:
+        """Return account list with default currency annotations for use in LLM prompts."""
+        accounts = self._accounts_cache.get("accounts") or []
+        currencies = self._accounts_cache.get("currencies") or {}
+        return [f"{a} {currencies[a]}" if a in currencies else a for a in accounts]
 
     def match_account(self, account_suffix: str) -> str | None:
         accounts = self.parse_accounts()
@@ -394,7 +405,7 @@ class Bot:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
-        user_prompt = build_user_prompt(txn_date, accounts, user_input, previous_draft, decline_reason)
+        user_prompt = build_user_prompt(txn_date, self._accounts_for_prompt(), user_input, previous_draft, decline_reason)
         payload = {
             "temperature": 0.2,
             "messages": [
@@ -440,7 +451,7 @@ class Bot:
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        {"type": "text", "text": build_invest_order_prompt(txn_date, accounts)},
+                        {"type": "text", "text": build_invest_order_prompt(txn_date, self._accounts_for_prompt())},
                     ],
                 },
             ],
