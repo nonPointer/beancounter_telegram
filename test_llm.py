@@ -140,7 +140,7 @@ def normalize_and_validate_llm_entry(entry_text: str, accounts: list[str]) -> st
         if a0 * a1 >= 0:
             raise ValueError("LLM output invalid: two postings must be one positive and one negative.")
         
-        if c0 == c1 and (a0 + a1) != 0:
+        if c0 == c1 and abs(a0 + a1) > 0.0001:
             raise ValueError(f"LLM output invalid: same-currency postings are unbalanced ({a0} + {a1} != 0).")
         
         if c0 != c1:
@@ -161,8 +161,10 @@ def normalize_and_validate_llm_entry(entry_text: str, accounts: list[str]) -> st
                     rate_str = f"{rate:.8f}".rstrip('0').rstrip('.')
                     postings[1]["rest"] = (postings[1]["rest"] + f" @ {rate_str} {c0}").strip()
                 else:
-                    total_str = f"{abs1:.8f}".rstrip('0').rstrip('.')
-                    postings[0]["rest"] = (postings[0]["rest"] + f" @@ {total_str} {c1}").strip()
+                    # abs0 > 0, abs1 == 0: degenerate cross-currency posting; cannot infer FX rate.
+                    raise ValueError(
+                        "LLM output invalid: one cross-currency posting has zero amount; cannot infer FX rate."
+                    )
     
     account_width = max(len(p["account"]) for p in postings) + 2
     amount_width = max(len(str(p["amount"])) for p in postings) + 2

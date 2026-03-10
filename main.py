@@ -136,6 +136,7 @@ class Bot:
         self.pending_llm_entries = {}
         self.pending_llm_id = 0
         self.pending_decline_reasons = {}
+        self._pending_lock = threading.Lock()
         self._accounts_cache = {"accounts": None, "currencies": {}, "ts": 0}
         self.llm_enabled = LLM_ENABLED
 
@@ -289,7 +290,7 @@ class Bot:
             if a0 * a1 >= 0:
                 raise ValueError("LLM output invalid: two postings must be one positive and one negative.")
 
-            if c0 == c1 and (a0 + a1) != 0:
+            if c0 == c1 and abs(a0 + a1) > 0.0001:
                 raise ValueError(f"LLM output invalid: same-currency postings are unbalanced ({a0} + {a1} != 0).")
 
             if c0 != c1:
@@ -310,8 +311,10 @@ class Bot:
                         rate_str = f"{rate:.8f}".rstrip('0').rstrip('.')
                         postings[1]["rest"] = (postings[1]["rest"] + f" @ {rate_str} {c0}").strip()
                     else:
-                        total_str = f"{abs1:.8f}".rstrip('0').rstrip('.')
-                        postings[0]["rest"] = (postings[0]["rest"] + f" @@ {total_str} {c1}").strip()
+                        # abs0 > 0, abs1 == 0: degenerate cross-currency posting; cannot infer FX rate.
+                        raise ValueError(
+                            "LLM output invalid: one cross-currency posting has zero amount; cannot infer FX rate."
+                        )
 
         account_width = max(len(p["account"]) for p in postings) + 2
         amount_width = max(len(str(p["amount"])) for p in postings) + 2
@@ -506,9 +509,10 @@ class Bot:
             )
 
             pending_id = self.next_pending_id()
-            self.pending_llm_entries[pending_id] = self._make_pending_entry(
-                chat_id, appendix, commit_message, caption or "(investment order screenshot)", date_str
-            )
+            with self._pending_lock:
+                self.pending_llm_entries[pending_id] = self._make_pending_entry(
+                    chat_id, appendix, commit_message, caption or "(investment order screenshot)", date_str
+                )
 
             log("Investment order draft:\n" + appendix)
             self.send_message(
@@ -560,13 +564,20 @@ class Bot:
         }
 
     def next_pending_id(self) -> str:
-        self.pending_llm_id += 1
-        return str(self.pending_llm_id)
+        with self._pending_lock:
+            self.pending_llm_id += 1
+            return str(self.pending_llm_id)
+
+    def _pop_pending(self, pending_id: str) -> dict | None:
+        """Atomically claim (pop) a pending entry. Returns None if already claimed."""
+        with self._pending_lock:
+            return self.pending_llm_entries.pop(pending_id, None)
 
     def remove_decline_reason_bindings(self, pending_id: str):
-        for reason_chat_id, reason_pending_id in list(self.pending_decline_reasons.items()):
-            if reason_pending_id == pending_id:
-                self.pending_decline_reasons.pop(reason_chat_id, None)
+        with self._pending_lock:
+            for reason_chat_id, reason_pending_id in list(self.pending_decline_reasons.items()):
+                if reason_pending_id == pending_id:
+                    self.pending_decline_reasons.pop(reason_chat_id, None)
 
     def add_non_pnl_accounts_to_commit_message(self, commit_message: str, entry_text: str) -> str:
         for account in self.extract_accounts_from_entry(entry_text):
@@ -579,22 +590,22 @@ class Bot:
         return (time.time() - created_at) > DRAFT_TTL_SECONDS
 
     def cleanup_expired_drafts(self):
-        expired_ids = [
-            pending_id
-            for pending_id, pending in self.pending_llm_entries.items()
-            if self.is_pending_expired(pending)
-        ]
+        with self._pending_lock:
+            expired_ids = [
+                pending_id
+                for pending_id, pending in self.pending_llm_entries.items()
+                if self.is_pending_expired(pending)
+            ]
+            expired_entries = {pid: self.pending_llm_entries.pop(pid) for pid in expired_ids}
+            for pid in expired_ids:
+                for reason_chat_id, reason_pending_id in list(self.pending_decline_reasons.items()):
+                    if reason_pending_id == pid:
+                        self.pending_decline_reasons.pop(reason_chat_id, None)
 
-        for pending_id in expired_ids:
-            pending = self.pending_llm_entries.pop(pending_id, None)
-            if not pending:
-                continue
-
+        for pending_id, pending in expired_entries.items():
             chat_id = pending.get("chat_id")
             if chat_id is not None:
                 self.send_message(chat_id, f"Draft expired after {DRAFT_TTL_SECONDS} seconds and was discarded.")
-
-            self.remove_decline_reason_bindings(pending_id)
 
     def build_review_buttons(self, pending_id: str):
         return {
@@ -606,7 +617,8 @@ class Bot:
         }
 
     def run_recheck(self, chat_id: int, pending_id: str, decline_reason: str | None = None):
-        pending = self.pending_llm_entries.get(pending_id)
+        with self._pending_lock:
+            pending = self.pending_llm_entries.get(pending_id)
         if not pending:
             self.send_message(chat_id, "This request is expired or already handled")
             return
@@ -620,7 +632,7 @@ class Bot:
 
         accounts = self.parse_accounts()
         if not accounts:
-            self.pending_llm_entries.pop(pending_id, None)
+            self._pop_pending(pending_id)
             self.send_message(chat_id, "No accounts available. Please check GitHub account parsing first.")
             return
 
@@ -638,10 +650,11 @@ class Bot:
             )
 
             new_pending_id = self.next_pending_id()
-            self.pending_llm_entries[new_pending_id] = self._make_pending_entry(
-                chat_id, new_appendix, new_commit_message, pending["user_input"], pending["date_str"]
-            )
-            self.pending_llm_entries.pop(pending_id, None)
+            with self._pending_lock:
+                self.pending_llm_entries[new_pending_id] = self._make_pending_entry(
+                    chat_id, new_appendix, new_commit_message, pending["user_input"], pending["date_str"]
+                )
+                self.pending_llm_entries.pop(pending_id, None)
 
             log("LLM rechecked draft:\n" + new_appendix)
             self.send_message(
@@ -653,7 +666,7 @@ class Bot:
                 parse_mode="HTML",
             )
         except Exception as e:
-            self.pending_llm_entries.pop(pending_id, None)
+            self._pop_pending(pending_id)
             log(f"LLM recheck failed: {e}")
             error_text = str(e)
             if error_text and ("账户" in error_text or "account" in error_text.lower()):
@@ -675,21 +688,35 @@ class Bot:
             self.answer_callback_query(callback_id, "Unknown action")
             return
 
-        pending = self.pending_llm_entries.get(pending_id)
-        if not pending:
-            self.answer_callback_query(callback_id, "This request is expired or already handled")
-            return
+        # Atomically validate and (for destructive actions) claim the pending entry
+        # so concurrent callbacks for the same pending_id cannot double-process it.
+        with self._pending_lock:
+            pending = self.pending_llm_entries.get(pending_id)
+            if not pending:
+                self.answer_callback_query(callback_id, "This request is expired or already handled")
+                return
 
-        if self.is_pending_expired(pending):
-            self.pending_llm_entries.pop(pending_id, None)
-            self.remove_decline_reason_bindings(pending_id)
-            self.answer_callback_query(callback_id, "Expired")
-            self.send_message(chat_id, f"Draft expired after {DRAFT_TTL_SECONDS} seconds and was discarded.")
-            return
+            if self.is_pending_expired(pending):
+                self.pending_llm_entries.pop(pending_id, None)
+                for rc, rp in list(self.pending_decline_reasons.items()):
+                    if rp == pending_id:
+                        self.pending_decline_reasons.pop(rc, None)
+                self.answer_callback_query(callback_id, "Expired")
+                self.send_message(chat_id, f"Draft expired after {DRAFT_TTL_SECONDS} seconds and was discarded.")
+                return
 
-        if chat_id != pending["chat_id"]:
-            self.answer_callback_query(callback_id, "Not allowed")
-            return
+            if chat_id != pending["chat_id"]:
+                self.answer_callback_query(callback_id, "Not allowed")
+                return
+
+            if action in ("discard", "approve"):
+                # Claim the entry now; prevents any concurrent thread from also processing it.
+                pending = self.pending_llm_entries.pop(pending_id, None)
+                if not pending:
+                    self.answer_callback_query(callback_id, "This request is expired or already handled")
+                    return
+            elif action == "decline_reason":
+                self.pending_decline_reasons[chat_id] = pending_id
 
         self.edit_message_reply_markup(chat_id, message_id)
 
@@ -701,13 +728,11 @@ class Bot:
                 return
 
             self.answer_callback_query(callback_id, "Please send reason")
-            self.pending_decline_reasons[chat_id] = pending_id
             self.send_message(chat_id, "Please send your decline reason as plain text. I will send it to LLM for recheck.")
             return
 
         if action == "discard":
             log(f"User discarded pending {pending_id}")
-            self.pending_llm_entries.pop(pending_id, None)
             self.answer_callback_query(callback_id, "Discarded")
             self.send_message(chat_id, "Discarded. Entry was not saved.")
             return
@@ -728,7 +753,6 @@ class Bot:
         appendix = self.ensure_datetime_metadata(appendix, approve_datetime_str)
         commit_message = pending["commit_message"]
         ok = self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip())
-        self.pending_llm_entries.pop(pending_id, None)
 
         if ok:
             self.answer_callback_query(callback_id, "Approved")
@@ -809,14 +833,16 @@ class Bot:
         except ValueError:
             pass
 
-        pending_reason_id = self.pending_decline_reasons.get(chat_id)
+        with self._pending_lock:
+            pending_reason_id = self.pending_decline_reasons.get(chat_id)
         if pending_reason_id is not None:
             reason_text = text.strip()
             if not reason_text or reason_text.startswith('/'):
                 reply("Please send a non-command reason text, or tap discard.")
                 return
 
-            self.pending_decline_reasons.pop(chat_id, None)
+            with self._pending_lock:
+                self.pending_decline_reasons.pop(chat_id, None)
             log(f"Decline reason received: {reason_text}")
             self.run_recheck(chat_id, pending_reason_id, decline_reason=reason_text)
             return
@@ -974,9 +1000,10 @@ class Bot:
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
                 pending_id = self.next_pending_id()
-                self.pending_llm_entries[pending_id] = self._make_pending_entry(
-                    chat_id, appendix, commit_message, text, date_str
-                )
+                with self._pending_lock:
+                    self.pending_llm_entries[pending_id] = self._make_pending_entry(
+                        chat_id, appendix, commit_message, text, date_str
+                    )
 
                 log("LLM draft:\n" + appendix)
                 self.send_message(
@@ -1068,7 +1095,7 @@ class Bot:
                     return
 
                 if c0 == c1:
-                    if a0 + a1 != 0:
+                    if abs(a0 + a1) > 0.0001:
                         reply(f"同币种 {c0} 的两条 posting 金额不平衡：{a0} + {a1} != 0")
                         return
                 else:
@@ -1114,6 +1141,7 @@ class Bot:
             self.stop.set()
             exit(0)
         except Exception as e:
+            loading_stop_event.set()
             log(e)
             log("Timeout or Connection Error")
             return {"result": []}
