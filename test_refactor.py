@@ -426,15 +426,30 @@ class TestAccountsForPrompt(unittest.TestCase):
     def test_annotates_accounts_with_currency(self):
         self.bot._accounts_cache["accounts"] = ["Assets:WeChat:Current", "Expenses:Food"]
         self.bot._accounts_cache["currencies"] = {"Assets:WeChat:Current": "CNY"}
+        self.bot._accounts_cache["comments"] = {}
         result = self.bot._accounts_for_prompt()
-        self.assertIn("Assets:WeChat:Current CNY", result)
+        self.assertIn("Assets:WeChat:Current (CNY)", result)
         self.assertIn("Expenses:Food", result)
-        # Expenses:Food should not have extra currency annotation
         self.assertEqual(next(x for x in result if "Food" in x), "Expenses:Food")
+
+    def test_annotates_accounts_with_comment(self):
+        self.bot._accounts_cache["accounts"] = ["Assets:Bank:CMB"]
+        self.bot._accounts_cache["currencies"] = {"Assets:Bank:CMB": "CNY"}
+        self.bot._accounts_cache["comments"] = {"Assets:Bank:CMB": "招商银行"}
+        result = self.bot._accounts_for_prompt()
+        self.assertEqual(result, ["Assets:Bank:CMB (CNY) ; 招商银行"])
+
+    def test_comment_without_currency(self):
+        self.bot._accounts_cache["accounts"] = ["Assets:Bank:Foo"]
+        self.bot._accounts_cache["currencies"] = {}
+        self.bot._accounts_cache["comments"] = {"Assets:Bank:Foo": "某银行"}
+        result = self.bot._accounts_for_prompt()
+        self.assertEqual(result, ["Assets:Bank:Foo ; 某银行"])
 
     def test_no_currency_no_annotation(self):
         self.bot._accounts_cache["accounts"] = ["Assets:Cash"]
         self.bot._accounts_cache["currencies"] = {}
+        self.bot._accounts_cache["comments"] = {}
         result = self.bot._accounts_for_prompt()
         self.assertEqual(result, ["Assets:Cash"])
 

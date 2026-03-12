@@ -172,7 +172,7 @@ class Bot:
         self.pending_llm_id = 0
         self.pending_decline_reasons = {}
         self._pending_lock = threading.Lock()
-        self._accounts_cache = {"accounts": None, "currencies": {}, "ts": 0}
+        self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0}
         self.llm_enabled = LLM_ENABLED
 
         if not self.llm_enabled:
@@ -215,10 +215,22 @@ class Bot:
                 return {}, []
             content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
             opened = {}
-            for m in re.findall(r'\d{4}-\d{2}-\d{2} open (\S+)(?:\s+([A-Z][A-Z0-9]{0,9}))?', content):
-                name, currency = m[0], m[1] if m[1] else None
-                opened[name] = currency
-            closed = [m.strip().split(" ", 1)[0] for m in re.findall(r'\d{4}-\d{2}-\d{2} close (.*)', content)]
+            closed = []
+            for line in content.splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                date, directive, account = parts[0], parts[1], parts[2]
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+                    continue
+                if directive == 'open':
+                    # 4th field (if present and looks like a currency code) is default currency
+                    currency = parts[3] if len(parts) >= 4 and re.match(r'^[A-Z][A-Z0-9]{0,9}$', parts[3]) else None
+                    # extract inline comment after ';' as human-readable alias
+                    comment = line.split(';', 1)[1].strip() if ';' in line else None
+                    opened[account] = (currency, comment)
+                elif directive == 'close':
+                    closed.append(account)
             return opened, closed
 
         all_opened = {}
@@ -230,18 +242,29 @@ class Bot:
                 all_opened.update(opened)
                 all_closed.update(closed)
 
-        currencies = {k: v for k, v in all_opened.items() if k not in all_closed and v}
+        currencies = {k: v[0] for k, v in all_opened.items() if k not in all_closed and v[0]}
+        comments = {k: v[1] for k, v in all_opened.items() if k not in all_closed and v[1]}
         accounts = sorted(k for k in all_opened if k not in all_closed)
         self._accounts_cache["accounts"] = accounts
         self._accounts_cache["currencies"] = currencies
+        self._accounts_cache["comments"] = comments
         self._accounts_cache["ts"] = now
         return accounts
 
     def _accounts_for_prompt(self) -> list[str]:
-        """Return account list with default currency annotations for use in LLM prompts."""
+        """Return account list with default currency and comment annotations for use in LLM prompts."""
         accounts = self._accounts_cache.get("accounts") or []
         currencies = self._accounts_cache.get("currencies") or {}
-        return [f"{a} {currencies[a]}" if a in currencies else a for a in accounts]
+        comments = self._accounts_cache.get("comments") or {}
+        result = []
+        for a in accounts:
+            entry = a
+            if a in currencies:
+                entry += f" ({currencies[a]})"
+            if a in comments:
+                entry += f" ; {comments[a]}"
+            result.append(entry)
+        return result
 
     def match_account(self, account_suffix: str) -> str | None:
         accounts = self.parse_accounts()
