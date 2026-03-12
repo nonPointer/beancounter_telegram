@@ -213,3 +213,4 @@ accounts/*
 config.json
 .dev.vars
 node_modules/.cspell.json
+check_balance.py

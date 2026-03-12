@@ -125,6 +125,41 @@ GITHUB_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28"
 }
 
+_DIRECTIVE_HEADER_RE = re.compile(r'^\d{4}-\d{2}-\d{2} ')
+
+
+def extract_last_directive_block(content: str) -> tuple[str, str] | None:
+    """Returns (directive_block_text, new_file_content) or None if no directive found."""
+    lines = content.splitlines()
+    last_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _DIRECTIVE_HEADER_RE.match(lines[i]):
+            last_idx = i
+            break
+    if last_idx is None:
+        return None
+    # Find block end: stop at next col-0 non-blank line
+    block_end = last_idx + 1
+    while block_end < len(lines):
+        line = lines[block_end]
+        if line.strip() == '':
+            block_end += 1
+        elif line[0] not in (' ', '\t'):
+            break
+        else:
+            block_end += 1
+    # Trim trailing blank lines from block
+    while block_end > last_idx + 1 and lines[block_end - 1].strip() == '':
+        block_end -= 1
+    directive_text = '\n'.join(lines[last_idx:block_end])
+    # Remove block + its leading blank separator
+    remove_start = last_idx
+    if remove_start > 0 and lines[remove_start - 1].strip() == '':
+        remove_start -= 1
+    new_lines = lines[:remove_start] + lines[block_end:]
+    new_content = '\n'.join(new_lines).rstrip('\n') + '\n'
+    return directive_text, new_content
+
 
 class Bot:
     def __init__(self, debug: bool = False):
@@ -527,6 +562,43 @@ class Bot:
             log(f"Investment order processing failed: {e}")
             reply(f"Failed to process investment order: {e}")
 
+    def handle_undo(self, chat_id: int):
+        f = self.github_download_file()
+        if not f:
+            self.send_message(chat_id, "Failed to download main.bean from GitHub.")
+            return
+        result = extract_last_directive_block(f["content"])
+        if result is None:
+            self.send_message(chat_id, "main.bean 中没有找到任何指令。")
+            return
+        directive_text, new_content = result
+        header_line = directive_text.splitlines()[0]
+        quoted = re.findall(r'"([^"]*)"', header_line)
+        if len(quoted) >= 2:
+            description = f"{quoted[0]} {quoted[1]}"
+        elif len(quoted) == 1:
+            description = quoted[0]
+        else:
+            description = header_line
+        commit_message = f"Revert: {description}"
+        pending_id = self.next_pending_id()
+        with self._pending_lock:
+            self.pending_llm_entries[pending_id] = {
+                "kind": "undo",
+                "chat_id": chat_id,
+                "transaction_text": directive_text,
+                "new_content": new_content,
+                "file_sha": f["sha"],
+                "commit_message": commit_message,
+                "created_at": time.time(),
+            }
+        self.send_message(
+            chat_id,
+            f"撤回最后一条指令？\n<pre><code>{html.escape(directive_text)}</code></pre>",
+            reply_markup=self.build_undo_buttons(pending_id),
+            parse_mode="HTML",
+        )
+
     def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
         data = {"chat_id": chat_id, "text": text}
         if parse_mode:
@@ -613,6 +685,14 @@ class Bot:
                 {"text": "✅", "callback_data": f"approve:{pending_id}"},
                 {"text": "🔧", "callback_data": f"decline_reason:{pending_id}"},
                 {"text": "❌", "callback_data": f"discard:{pending_id}"},
+            ]]
+        }
+
+    def build_undo_buttons(self, pending_id: str):
+        return {
+            "inline_keyboard": [[
+                {"text": "✅ 确认撤回", "callback_data": f"undo_confirm:{pending_id}"},
+                {"text": "❌ 取消",     "callback_data": f"undo_cancel:{pending_id}"},
             ]]
         }
 
@@ -709,7 +789,7 @@ class Bot:
                 self.answer_callback_query(callback_id, "Not allowed")
                 return
 
-            if action in ("discard", "approve"):
+            if action in ("discard", "approve", "undo_confirm", "undo_cancel"):
                 # Claim the entry now; prevents any concurrent thread from also processing it.
                 pending = self.pending_llm_entries.pop(pending_id, None)
                 if not pending:
@@ -735,6 +815,28 @@ class Bot:
             log(f"User discarded pending {pending_id}")
             self.answer_callback_query(callback_id, "Discarded")
             self.send_message(chat_id, "Discarded. Entry was not saved.")
+            return
+
+        if action == "undo_cancel":
+            log(f"User cancelled undo for pending {pending_id}")
+            self.answer_callback_query(callback_id, "已取消")
+            self.send_message(chat_id, "已取消，未作任何更改。")
+            return
+
+        if action == "undo_confirm":
+            log(f"User confirmed undo for pending {pending_id}")
+            ok = self.github_upload_file(pending["new_content"], pending["file_sha"], pending["commit_message"])
+            if ok:
+                self.answer_callback_query(callback_id, "已撤回")
+                self.send_message(
+                    chat_id,
+                    f"已撤回以下指令：\n<pre><code>{html.escape(pending['transaction_text'])}</code></pre>",
+                    parse_mode="HTML",
+                )
+                log("Undo committed. Removed:\n" + pending["transaction_text"])
+            else:
+                self.answer_callback_query(callback_id, "失败")
+                self.send_message(chat_id, "Failed to upload to GitHub.")
             return
 
         if action != "approve":
@@ -910,6 +1012,9 @@ class Bot:
                     reply("Sankey report is being generated.")
                 else:
                     reply(f"Failed to trigger the report workflow: {err}")
+                return
+            elif command == "undo":
+                self.handle_undo(chat_id)
                 return
             else:
                 reply(f"Unknown command: {command}")

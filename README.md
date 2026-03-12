@@ -61,6 +61,7 @@
 - [x] `/tz <timezone>` 设置时区
 - [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
 - [x] `/view` 触发当月 Sankey 图生成（调用账本仓库的 `monthly-report.yml` workflow）
+- [x] `/undo` 撤回 `main.bean` 中的最后一条指令（支持 transaction、balance、pad、open、close 等任意顶层指令）
 
 ## 账本仓库 GitHub Actions
 
@@ -191,4 +192,10 @@ YYYY-MM-DD * "咖啡店" "咖啡"
 
   ```
   /view
+  ```
+
+- 撤回最后一条指令（预览后确认）
+
+  ```
+  /undo
   ```

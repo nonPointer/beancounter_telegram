@@ -520,5 +520,89 @@ class TestCleanupExpiredDrafts(unittest.TestCase):
         mock_send.assert_called_once_with(99, unittest.mock.ANY)
 
 
+class TestExtractLastDirectiveBlock(unittest.TestCase):
+    """Tests for extract_last_directive_block pure function."""
+
+    def test_empty_content_returns_none(self):
+        self.assertIsNone(main.extract_last_directive_block(""))
+
+    def test_no_directives_returns_none(self):
+        content = "; just a comment\n\nplugin \"beancount.loader\"\n"
+        self.assertIsNone(main.extract_last_directive_block(content))
+
+    def test_single_transaction_extracted(self):
+        content = (
+            '2024-01-15 * "Shop" "Coffee"\n'
+            '  datetime: "2024-01-15 10:00:00"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        result = main.extract_last_directive_block(content)
+        self.assertIsNotNone(result)
+        directive_text, new_content = result
+        self.assertIn('2024-01-15 * "Shop" "Coffee"', directive_text)
+        self.assertEqual(new_content.strip(), "")
+
+    def test_last_of_two_transactions_extracted(self):
+        content = (
+            '2024-01-14 * "A" "first"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '  Expenses:Food  5 CNY\n'
+            '\n'
+            '2024-01-15 * "B" "second"\n'
+            '  Assets:Cash  -10 CNY\n'
+            '  Expenses:Food  10 CNY\n'
+        )
+        result = main.extract_last_directive_block(content)
+        directive_text, new_content = result
+        self.assertIn('"B" "second"', directive_text)
+        self.assertNotIn('"B"', new_content)
+        self.assertIn('"A" "first"', new_content)
+
+    def test_balance_directive_extracted(self):
+        content = (
+            '2024-01-14 * "A" "txn"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '  Expenses:Food  5 CNY\n'
+            '\n'
+            '2024-01-15 balance Assets:Cash  100 CNY\n'
+        )
+        result = main.extract_last_directive_block(content)
+        directive_text, new_content = result
+        self.assertIn('balance Assets:Cash', directive_text)
+        self.assertNotIn('balance', new_content)
+        self.assertIn('"A" "txn"', new_content)
+
+    def test_first_transaction_preserved_after_removal(self):
+        content = (
+            '2024-01-14 * "Keep" "this"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '  Expenses:Food  5 CNY\n'
+            '\n'
+            '2024-01-15 * "Remove" "this"\n'
+            '  Assets:Cash  -10 CNY\n'
+            '  Expenses:Food  10 CNY\n'
+        )
+        _, new_content = main.extract_last_directive_block(content)
+        self.assertIn('"Keep" "this"', new_content)
+        self.assertNotIn('"Remove"', new_content)
+
+    def test_trailing_blank_lines_not_left_dangling(self):
+        content = '2024-01-15 * "A" "B"\n  Assets:Cash  -5 CNY\n  Expenses:Food  5 CNY\n\n\n'
+        _, new_content = main.extract_last_directive_block(content)
+        self.assertNotIn('\n\n', new_content)
+
+    def test_new_content_ends_with_newline(self):
+        content = (
+            '2024-01-14 * "A" "first"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '\n'
+            '2024-01-15 * "B" "second"\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        _, new_content = main.extract_last_directive_block(content)
+        self.assertTrue(new_content.endswith('\n'))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

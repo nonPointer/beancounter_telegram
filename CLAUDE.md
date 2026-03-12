@@ -64,5 +64,12 @@ Optional tuning: `ACCOUNTS_CACHE_TTL` (default 300s), `DRAFT_TTL_SECONDS` (defau
 2. Bot sends entry text + inline confirm/decline/edit buttons to user
 3. On confirm → GitHub commit; on decline → discard; on no action → expires after `DRAFT_TTL_SECONDS` and `cleanup_expired_drafts()` notifies user
 
+Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish them from LLM draft entries. They store `new_content` and `file_sha` pre-computed at show-time.
+
+### /undo command
+- `/undo` — previews and removes the last beancount directive from `main.bean` (any top-level directive: transaction, balance, pad, open, close)
+- `extract_last_directive_block(content)` — module-level pure function; scans backward for last `YYYY-MM-DD ` line, extracts the full block, returns `(directive_text, new_file_content)`
+- Callback actions: `undo_confirm:<id>` commits `new_content` to GitHub; `undo_cancel:<id>` discards
+
 ### Date handling
 First line of user input is tested with `datetime.strptime(line, '%Y-%m-%d')`; if it parses, it overrides today's date and is stripped from the input before LLM call.
