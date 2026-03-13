@@ -619,5 +619,78 @@ class TestExtractLastDirectiveBlock(unittest.TestCase):
         self.assertTrue(new_content.endswith('\n'))
 
 
+class TestBuildUserPromptCurrentTime(unittest.TestCase):
+    """Tests for current_time parameter in build_user_prompt."""
+
+    def test_without_current_time(self):
+        from prompts import build_user_prompt
+        result = build_user_prompt("2026-03-13", ["Assets:Cash"], "lunch 50")
+        self.assertNotIn("current time", result)
+        self.assertIn("Transaction date is 2026-03-13", result)
+
+    def test_with_empty_current_time(self):
+        from prompts import build_user_prompt
+        result = build_user_prompt("2026-03-13", ["Assets:Cash"], "lunch 50", current_time="")
+        self.assertNotIn("current time", result)
+
+    def test_with_current_time(self):
+        from prompts import build_user_prompt
+        result = build_user_prompt("2026-03-13", ["Assets:Cash"], "lunch 50", current_time="14:30")
+        self.assertIn("(current time: 14:30)", result)
+        self.assertIn("Transaction date is 2026-03-13", result)
+
+    def test_with_previous_draft_and_time(self):
+        from prompts import build_user_prompt
+        result = build_user_prompt(
+            "2026-03-13", ["Assets:Cash"], "lunch 50",
+            previous_draft="old draft", current_time="08:00",
+        )
+        self.assertIn("(current time: 08:00)", result)
+        self.assertIn("Previous declined draft:", result)
+
+    def test_with_decline_reason_and_time(self):
+        from prompts import build_user_prompt
+        result = build_user_prompt(
+            "2026-03-13", ["Assets:Cash"], "lunch 50",
+            decline_reason="wrong account", current_time="19:45",
+        )
+        self.assertIn("(current time: 19:45)", result)
+        self.assertIn("Decline reason from user:", result)
+
+    def test_with_all_optional_params(self):
+        from prompts import build_user_prompt
+        result = build_user_prompt(
+            "2026-03-13", ["Assets:Cash", "Expenses:Food"], "dinner 80",
+            previous_draft="draft v1", decline_reason="fix payee",
+            current_time="20:15",
+        )
+        self.assertIn("(current time: 20:15)", result)
+        self.assertIn("Previous declined draft:", result)
+        self.assertIn("Decline reason from user:", result)
+        self.assertIn("Assets:Cash", result)
+        self.assertIn("Expenses:Food", result)
+
+
+class TestBuildInvestOrderPromptCurrentTime(unittest.TestCase):
+    """Tests for current_time parameter in build_invest_order_prompt."""
+
+    def test_without_current_time(self):
+        from prompts import build_invest_order_prompt
+        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"])
+        self.assertNotIn("current time", result)
+        self.assertIn("Reference date (today): 2026-03-13.", result)
+
+    def test_with_empty_current_time(self):
+        from prompts import build_invest_order_prompt
+        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_time="")
+        self.assertNotIn("current time", result)
+
+    def test_with_current_time(self):
+        from prompts import build_invest_order_prompt
+        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_time="09:30")
+        self.assertIn("(current time: 09:30)", result)
+        self.assertIn("Reference date (today): 2026-03-13", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

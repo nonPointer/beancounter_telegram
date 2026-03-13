@@ -462,11 +462,12 @@ class Bot:
         txn_date: str,
         previous_draft: str | None = None,
         decline_reason: str | None = None,
+        current_time: str = "",
     ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
-        user_prompt = build_user_prompt(txn_date, self._accounts_for_prompt(), user_input, previous_draft, decline_reason)
+        user_prompt = build_user_prompt(txn_date, self._accounts_for_prompt(), user_input, previous_draft, decline_reason, current_time)
         payload = {
             "temperature": 0.2,
             "messages": [
@@ -499,7 +500,7 @@ class Bot:
             return None
         return dl.content
 
-    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str) -> str:
+    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, current_time: str = "") -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
@@ -512,7 +513,7 @@ class Bot:
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        {"type": "text", "text": build_invest_order_prompt(txn_date, self._accounts_for_prompt())},
+                        {"type": "text", "text": build_invest_order_prompt(txn_date, self._accounts_for_prompt(), current_time)},
                     ],
                 },
             ],
@@ -548,6 +549,7 @@ class Bot:
 
         dt = datetime.now(self.timezone)
         date_str = dt.strftime('%Y-%m-%d')
+        time_str = dt.strftime('%H:%M')
 
         # Use highest-resolution photo
         file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
@@ -559,7 +561,7 @@ class Bot:
             return
 
         try:
-            appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str)
+            appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, time_str)
             if caption:
                 appendix = self.prepend_natural_language_comment(appendix, caption)
             commit_message = self.add_non_pnl_accounts_to_commit_message(
@@ -746,6 +748,7 @@ class Bot:
                 pending["date_str"],
                 previous_draft=pending["appendix"],
                 decline_reason=decline_reason,
+                current_time=datetime.now(self.timezone).strftime('%H:%M'),
             )
             new_appendix = self.prepend_natural_language_comment(new_appendix, pending["user_input"])
             new_commit_message = self.add_non_pnl_accounts_to_commit_message(
@@ -945,6 +948,7 @@ class Bot:
 
         dt = datetime.now(self.timezone)
         date_str = dt.strftime('%Y-%m-%d')
+        time_str = dt.strftime('%H:%M')
         datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
         custom_date = False
 
@@ -1123,7 +1127,7 @@ class Bot:
                 reply("No accounts available. Please check GitHub account parsing first.")
                 return
             try:
-                appendix = self.call_openai_compatible(text, accounts, date_str)
+                appendix = self.call_openai_compatible(text, accounts, date_str, current_time=time_str)
                 appendix = self.prepend_natural_language_comment(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 

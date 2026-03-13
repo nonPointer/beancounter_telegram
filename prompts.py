@@ -32,6 +32,8 @@ BEANCOUNT_SYSTEM_PROMPT = (
     "If user mentions a specific item name (e.g., 'coke', 'coffee', 'pizza'), use that item name in the narration, NOT a generic category. "
     "Examples: 'coke' → narration 'Coke' (NOT '购物' or '饮料'); 'coffee' → narration 'Coffee' (NOT '饮料'); 'pizza' → narration 'Pizza' (NOT '餐饮'). "
     "Use specific meal types from user input: 'brunch' → 'Brunch', 'lunch' → 'Lunch', 'dinner' / 晚餐 → '晚餐', 'breakfast' → 'Breakfast'. "
+    "When the current time is provided, use it to infer meal context if the user mentions eating without specifying the meal type "
+    "(e.g., morning → 'Breakfast', noon → 'Lunch', evening → 'Dinner'). "
     "Use generic categories ONLY when no specific item is mentioned: '购物', '餐饮', '交通'. "
     "DO NOT use action verbs like '吃', '买', '购买' as narration. "
     "Examples of good narrations: 'Coke', 'Coffee', 'Brunch', '晚餐', '打车', '转账', '充值'. "
@@ -114,9 +116,10 @@ INVEST_ORDER_SYSTEM_PROMPT = (
 )
 
 
-def build_invest_order_prompt(txn_date: str, accounts: list[str]) -> str:
+def build_invest_order_prompt(txn_date: str, accounts: list[str], current_time: str = "") -> str:
+    time_info = f" (current time: {current_time})" if current_time else ""
     return (
-        f"Reference date (today): {txn_date}.\n"
+        f"Reference date (today): {txn_date}{time_info}.\n"
         "Account list:\n"
         + "\n".join(accounts)
         + "\n\n"
@@ -131,10 +134,12 @@ def build_user_prompt(
     user_input: str,
     previous_draft: str | None = None,
     decline_reason: str | None = None,
+    current_time: str = "",
 ) -> str:
     """构建用户 prompt"""
+    time_info = f" (current time: {current_time})" if current_time else ""
     prompt = (
-        f"Transaction date is {txn_date}. Use this exact date in the output.\n"
+        f"Transaction date is {txn_date}. Use this exact date in the output.{time_info}\n"
         "Account list:\n"
         + "\n".join(accounts)
         + "\n\n"
