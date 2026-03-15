@@ -692,5 +692,249 @@ class TestBuildInvestOrderPromptCurrentTime(unittest.TestCase):
         self.assertIn("Reference date (today): 2026-03-13", result)
 
 
+class TestExtractAllDirectiveBlocks(unittest.TestCase):
+    """Tests for extract_all_directive_blocks pure function."""
+
+    def test_empty_content(self):
+        self.assertEqual(main.extract_all_directive_blocks(""), [])
+
+    def test_no_directives(self):
+        content = "; just a comment\n\nplugin \"beancount.loader\"\n"
+        self.assertEqual(main.extract_all_directive_blocks(content), [])
+
+    def test_single_transaction(self):
+        content = (
+            '2024-01-15 * "Shop" "Coffee"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0][0], "2024-01-15")
+        self.assertIn('"Shop" "Coffee"', blocks[0][1])
+
+    def test_two_transactions(self):
+        content = (
+            '2024-01-14 * "A" "first"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '  Expenses:Food  5 CNY\n'
+            '\n'
+            '2024-01-15 * "B" "second"\n'
+            '  Assets:Cash  -10 CNY\n'
+            '  Expenses:Food  10 CNY\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], "2024-01-14")
+        self.assertIn('"A" "first"', blocks[0][1])
+        self.assertEqual(blocks[1][0], "2024-01-15")
+        self.assertIn('"B" "second"', blocks[1][1])
+
+    def test_includes_leading_comment(self):
+        content = (
+            '; lunch at KFC\n'
+            '2024-01-15 * "KFC" "Lunch"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 1)
+        self.assertTrue(blocks[0][1].startswith('; lunch at KFC'))
+
+    def test_includes_metadata_lines(self):
+        content = (
+            '2024-01-15 * "Shop" "Coffee"\n'
+            '  datetime: "2024-01-15 10:00:00"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 1)
+        self.assertIn('datetime:', blocks[0][1])
+
+    def test_mixed_directive_types(self):
+        content = (
+            '2024-01-14 * "A" "txn"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '  Expenses:Food  5 CNY\n'
+            '\n'
+            '2024-01-15 balance Assets:Cash  100 CNY\n'
+            '\n'
+            '2024-01-16 pad Assets:Cash Equity:Opening\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(blocks[0][0], "2024-01-14")
+        self.assertEqual(blocks[1][0], "2024-01-15")
+        self.assertIn("balance", blocks[1][1])
+        self.assertEqual(blocks[2][0], "2024-01-16")
+        self.assertIn("pad", blocks[2][1])
+
+    def test_same_date_multiple_entries(self):
+        content = (
+            '2024-01-15 * "A" "first"\n'
+            '  Expenses:Food  5 CNY\n'
+            '  Assets:Cash  -5 CNY\n'
+            '\n'
+            '2024-01-15 * "B" "second"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], "2024-01-15")
+        self.assertEqual(blocks[1][0], "2024-01-15")
+
+    def test_comment_not_shared_across_entries(self):
+        content = (
+            '2024-01-14 * "A" "first"\n'
+            '  Assets:Cash  -5 CNY\n'
+            '  Expenses:Food  5 CNY\n'
+            '\n'
+            '; second entry note\n'
+            '2024-01-15 * "B" "second"\n'
+            '  Assets:Cash  -10 CNY\n'
+            '  Expenses:Food  10 CNY\n'
+        )
+        blocks = main.extract_all_directive_blocks(content)
+        self.assertEqual(len(blocks), 2)
+        self.assertNotIn(';', blocks[0][1])
+        self.assertIn('; second entry note', blocks[1][1])
+
+
+class TestHandleLast(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def _make_file(self, content):
+        return {"content": content, "sha": "abc123"}
+
+    def test_shows_last_5_entries(self):
+        entries = []
+        for i in range(1, 8):
+            entries.append(
+                f'2024-01-{i:02d} * "Shop{i}" "Item{i}"\n'
+                f'  Expenses:Food  {i}0 CNY\n'
+                f'  Assets:Cash  -{i}0 CNY'
+            )
+        content = "\n\n".join(entries) + "\n"
+
+        with patch.object(self.bot, "github_download_file", return_value=self._make_file(content)):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_last(42)
+
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][1]
+        self.assertIn("最近 5 条记录", msg)
+        # Should contain entries 3-7 but not 1-2
+        self.assertIn("Shop3", msg)
+        self.assertIn("Shop7", msg)
+        self.assertNotIn("Shop2", msg)
+
+    def test_shows_all_when_fewer_than_count(self):
+        content = (
+            '2024-01-15 * "A" "only"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+        )
+        with patch.object(self.bot, "github_download_file", return_value=self._make_file(content)):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_last(42)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn("最近 1 条记录", msg)
+
+    def test_custom_count(self):
+        entries = []
+        for i in range(1, 6):
+            entries.append(
+                f'2024-01-{i:02d} * "Shop{i}" "Item{i}"\n'
+                f'  Expenses:Food  {i}0 CNY\n'
+                f'  Assets:Cash  -{i}0 CNY'
+            )
+        content = "\n\n".join(entries) + "\n"
+
+        with patch.object(self.bot, "github_download_file", return_value=self._make_file(content)):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_last(42, count=2)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn("最近 2 条记录", msg)
+        self.assertIn("Shop4", msg)
+        self.assertIn("Shop5", msg)
+        self.assertNotIn("Shop3", msg)
+
+    def test_empty_file(self):
+        with patch.object(self.bot, "github_download_file", return_value=self._make_file("")):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_last(42)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn("没有找到任何记录", msg)
+
+    def test_download_failure(self):
+        with patch.object(self.bot, "github_download_file", return_value=None):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_last(42)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn("Failed to download", msg)
+
+
+class TestHandleToday(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def _make_file(self, content):
+        return {"content": content, "sha": "abc123"}
+
+    def test_shows_today_entries(self):
+        today = datetime.now(self.bot.timezone).strftime('%Y-%m-%d')
+        content = (
+            '2020-01-01 * "Old" "entry"\n'
+            '  Expenses:Food  5 CNY\n'
+            '  Assets:Cash  -5 CNY\n'
+            '\n'
+            f'{today} * "Today" "first"\n'
+            '  Expenses:Food  10 CNY\n'
+            '  Assets:Cash  -10 CNY\n'
+            '\n'
+            f'{today} * "Today" "second"\n'
+            '  Expenses:Food  20 CNY\n'
+            '  Assets:Cash  -20 CNY\n'
+        )
+        with patch.object(self.bot, "github_download_file", return_value=self._make_file(content)):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_today(42)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn(f"今天（{today}）共 2 条记录", msg)
+        self.assertIn("Today", msg)
+        self.assertNotIn("Old", msg)
+
+    def test_no_entries_today(self):
+        content = (
+            '2020-01-01 * "Old" "entry"\n'
+            '  Expenses:Food  5 CNY\n'
+            '  Assets:Cash  -5 CNY\n'
+        )
+        with patch.object(self.bot, "github_download_file", return_value=self._make_file(content)):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_today(42)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn("没有记录", msg)
+
+    def test_download_failure(self):
+        with patch.object(self.bot, "github_download_file", return_value=None):
+            with patch.object(self.bot, "send_message") as mock_send:
+                self.bot.handle_today(42)
+
+        msg = mock_send.call_args[0][1]
+        self.assertIn("Failed to download", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

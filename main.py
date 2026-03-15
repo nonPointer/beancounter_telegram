@@ -128,6 +128,42 @@ GITHUB_HEADERS = {
 _DIRECTIVE_HEADER_RE = re.compile(r'^\d{4}-\d{2}-\d{2} ')
 
 
+def extract_all_directive_blocks(content: str) -> list[tuple[str, str]]:
+    """Returns list of (date_str, directive_block_text) for all directives, in file order.
+
+    Each block includes any leading ';' comment lines immediately before the directive header.
+    """
+    lines = content.splitlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        if _DIRECTIVE_HEADER_RE.match(lines[i]):
+            date_str = lines[i][:10]
+            # Look backward for leading ';' comment lines
+            comment_start = i
+            while comment_start > 0 and lines[comment_start - 1].startswith(';'):
+                comment_start -= 1
+            # Find block end: continuation lines are indented or blank
+            block_end = i + 1
+            while block_end < len(lines):
+                line = lines[block_end]
+                if line.strip() == '':
+                    block_end += 1
+                elif line[0] in (' ', '\t'):
+                    block_end += 1
+                else:
+                    break
+            # Trim trailing blank lines from block
+            while block_end > i + 1 and lines[block_end - 1].strip() == '':
+                block_end -= 1
+            directive_text = '\n'.join(lines[comment_start:block_end])
+            blocks.append((date_str, directive_text))
+            i = block_end
+        else:
+            i += 1
+    return blocks
+
+
 def extract_last_directive_block(content: str) -> tuple[str, str] | None:
     """Returns (directive_block_text, new_file_content) or None if no directive found."""
     lines = content.splitlines()
@@ -624,6 +660,41 @@ class Bot:
             parse_mode="HTML",
         )
 
+    def handle_last(self, chat_id: int, count: int = 5):
+        f = self.github_download_file()
+        if not f:
+            self.send_message(chat_id, "Failed to download main.bean from GitHub.")
+            return
+        blocks = extract_all_directive_blocks(f["content"])
+        if not blocks:
+            self.send_message(chat_id, "main.bean 中没有找到任何记录。")
+            return
+        last_blocks = blocks[-count:]
+        text = "\n\n".join(block_text for _, block_text in last_blocks)
+        self.send_message(
+            chat_id,
+            f"最近 {len(last_blocks)} 条记录：\n<pre><code>{html.escape(text)}</code></pre>",
+            parse_mode="HTML",
+        )
+
+    def handle_today(self, chat_id: int):
+        f = self.github_download_file()
+        if not f:
+            self.send_message(chat_id, "Failed to download main.bean from GitHub.")
+            return
+        today = datetime.now(self.timezone).strftime('%Y-%m-%d')
+        blocks = extract_all_directive_blocks(f["content"])
+        today_blocks = [(d, t) for d, t in blocks if d == today]
+        if not today_blocks:
+            self.send_message(chat_id, f"今天（{today}）没有记录。")
+            return
+        text = "\n\n".join(block_text for _, block_text in today_blocks)
+        self.send_message(
+            chat_id,
+            f"今天（{today}）共 {len(today_blocks)} 条记录：\n<pre><code>{html.escape(text)}</code></pre>",
+            parse_mode="HTML",
+        )
+
     def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
         data = {"chat_id": chat_id, "text": text}
         if parse_mode:
@@ -1042,6 +1113,19 @@ class Bot:
                 return
             elif command == "undo":
                 self.handle_undo(chat_id)
+                return
+            elif command == "last":
+                count = 5
+                if payload:
+                    try:
+                        count = max(1, int(payload))
+                    except ValueError:
+                        reply("用法：/last [数量]，默认 5")
+                        return
+                self.handle_last(chat_id, count)
+                return
+            elif command == "today":
+                self.handle_today(chat_id)
                 return
             else:
                 reply(f"Unknown command: {command}")
