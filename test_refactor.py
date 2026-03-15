@@ -106,6 +106,45 @@ class TestCallLlmBackends(unittest.TestCase):
                 with self.assertRaises(ValueError, msg="All LLM backends failed"):
                     self.bot._call_llm_backends({})
 
+    def test_vision_uses_vision_model(self):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+
+        backend = {**self._make_backend(model="text-model"), "vision_model": "vision-model"}
+        with patch.object(main, "LLM_BACKENDS", [backend]):
+            with patch("requests.post", return_value=mock_resp) as mock_post:
+                self.bot._call_llm_backends({}, vision=True)
+
+        sent_model = mock_post.call_args[1]["json"]["model"]
+        self.assertEqual(sent_model, "vision-model")
+
+    def test_vision_falls_back_to_model(self):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+
+        backend = self._make_backend(model="text-model")  # no vision_model
+        with patch.object(main, "LLM_BACKENDS", [backend]):
+            with patch("requests.post", return_value=mock_resp) as mock_post:
+                self.bot._call_llm_backends({}, vision=True)
+
+        sent_model = mock_post.call_args[1]["json"]["model"]
+        self.assertEqual(sent_model, "text-model")
+
+    def test_text_ignores_vision_model(self):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+
+        backend = {**self._make_backend(model="text-model"), "vision_model": "vision-model"}
+        with patch.object(main, "LLM_BACKENDS", [backend]):
+            with patch("requests.post", return_value=mock_resp) as mock_post:
+                self.bot._call_llm_backends({})
+
+        sent_model = mock_post.call_args[1]["json"]["model"]
+        self.assertEqual(sent_model, "text-model")
+
 
 class TestDateValidation(unittest.TestCase):
     """5.6 – strptime-based date validation in handle_message."""

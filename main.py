@@ -48,8 +48,12 @@ def _parse_llm_backends() -> list[dict]:
             url = b.get("LLM_API_BASE_URL", "").rstrip("/")
             key = b.get("LLM_API_KEY", "")
             model = b.get("LLM_MODEL", "")
+            vision_model = b.get("LLM_VISION_MODEL", "")
             if url and key and model:
-                backends.append({"base_url": url, "api_key": key, "model": model})
+                entry = {"base_url": url, "api_key": key, "model": model}
+                if vision_model:
+                    entry["vision_model"] = vision_model
+                backends.append(entry)
         return backends
     # Backward compat: single-backend keys
     url = config.get("LLM_API_BASE_URL", "").rstrip("/")
@@ -475,20 +479,21 @@ class Bot:
 
         return f"{comment_line}\n{entry_text}"
 
-    def _call_llm_backends(self, payload: dict, log_prefix: str = "") -> str:
+    def _call_llm_backends(self, payload: dict, log_prefix: str = "", vision: bool = False) -> str:
         last_error: Exception | None = None
         for backend in LLM_BACKENDS:
+            model = backend.get("vision_model", backend["model"]) if vision else backend["model"]
             try:
                 url = f"{backend['base_url']}/chat/completions"
                 headers = {
                     "Authorization": f"Bearer {backend['api_key']}",
                     "Content-Type": "application/json",
                 }
-                response = requests.post(url, headers=headers, json={**payload, "model": backend["model"]}, timeout=60)
+                response = requests.post(url, headers=headers, json={**payload, "model": model}, timeout=60)
                 response.raise_for_status()
                 return response.json()["choices"][0]["message"]["content"].strip()
             except Exception as e:
-                log(f"LLM backend '{backend['model']}'{log_prefix} failed: {e}, trying next...")
+                log(f"LLM backend '{model}'{log_prefix} failed: {e}, trying next...")
                 last_error = e
         raise ValueError(f"All LLM backends failed. Last error: {last_error}")
 
@@ -556,7 +561,7 @@ class Bot:
             ],
         }
 
-        raw_text = self._call_llm_backends(payload, " vision")
+        raw_text = self._call_llm_backends(payload, " vision", vision=True)
         try:
             return self.normalize_and_validate_llm_entry(raw_text, accounts)
         except Exception as e:
