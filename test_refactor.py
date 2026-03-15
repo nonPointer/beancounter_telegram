@@ -936,5 +936,86 @@ class TestHandleToday(unittest.TestCase):
         self.assertIn("Failed to download", msg)
 
 
+class TestGitHubDownloadFileETagCache(unittest.TestCase):
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def _mock_response(self, status_code, json_data=None, headers=None):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = json_data or {}
+        resp.headers = headers or {}
+        return resp
+
+    def test_first_call_stores_etag(self):
+        content_b64 = __import__("base64").b64encode(b"hello").decode()
+        resp = self._mock_response(200, {"content": content_b64, "sha": "abc"}, {"ETag": '"etag1"'})
+
+        with patch("requests.get", return_value=resp):
+            result = self.bot.github_download_file("main.bean")
+
+        self.assertEqual(result["content"], "hello")
+        self.assertEqual(result["sha"], "abc")
+        self.assertIn("main.bean", self.bot._file_etag_cache)
+        self.assertEqual(self.bot._file_etag_cache["main.bean"]["etag"], '"etag1"')
+
+    def test_304_returns_cached_data(self):
+        self.bot._file_etag_cache["main.bean"] = {
+            "etag": '"etag1"', "content": "cached content", "sha": "old_sha",
+        }
+        resp = self._mock_response(304)
+
+        with patch("requests.get", return_value=resp) as mock_get:
+            result = self.bot.github_download_file("main.bean")
+
+        self.assertEqual(result["content"], "cached content")
+        self.assertEqual(result["sha"], "old_sha")
+        # Verify If-None-Match header was sent
+        call_headers = mock_get.call_args[1].get("headers") or mock_get.call_args[0][0]
+        passed_headers = mock_get.call_args.kwargs.get("headers") or mock_get.call_args[1].get("headers")
+        self.assertEqual(passed_headers["If-None-Match"], '"etag1"')
+
+    def test_200_after_cache_updates_cache(self):
+        self.bot._file_etag_cache["main.bean"] = {
+            "etag": '"old"', "content": "old", "sha": "old_sha",
+        }
+        content_b64 = __import__("base64").b64encode(b"new content").decode()
+        resp = self._mock_response(200, {"content": content_b64, "sha": "new_sha"}, {"ETag": '"new"'})
+
+        with patch("requests.get", return_value=resp):
+            result = self.bot.github_download_file("main.bean")
+
+        self.assertEqual(result["content"], "new content")
+        self.assertEqual(self.bot._file_etag_cache["main.bean"]["etag"], '"new"')
+
+    def test_upload_invalidates_cache(self):
+        self.bot._file_etag_cache["main.bean"] = {
+            "etag": '"e"', "content": "x", "sha": "s",
+        }
+        resp = self._mock_response(200)
+        with patch("requests.put", return_value=resp):
+            self.bot.github_upload_file("new", "sha", "msg", "main.bean")
+
+        self.assertNotIn("main.bean", self.bot._file_etag_cache)
+
+    def test_404_not_cached(self):
+        resp = self._mock_response(404)
+        with patch("requests.get", return_value=resp):
+            result = self.bot.github_download_file("main.bean")
+
+        self.assertEqual(result["content"], "")
+        self.assertNotIn("main.bean", self.bot._file_etag_cache)
+
+    def test_no_etag_header_skips_cache(self):
+        content_b64 = __import__("base64").b64encode(b"data").decode()
+        resp = self._mock_response(200, {"content": content_b64, "sha": "s"}, {})
+
+        with patch("requests.get", return_value=resp):
+            self.bot.github_download_file("main.bean")
+
+        self.assertNotIn("main.bean", self.bot._file_etag_cache)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

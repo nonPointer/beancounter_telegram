@@ -209,6 +209,7 @@ class Bot:
         self.pending_decline_reasons = {}
         self._pending_lock = threading.Lock()
         self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0}
+        self._file_etag_cache = {}  # file_path -> {"etag": str, "content": str, "sha": str}
         self.llm_enabled = LLM_ENABLED
 
         if not self.llm_enabled:
@@ -963,13 +964,21 @@ class Bot:
 
     def github_download_file(self, file_path: str = FILE_PATH) -> dict | None:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{file_path}?ref={BRANCH_NAME}"
-        r = requests.get(url=url, headers=GITHUB_HEADERS, timeout=30)
+        headers = dict(GITHUB_HEADERS)
+        cached = self._file_etag_cache.get(file_path)
+        if cached:
+            headers["If-None-Match"] = cached["etag"]
+        r = requests.get(url=url, headers=headers, timeout=30)
+        if r.status_code == 304 and cached:
+            return {"content": cached["content"], "sha": cached["sha"]}
         if r.status_code == 200:
             data = r.json()
-            return {
-                "content": base64.b64decode(data["content"]).decode("utf-8"),
-                "sha": data["sha"]
-            }
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            sha = data["sha"]
+            etag = r.headers.get("ETag", "")
+            if etag:
+                self._file_etag_cache[file_path] = {"etag": etag, "content": content, "sha": sha}
+            return {"content": content, "sha": sha}
         elif r.status_code == 404:
             log("File not found.")
             return {"content": "", "sha": ""}
@@ -988,6 +997,7 @@ class Bot:
             data["sha"] = sha
         r = requests.put(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
         if r.status_code in [200, 201]:
+            self._file_etag_cache.pop(file_path, None)
             return True
         else:
             log(f"Error uploading file: {r.status_code}")
