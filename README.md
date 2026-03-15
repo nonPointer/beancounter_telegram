@@ -62,6 +62,8 @@
 - [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
 - [x] `/view` 触发当月 Sankey 图生成（调用账本仓库的 `monthly-report.yml` workflow）
 - [x] `/undo` 撤回 `main.bean` 中的最后一条指令（支持 transaction、balance、pad、open、close 等任意顶层指令）
+- [x] `/last [N]` 查看 `main.bean` 中最近 N 条记录（默认 5 条）
+- [x] `/today` 查看今天的所有记录（根据 bot 时区判断）
 
 ## 账本仓库 GitHub Actions
 
@@ -198,4 +200,17 @@ YYYY-MM-DD * "咖啡店" "咖啡"
 
   ```
   /undo
+  ```
+
+- 查看最近 5 条记录（默认），或指定数量
+
+  ```
+  /last
+  /last 10
+  ```
+
+- 查看今天的所有记录
+
+  ```
+  /today
   ```
