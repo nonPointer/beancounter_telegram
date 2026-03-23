@@ -125,6 +125,65 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     if not first_line:
         return now.strftime('%Y-%m-%d'), False, text
 
+    # --- Layer 0: Chinese date keywords (direct mapping) ---
+    _chinese_date_map = {
+        '今天': timedelta(days=0),
+        '昨天': timedelta(days=-1),
+        '前天': timedelta(days=-2),
+        '大前天': timedelta(days=-3),
+        '明天': timedelta(days=1),
+        '后天': timedelta(days=2),
+    }
+    _chinese_weekday_re = re.match(
+        r'^(上+|下+)(?:周|星期|礼拜)([一二三四五六日天])$', first_line)
+    _cn_day_names = {'一': 0, '二': 1, '三': 2, '四': 3,
+                     '五': 4, '六': 5, '日': 6, '天': 6}
+    if first_line in _chinese_date_map:
+        d = now + _chinese_date_map[first_line]
+        date_str = d.strftime('%Y-%m-%d')
+        remaining = '\n'.join(lines[1:]).strip()
+        log(f"Custom date detected (Chinese keyword): {date_str}")
+        return date_str, True, remaining
+    if _chinese_weekday_re:
+        prefix, day_char = _chinese_weekday_re.groups()
+        target_wd = _cn_day_names[day_char]
+        current_wd = now.weekday()
+        if prefix[0] == '上':
+            weeks_back = len(prefix)
+            diff = current_wd - target_wd
+            if diff <= 0:
+                diff += 7
+            delta = diff + 7 * (weeks_back - 1)
+            d = now - timedelta(days=delta)
+        else:  # 下
+            weeks_fwd = len(prefix)
+            diff = target_wd - current_wd
+            if diff <= 0:
+                diff += 7
+            delta = diff + 7 * (weeks_fwd - 1)
+            d = now + timedelta(days=delta)
+        date_str = d.strftime('%Y-%m-%d')
+        remaining = '\n'.join(lines[1:]).strip()
+        log(f"Custom date detected (Chinese weekday): {date_str}")
+        return date_str, True, remaining
+    # Check for "N天前" / "N天后" pattern
+    _chinese_ago_re = re.match(r'^(\d+)\s*天前$', first_line)
+    _chinese_later_re = re.match(r'^(\d+)\s*天后$', first_line)
+    if _chinese_ago_re:
+        days = int(_chinese_ago_re.group(1))
+        d = now - timedelta(days=days)
+        date_str = d.strftime('%Y-%m-%d')
+        remaining = '\n'.join(lines[1:]).strip()
+        log(f"Custom date detected (Chinese N天前): {date_str}")
+        return date_str, True, remaining
+    if _chinese_later_re:
+        days = int(_chinese_later_re.group(1))
+        d = now + timedelta(days=days)
+        date_str = d.strftime('%Y-%m-%d')
+        remaining = '\n'.join(lines[1:]).strip()
+        log(f"Custom date detected (Chinese N天后): {date_str}")
+        return date_str, True, remaining
+
     # --- Layer 1: dateutil (structured dates) ---
     # Guard: skip dateutil for inputs that it would mis-parse
     #  - pure digits / decimals ("42" → year 2042, "10.5" → Jan 10)
