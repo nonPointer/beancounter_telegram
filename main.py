@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pprint import pprint
 
+import parsedatetime as pdt
 import pytz
+from dateutil.parser import parse as dateutil_parse
 import requests
 from jinja2 import Environment, FileSystemLoader
 
@@ -94,6 +96,96 @@ def log(message):
         else:
             print()
             pprint(message)
+
+
+_FAKE_YEAR = 9999
+_pdt_consts = pdt.Constants(usePyICU=False)
+_pdt_consts.DOWParseStyle = -1  # "Monday" → today or the *last* Monday
+_pdt_calendar = pdt.Calendar(_pdt_consts, version=pdt.VERSION_CONTEXT_STYLE)
+
+
+def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
+    """Parse a natural-language date from the first line of *text*.
+
+    Uses a two-layer fallback inspired by jrnl:
+      1. dateutil  — structured dates (``2024-03-15``, ``March 15``, ``3/15``)
+      2. parsedatetime — relative / fuzzy dates (``yesterday``, ``last friday``,
+         ``3 days ago``)
+
+    Returns ``(date_str, custom_date, remaining_text)`` where *date_str* is
+    ``YYYY-MM-DD``, *custom_date* is ``True`` when a date was detected, and
+    *remaining_text* is the input with the date line stripped.
+    """
+    if not text or not text.strip():
+        return now.strftime('%Y-%m-%d'), False, text
+
+    lines = text.strip().splitlines()
+    first_line = lines[0].strip()
+
+    if not first_line:
+        return now.strftime('%Y-%m-%d'), False, text
+
+    # --- Layer 1: dateutil (structured dates) ---
+    # Guard: skip dateutil for inputs that it would mis-parse
+    #  - pure digits / decimals ("42" → year 2042, "10.5" → Jan 10)
+    #  - too short without a date separator (single tokens like "Dec")
+    _has_date_sep = any(c in first_line for c in '-/ ')
+    _looks_numeric = re.fullmatch(r'-?\d+\.?\d*', first_line) is not None
+    _skip_dateutil = _looks_numeric or (len(first_line) <= 5 and not _has_date_sep)
+    if not _skip_dateutil:
+        try:
+            fake_default = datetime(_FAKE_YEAR, 1, 1)
+            parsed = dateutil_parse(first_line, default=fake_default, fuzzy=False)
+
+            if parsed == fake_default:
+                raise ValueError("no date info")
+
+            # Reject years before 1900 or after 2100 (likely garbage parse)
+            year = parsed.year if parsed.year != _FAKE_YEAR else now.year
+            if not (1900 <= year <= 2100):
+                raise ValueError("year out of plausible range")
+
+            year_supplied = parsed.year != _FAKE_YEAR
+            if not year_supplied:
+                parsed = parsed.replace(year=now.year)
+
+            # Cross-year heuristic: if the parsed date is more than 6 months
+            # in the future and the user did NOT supply an explicit year,
+            # assume they meant last year (e.g. "December 25" typed in January)
+            if not year_supplied:
+                delta = (parsed - now.replace(tzinfo=None) if now.tzinfo
+                         else parsed - now)
+                if delta.days > 183:
+                    parsed = parsed.replace(year=parsed.year - 1)
+
+            date_str = parsed.strftime('%Y-%m-%d')
+            remaining = '\n'.join(lines[1:]).strip()
+            log(f"Custom date detected (dateutil): {date_str}")
+            return date_str, True, remaining
+        except (ValueError, OverflowError):
+            pass
+
+    # --- Layer 2: parsedatetime (natural language) ---
+    # Require at least 2 tokens or a known keyword to avoid false positives
+    # on single abbreviations like "Dec", "Mon", "Fri"
+    _pdt_keywords = {
+        'yesterday', 'today', 'tomorrow', 'now',
+        'ago', 'last', 'next', 'this', 'previous',
+    }
+    _tokens = first_line.lower().split()
+    _try_pdt = len(_tokens) >= 2 or bool(set(_tokens) & _pdt_keywords)
+    if _try_pdt:
+        now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+        result, context = _pdt_calendar.parseDT(first_line, sourceTime=now_naive)
+        if context.hasDate:
+            if (result - now_naive).days > 28:
+                result = result.replace(year=result.year - 1)
+            date_str = result.strftime('%Y-%m-%d')
+            remaining = '\n'.join(lines[1:]).strip()
+            log(f"Custom date detected (parsedatetime): {date_str}")
+            return date_str, True, remaining
+
+    return now.strftime('%Y-%m-%d'), False, text
 
 
 class rotating_loading:
@@ -1033,20 +1125,10 @@ class Bot:
             return
 
         dt = datetime.now(self.timezone)
-        date_str = dt.strftime('%Y-%m-%d')
         time_str = dt.strftime('%H:%M')
         datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-        custom_date = False
 
-        _first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
-        try:
-            datetime.strptime(_first_line, '%Y-%m-%d')
-            log("Custom date detected")
-            date_str = _first_line
-            custom_date = True
-            text = '\n'.join(text.strip().splitlines()[1:]).strip()
-        except ValueError:
-            pass
+        date_str, custom_date, text = parse_natural_date(text, dt)
 
         with self._pending_lock:
             pending_reason_id = self.pending_decline_reasons.get(chat_id)
