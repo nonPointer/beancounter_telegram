@@ -125,27 +125,32 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     if not first_line:
         return now.strftime('%Y-%m-%d'), False, text
 
-    # --- Layer 0: Chinese date keywords (direct mapping) ---
+    # --- Layer 0: Chinese date keywords (prefix matching) ---
     _chinese_date_map = {
-        '今天': timedelta(days=0),
-        '昨天': timedelta(days=-1),
-        '前天': timedelta(days=-2),
         '大前天': timedelta(days=-3),
+        '前天': timedelta(days=-2),
+        '昨天': timedelta(days=-1),
+        '今天': timedelta(days=0),
         '明天': timedelta(days=1),
         '后天': timedelta(days=2),
     }
-    _chinese_weekday_re = re.match(
-        r'^(上+|下+)(?:周|星期|礼拜)([一二三四五六日天])$', first_line)
     _cn_day_names = {'一': 0, '二': 1, '三': 2, '四': 3,
                      '五': 4, '六': 5, '日': 6, '天': 6}
-    if first_line in _chinese_date_map:
-        d = now + _chinese_date_map[first_line]
-        date_str = d.strftime('%Y-%m-%d')
-        remaining = '\n'.join(lines[1:]).strip()
-        log(f"Custom date detected (Chinese keyword): {date_str}")
-        return date_str, True, remaining
+    for _kw, _delta in _chinese_date_map.items():
+        if first_line.startswith(_kw):
+            d = now + _delta
+            date_str = d.strftime('%Y-%m-%d')
+            rest_of_first = first_line[len(_kw):].strip()
+            remaining_lines = [rest_of_first] if rest_of_first else []
+            remaining_lines.extend(lines[1:])
+            remaining = '\n'.join(remaining_lines).strip()
+            log(f"Custom date detected (Chinese keyword): {date_str}")
+            return date_str, True, remaining
+    _chinese_weekday_re = re.match(
+        r'^(上+|下+)(?:周|星期|礼拜)([一二三四五六日天])\s*(.*)',
+        first_line, re.DOTALL)
     if _chinese_weekday_re:
-        prefix, day_char = _chinese_weekday_re.groups()
+        prefix, day_char, rest_of_first = _chinese_weekday_re.groups()
         target_wd = _cn_day_names[day_char]
         current_wd = now.weekday()
         if prefix[0] == '上':
@@ -163,24 +168,33 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
             delta = diff + 7 * (weeks_fwd - 1)
             d = now + timedelta(days=delta)
         date_str = d.strftime('%Y-%m-%d')
-        remaining = '\n'.join(lines[1:]).strip()
+        rest_of_first = rest_of_first.strip()
+        remaining_lines = [rest_of_first] if rest_of_first else []
+        remaining_lines.extend(lines[1:])
+        remaining = '\n'.join(remaining_lines).strip()
         log(f"Custom date detected (Chinese weekday): {date_str}")
         return date_str, True, remaining
     # Check for "N天前" / "N天后" pattern
-    _chinese_ago_re = re.match(r'^(\d+)\s*天前$', first_line)
-    _chinese_later_re = re.match(r'^(\d+)\s*天后$', first_line)
+    _chinese_ago_re = re.match(r'^(\d+)\s*天前\s*(.*)', first_line, re.DOTALL)
+    _chinese_later_re = re.match(r'^(\d+)\s*天后\s*(.*)', first_line, re.DOTALL)
     if _chinese_ago_re:
         days = int(_chinese_ago_re.group(1))
+        rest_of_first = _chinese_ago_re.group(2).strip()
         d = now - timedelta(days=days)
         date_str = d.strftime('%Y-%m-%d')
-        remaining = '\n'.join(lines[1:]).strip()
+        remaining_lines = [rest_of_first] if rest_of_first else []
+        remaining_lines.extend(lines[1:])
+        remaining = '\n'.join(remaining_lines).strip()
         log(f"Custom date detected (Chinese N天前): {date_str}")
         return date_str, True, remaining
     if _chinese_later_re:
         days = int(_chinese_later_re.group(1))
+        rest_of_first = _chinese_later_re.group(2).strip()
         d = now + timedelta(days=days)
         date_str = d.strftime('%Y-%m-%d')
-        remaining = '\n'.join(lines[1:]).strip()
+        remaining_lines = [rest_of_first] if rest_of_first else []
+        remaining_lines.extend(lines[1:])
+        remaining = '\n'.join(remaining_lines).strip()
         log(f"Custom date detected (Chinese N天后): {date_str}")
         return date_str, True, remaining
 
@@ -232,7 +246,10 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         'ago', 'last', 'next', 'this', 'previous',
     }
     _tokens = first_line.lower().split()
-    _try_pdt = len(_tokens) >= 2 or bool(set(_tokens) & _pdt_keywords)
+    _try_pdt = (
+        (len(_tokens) >= 2 or bool(set(_tokens) & _pdt_keywords))
+        and len(_tokens) <= 4  # skip long sentences to avoid false positives
+    )
     if _try_pdt:
         now_naive = now.replace(tzinfo=None) if now.tzinfo else now
         result, context = _pdt_calendar.parseDT(first_line, sourceTime=now_naive)
@@ -1367,7 +1384,7 @@ class Bot:
                 reply("No accounts available. Please check GitHub account parsing first.")
                 return
             try:
-                appendix = self.call_openai_compatible(text, accounts, date_str, current_time=time_str)
+                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str)
                 appendix = self.prepend_natural_language_comment(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
