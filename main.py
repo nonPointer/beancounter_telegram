@@ -1246,7 +1246,17 @@ class Bot:
         time_str = dt.strftime('%H:%M')
         datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        date_str, custom_date, text = parse_natural_date(text, dt)
+        # Detect beancount directive commands from raw text BEFORE natural
+        # language date parsing.  parsedatetime can false-positive on numbers
+        # embedded in command args (e.g. "balance acc -41.1 GBP" → year 2042),
+        # consuming the entire line and breaking command dispatch.
+        _directive_commands = {'open', 'close', 'balance', 'pad'}
+        _first_word = text.strip().split()[0].lower() if text.strip() else ''
+        if _first_word in _directive_commands:
+            date_str = dt.strftime('%Y-%m-%d')
+            custom_date = False
+        else:
+            date_str, custom_date, text = parse_natural_date(text, dt)
 
         with self._pending_lock:
             pending_reason_id = self.pending_decline_reasons.get(chat_id)
