@@ -9,44 +9,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-beanquery-${{ runner.os }}
 
       - name: Install dependencies
-        run: python3 -m pip install --user beanquery
-
-      - name: Compute current month range
-        id: daterange
-        run: |
-          FIRST_DAY="$(date -u +'%Y-%m-01')"
-          NEXT_MONTH="$(date -u -d "$(date -u +'%Y-%m-01') +1 month" +'%Y-%m-01')"
-          echo "first_day=$FIRST_DAY" >> "$GITHUB_OUTPUT"
-          echo "next_month=$NEXT_MONTH" >> "$GITHUB_OUTPUT"
+        run: pip install --user beanquery
 
       - name: Notify monthly expenses
         env:
-          FIRST_DAY: ${{ steps.daterange.outputs.first_day }}
-          NEXT_MONTH: ${{ steps.daterange.outputs.next_month }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
 
-          BREAKDOWN=$(bean-query -q main.bean \
+          FIRST_DAY="$(date -u +'%Y-%m-01')"
+          NEXT_MONTH="$(date -u -d "$FIRST_DAY +1 month" +'%Y-%m-01')"
+
+          BREAKDOWN=$(bean-query -f text main.bean \
             "SELECT account, cost(sum(position))
              WHERE account ~ '^Expenses:' AND date >= $FIRST_DAY AND date < $NEXT_MONTH
              GROUP BY account ORDER BY account" \
             | sed 's/Expenses://g')
 
-          TOTAL=$(bean-query -q main.bean \
+          TOTAL=$(bean-query -f text main.bean \
             "SELECT cost(sum(position))
              WHERE account ~ '^Expenses:' AND date >= $FIRST_DAY AND date < $NEXT_MONTH")
 
           MSG=$(printf '```\n%s\n---\nTotal: %s\n```' "$BREAKDOWN" "$TOTAL")
 
-          curl -sS -X POST \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+          HTTP_CODE=$(curl -sS -o /tmp/tg_resp1.json -w '%{http_code}' -X POST \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
             --data-urlencode "text=$MSG" \
             --data-urlencode "parse_mode=Markdown" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" | jq
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Telegram API returned $HTTP_CODE"
+            cat /tmp/tg_resp1.json
+            exit 1
+          fi
 
       - name: Notify account balances
         env:
@@ -60,15 +70,32 @@ jobs:
 
           while IFS= read -r account; do
             [[ -z "$account" ]] && continue
-            BALANCE=$(bean-query -q "$LEDGER" \
-              "SELECT sum(position) WHERE account = '$account'")
+            # Validate account name format (letters, digits, colons only)
+            if [[ ! "$account" =~ ^[A-Za-z0-9:]+$ ]]; then
+              echo "Skipping invalid account name: $account"
+              continue
+            fi
+            BALANCE=$(bean-query -f text "$LEDGER" \
+              "SELECT sum(position) WHERE account = '$account'" \
+              | tail -n +3 | sed '/^$/d' | paste -sd', ')
+            [ -z "$BALANCE" ] && BALANCE="(empty)"
             OUTPUT="${OUTPUT}${account}: ${BALANCE}\n"
           done < <(git log -1 --pretty=%b | sed '/^\s*$/d')
 
+          if [ -z "$OUTPUT" ]; then
+            echo "No account balances to report."
+            exit 0
+          fi
+
           MSG=$(printf '```\n%b```' "$OUTPUT")
 
-          curl -sS -X POST \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+          HTTP_CODE=$(curl -sS -o /tmp/tg_resp2.json -w '%{http_code}' -X POST \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
             --data-urlencode "text=$MSG" \
             --data-urlencode "parse_mode=Markdown" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" | jq
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Telegram API returned $HTTP_CODE"
+            cat /tmp/tg_resp2.json
+            exit 1
+          fi

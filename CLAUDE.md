@@ -12,7 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/bin/python main.py debug
 
 # Run tests (no pytest — use unittest directly)
-.venv/bin/python test_refactor.py
+.venv/bin/python test_refactor.py   # core logic tests
+.venv/bin/python test_fuzz.py       # fuzzing / edge-case tests
 
 # Interactive LLM test tool
 .venv/bin/python test_llm.py
@@ -37,7 +38,7 @@ The project has two independent components that share the same config schema:
 - Configured via Cloudflare environment bindings (same key names as `config.json`)
 
 ### Key modules
-- `main.py` — bot entry point, `Bot` class (~1430 lines)
+- `main.py` — bot entry point, `Bot` class (~1480 lines)
 - `prompts.py` — LLM system prompts and user prompt builders for both text and vision paths
 - `templates/*.bean.j2` — Jinja2 templates for beancount directives (`open`, `close`, `balance`, `pad`, `transaction`)
 
@@ -82,5 +83,14 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 - `github_download_file()` sends `If-None-Match` header when cache exists; on `304 Not Modified`, returns cached content without re-downloading
 - `github_upload_file()` invalidates the cache entry on success to ensure next read fetches fresh data
 
+### LLM output sanitization
+- `strip_code_fence()` — removes markdown code fences, then extracts the beancount entry by finding the `YYYY-MM-DD` transaction header line; discards any surrounding natural language (important for recheck flow where LLMs sometimes return conversational responses)
+- `normalize_and_validate_llm_entry()` — validates header is a beancount directive, filters metadata lines with strict regex (only `key: value` and `;` comments), rejects natural language; also handles balance validation, cross-currency FX annotation, and `:Current` suffix resolution
+- Key regex constraint: all `re.MULTILINE` patterns use `[ \t]*` (not `\s*`) to avoid crossing line boundaries
+
 ### Date handling
 First line of user input is tested with `datetime.strptime(line, '%Y-%m-%d')`; if it parses, it overrides today's date and is stripped from the input before LLM call.
+
+### GitHub Actions workflows (`.github/workflows/*.yml.example`)
+- `monthly-report.yml.example` — daily Sankey chart of monthly expenses sent to Telegram; configurable `REPORT_CURRENCY` and `FX_RATES` (JSON dict) at workflow `env` level; aggregates sub-accounts into top-level categories
+- `notify-on-push.yml.example` — on push to main: sends expense breakdown + affected account balances to Telegram; reads account names from commit body
