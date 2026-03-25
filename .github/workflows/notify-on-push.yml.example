@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main"]
 
+env:
+  REPORT_CURRENCY: GBP
+  FX_RATES: '{"CNY": 0.11, "USD": 0.79, "JPY": 0.005}'
+
 jobs:
   notify-on-push:
     runs-on: ubuntu-latest
@@ -31,32 +35,125 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
+          python3 << 'PYEOF'
+          import subprocess, re, os, sys, json
+          import urllib.request, urllib.parse, urllib.error
+          from datetime import date
 
-          FIRST_DAY="$(date -u +'%Y-%m-01')"
-          NEXT_MONTH="$(date -u -d "$FIRST_DAY +1 month" +'%Y-%m-01')"
+          report_ccy = os.environ['REPORT_CURRENCY']
+          fx_rates = json.loads(os.environ.get('FX_RATES', '{}'))
+          token = os.environ['TELEGRAM_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
 
-          BREAKDOWN=$(bean-query -f text main.bean \
-            "SELECT account, cost(sum(position))
-             WHERE account ~ '^Expenses:' AND date >= $FIRST_DAY AND date < $NEXT_MONTH
-             GROUP BY account ORDER BY account" \
-            | sed 's/Expenses://g')
+          today = date.today()
+          first_day = today.replace(day=1)
+          next_month = first_day.replace(
+              year=first_day.year + (1 if first_day.month == 12 else 0),
+              month=(first_day.month % 12) + 1,
+          )
+          month_label = first_day.strftime('%Y-%m')
 
-          TOTAL=$(bean-query -f text main.bean \
-            "SELECT cost(sum(position))
-             WHERE account ~ '^Expenses:' AND date >= $FIRST_DAY AND date < $NEXT_MONTH")
+          def run_query(q):
+              r = subprocess.run(
+                  ['bean-query', '-q', 'main.bean', q],
+                  capture_output=True, text=True,
+              )
+              if r.returncode != 0:
+                  print(f"bean-query failed:\n{r.stderr}", file=sys.stderr)
+                  sys.exit(1)
+              return r.stdout
 
-          MSG=$(printf '```\n%s\n---\nTotal: %s\n```' "$BREAKDOWN" "$TOTAL")
+          def to_report(amount, currency):
+              if currency == report_ccy:
+                  return amount
+              rate = fx_rates.get(currency)
+              return amount * rate if rate else amount
 
-          HTTP_CODE=$(curl -sS -o /tmp/tg_resp1.json -w '%{http_code}' -X POST \
-            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
-            --data-urlencode "text=$MSG" \
-            --data-urlencode "parse_mode=Markdown" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Telegram API returned $HTTP_CODE"
-            cat /tmp/tg_resp1.json
-            exit 1
-          fi
+          output = run_query(
+              f"SELECT account, cost(sum(position)) "
+              f"WHERE account ~ '^Expenses:' "
+              f"AND date >= {first_day} AND date < {next_month} "
+              f"GROUP BY account ORDER BY account"
+          )
+
+          # Parse into {category: {currency: amount}}
+          categories = {}
+          current_account = None
+          for line in output.strip().split('\n')[2:]:
+              stripped = line.strip()
+              if not stripped:
+                  continue
+              first_token = stripped.split()[0]
+              if ':' in first_token:
+                  current_account = first_token
+                  amounts_str = stripped[len(first_token):]
+              else:
+                  amounts_str = stripped
+              if current_account:
+                  cat = current_account.split(':')[1]
+                  if cat not in categories:
+                      categories[cat] = {}
+                  for amt, cur in re.findall(
+                      r'(-?[\d,]+\.?\d*)\s+([A-Z]{3,})', amounts_str
+                  ):
+                      val = float(amt.replace(',', ''))
+                      categories[cat][cur] = categories[cat].get(cur, 0) + val
+
+          if not categories:
+              print("No expense data.")
+              sys.exit(0)
+
+          # Build rows: (name, converted_total, display_amounts)
+          rows = []
+          grand_total = {}
+          for cat, amounts in categories.items():
+              converted = sum(to_report(v, c) for c, v in amounts.items())
+              for c, v in amounts.items():
+                  grand_total[c] = grand_total.get(c, 0) + v
+              rows.append((cat, converted, amounts))
+
+          rows.sort(key=lambda x: -x[1])
+
+          # Format each row: "Category    1,234.56 GBP"
+          # Show converted report-currency amount for clean single-column alignment
+          lines = []
+          max_name = max(len(r[0]) for r in rows)
+          fmt_amounts = []
+          for name, converted, _ in rows:
+              s = f"{converted:,.0f}"
+              fmt_amounts.append(s)
+          max_amt = max(len(s) for s in fmt_amounts)
+
+          for (name, converted, _), amt_s in zip(rows, fmt_amounts):
+              lines.append(f"{name:<{max_name}}  {amt_s:>{max_amt}} {report_ccy}")
+
+          # Total
+          total_converted = sum(to_report(v, c) for c, v in grand_total.items())
+          total_s = f"{total_converted:,.0f}"
+          sep = '─' * (max_name + 2 + max_amt + 1 + len(report_ccy))
+          lines.append(sep)
+          lines.append(f"{'Total':<{max_name}}  {total_s:>{max_amt}} {report_ccy}")
+
+          # Non-report currency footnote
+          others = {c: v for c, v in grand_total.items() if c != report_ccy and abs(v) >= 0.5}
+          if others:
+              foot = ', '.join(f"{v:,.0f} {c}" for c, v in sorted(others.items()))
+              lines.append(f"\n(incl. {foot})")
+
+          msg = f"<b>Monthly Expenses — {month_label}</b>\n<pre>" + '\n'.join(lines) + "</pre>"
+
+          data = urllib.parse.urlencode({
+              'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
+          }).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage", data=data,
+          )
+          try:
+              urllib.request.urlopen(req)
+          except urllib.error.HTTPError as e:
+              print(f"Telegram API returned {e.code}: {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
 
       - name: Notify account balances
         env:
@@ -64,38 +161,64 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
+          python3 << 'PYEOF'
+          import subprocess, re, os, sys
+          import urllib.request, urllib.parse, urllib.error
 
-          LEDGER="main.bean"
-          OUTPUT=""
+          token = os.environ['TELEGRAM_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
 
-          while IFS= read -r account; do
-            [[ -z "$account" ]] && continue
-            # Validate account name format (letters, digits, colons only)
-            if [[ ! "$account" =~ ^[A-Za-z0-9:]+$ ]]; then
-              echo "Skipping invalid account name: $account"
-              continue
-            fi
-            BALANCE=$(bean-query -f text "$LEDGER" \
-              "SELECT sum(position) WHERE account = '$account'" \
-              | tail -n +3 | sed '/^$/d' | paste -sd', ')
-            [ -z "$BALANCE" ] && BALANCE="(empty)"
-            OUTPUT="${OUTPUT}${account}: ${BALANCE}\n"
-          done < <(git log -1 --pretty=%b | sed '/^\s*$/d')
+          # Read account names from commit body
+          r = subprocess.run(
+              ['git', 'log', '-1', '--pretty=%b'],
+              capture_output=True, text=True,
+          )
+          accounts = [
+              l.strip() for l in r.stdout.strip().split('\n')
+              if l.strip() and re.match(r'^[A-Za-z0-9:]+$', l.strip())
+          ]
+          if not accounts:
+              print("No account balances to report.")
+              sys.exit(0)
 
-          if [ -z "$OUTPUT" ]; then
-            echo "No account balances to report."
-            exit 0
-          fi
+          rows = []
+          for account in accounts:
+              r = subprocess.run(
+                  ['bean-query', '-q', 'main.bean',
+                   f"SELECT sum(position) WHERE account = '{account}'"],
+                  capture_output=True, text=True,
+              )
+              amounts = []
+              for line in r.stdout.strip().split('\n')[2:]:
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  for amt, cur in re.findall(
+                      r'(-?[\d,]+\.?\d*)\s+([A-Z]{3,})', stripped
+                  ):
+                      val = float(amt.replace(',', ''))
+                      amounts.append(f"{val:,.2f} {cur}")
 
-          MSG=$(printf '```\n%b```' "$OUTPUT")
+              short = ':'.join(account.split(':')[-2:])
+              balance = ', '.join(amounts) if amounts else '(empty)'
+              rows.append((short, balance))
 
-          HTTP_CODE=$(curl -sS -o /tmp/tg_resp2.json -w '%{http_code}' -X POST \
-            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
-            --data-urlencode "text=$MSG" \
-            --data-urlencode "parse_mode=Markdown" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage")
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Telegram API returned $HTTP_CODE"
-            cat /tmp/tg_resp2.json
-            exit 1
-          fi
+          if not rows:
+              sys.exit(0)
+
+          max_name = max(len(r[0]) for r in rows)
+          lines = [f"{name:<{max_name}}  {bal}" for name, bal in rows]
+          msg = "<b>Account Balances</b>\n<pre>" + '\n'.join(lines) + "</pre>"
+
+          data = urllib.parse.urlencode({
+              'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
+          }).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage", data=data,
+          )
+          try:
+              urllib.request.urlopen(req)
+          except urllib.error.HTTPError as e:
+              print(f"Telegram API returned {e.code}: {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
