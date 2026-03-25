@@ -501,11 +501,36 @@ class Bot:
 
     def strip_code_fence(self, text: str) -> str:
         stripped = text.strip()
-        if stripped.startswith("```") and stripped.endswith("```"):
-            lines = stripped.splitlines()
-            if len(lines) >= 3:
-                return "\n".join(lines[1:-1]).strip()
-        return stripped
+        # Remove code fence markers (```lang or ```) but only the marker line itself
+        # Use [ \t]* instead of \s* to avoid crossing line boundaries
+        cleaned = re.sub(r'^[ \t]*```\w*[ \t]*$', '', stripped, flags=re.MULTILINE).strip()
+        # Extract beancount entry: find the transaction header and collect from there
+        # Use [ \t]* instead of \s* to avoid matching across line boundaries
+        header_re = re.compile(r'^[ \t]*\d{4}-\d{2}-\d{2}\s+[*!txn]', re.MULTILINE)
+        m = header_re.search(cleaned)
+        if m:
+            # Collect leading ; comment lines immediately before the header
+            before = cleaned[:m.start()]
+            comments = []
+            for line in reversed(before.splitlines()):
+                if line.strip().startswith(';'):
+                    comments.insert(0, line)
+                elif line.strip() == '':
+                    continue
+                else:
+                    break
+            # Collect header + all subsequent indented/posting/comment lines
+            after = cleaned[m.start():]
+            entry_lines = []
+            for i, line in enumerate(after.splitlines()):
+                if i == 0:
+                    entry_lines.append(line.strip())
+                elif line.strip() == '' or line[0] in (' ', '\t') or line.strip().startswith(';'):
+                    entry_lines.append(line)
+                else:
+                    break
+            return "\n".join(comments + entry_lines).strip()
+        return cleaned
 
     def normalize_and_validate_llm_entry(self, entry_text: str, accounts: list[str]) -> str:
         text = self.strip_code_fence(entry_text)
@@ -513,13 +538,29 @@ class Bot:
         if len(raw_lines) < 3:
             raise ValueError("LLM output is too short. Expected a transaction header and at least two postings.")
 
-        header = raw_lines[0].strip()
-        metadata_lines = []
+        # Skip leading ; comment lines to find the header
+        header_idx = 0
+        leading_comments = []
+        for idx, line in enumerate(raw_lines):
+            if line.strip().startswith(';'):
+                leading_comments.append(line.strip())
+            else:
+                header_idx = idx
+                break
+
+        header = raw_lines[header_idx].strip()
+        # Validate header looks like a beancount directive (YYYY-MM-DD ...)
+        if not re.match(r'^\d{4}-\d{2}-\d{2}\s+', header):
+            raise ValueError(f"LLM output invalid: first line is not a beancount directive header: {header!r}")
+
+        metadata_lines = [f"  {c}" if not c.startswith('  ') else c for c in leading_comments]
         postings = []
 
         posting_re = re.compile(r'^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s+(\S+)(?:\s+(.*))?$')
+        # Beancount metadata: key-value (e.g. "  key: value") or inline comments ("; ...")
+        metadata_re = re.compile(r'^\s*(\w[\w-]*\s*:.*|;.*)$')
 
-        for line in raw_lines[1:]:
+        for line in raw_lines[header_idx + 1:]:
             pm = posting_re.match(line)
             if pm:
                 account = self.prefer_current_account(pm.group(1), accounts)
@@ -534,8 +575,9 @@ class Bot:
                 })
                 continue
 
-            # Keep metadata/comment-like lines and normalize indentation.
-            metadata_lines.append(f"  {line.strip()}")
+            # Only keep valid beancount metadata/comment lines; skip natural language
+            if metadata_re.match(line):
+                metadata_lines.append(f"  {line.strip()}")
 
         if len(postings) < 2:
             raise ValueError("LLM output must contain at least two postings.")
