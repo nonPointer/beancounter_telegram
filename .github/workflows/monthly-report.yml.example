@@ -2,7 +2,7 @@ name: monthly report
 
 on:
   schedule:
-    - cron: "0 8 * * *"   # 08:00 UTC = 08:00 GMT (winter) / 09:00 BST (summer)
+    - cron: "0 8 * * *"   # 08:00 UTC daily
   push:
     branches: ["main"]
     paths:
@@ -14,15 +14,41 @@ on:
         required: false
         default: ""
 
+env:
+  REPORT_CURRENCY: GBP
+  # FX rates: JSON dict of { "currency": how_many_REPORT_CURRENCY_per_unit }
+  # e.g. 1 CNY = 0.11 GBP, 1 USD = 0.79 GBP, 1 JPY = 0.005 GBP
+  FX_RATES: '{"CNY": 0.11, "USD": 0.79, "JPY": 0.005}'
+
 jobs:
   report:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-beanquery-${{ runner.os }}
+
+      - name: Cache npm packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-mermaid-${{ runner.os }}
+
       - name: Install dependencies
         run: |
-          python3 -m pip install --user beanquery
+          pip install --user beanquery
           npm install -g @mermaid-js/mermaid-cli
 
       - name: Compute month range
@@ -52,33 +78,48 @@ jobs:
 
           first_day = os.environ['FIRST_DAY']
           next_month = os.environ['NEXT_MONTH']
+          report_currency = os.environ['REPORT_CURRENCY']
+
+          # FX rates from env: {"CNY": 0.11} means 1 CNY = 0.11 REPORT_CURRENCY
+          fx_rates = json.loads(os.environ.get('FX_RATES', '{}'))
 
           def run_query(q):
               r = subprocess.run(
                   ['bean-query', '-q', 'main.bean', q],
                   capture_output=True, text=True
               )
+              if r.returncode != 0:
+                  print(f"bean-query failed:\n{r.stderr}", file=sys.stderr)
+                  sys.exit(1)
               return r.stdout
 
-          GBP_PER_CNY = 1 / 9  # 1 GBP = 9 CNY
-
-          def to_gbp(amount, currency):
-              if currency == 'CNY':
-                  return amount * GBP_PER_CNY
+          def to_report_currency(amount, currency):
+              if currency == report_currency:
+                  return amount
+              rate = fx_rates.get(currency)
+              if rate:
+                  return amount * rate
+              print(f"Warning: no FX rate for {currency} → {report_currency}, skipping",
+                    file=sys.stderr)
               return amount
 
           def parse_amounts(output):
               totals = {}
+              current_account = None
               for line in output.strip().split('\n')[2:]:
-                  line = line.strip()
-                  if not line:
+                  stripped = line.strip()
+                  if not stripped:
                       continue
-                  m = re.match(r'(\S+)\s+(-?[\d,]+\.?\d*)\s+([A-Z]+)', line)
-                  if m:
-                      account = m.group(1)
-                      amount = float(m.group(2).replace(',', ''))
-                      currency = m.group(3)
-                      totals[account] = totals.get(account, 0) + to_gbp(amount, currency)
+                  first_token = stripped.split()[0]
+                  if ':' in first_token:
+                      current_account = first_token
+                      amounts_str = stripped[len(first_token):]
+                  else:
+                      amounts_str = stripped
+                  if current_account:
+                      for amt, cur in re.findall(r'(-?[\d,]+\.?\d*)\s+([A-Z]{3,})', amounts_str):
+                          totals[current_account] = totals.get(current_account, 0) + \
+                              to_report_currency(float(amt.replace(',', '')), cur)
               return totals
 
           expense_data = {k: v for k, v in parse_amounts(run_query(
@@ -91,10 +132,23 @@ jobs:
               print("No expense data, skipping.")
               sys.exit(0)
 
+          # Aggregate sub-accounts into top-level category (Expenses:Food:X → Food)
+          categories = {}
+          for account, amount in expense_data.items():
+              parts = account.split(':')  # ['Expenses', 'Food', 'Groceries']
+              category = parts[1] if len(parts) >= 2 else account
+              categories[category] = categories.get(category, 0) + amount
+
+          # Drop categories that round to 0 (Sankey requires positive values)
+          categories = {k: v for k, v in categories.items() if round(v) >= 1}
+          if not categories:
+              print("All categories round to 0, skipping.")
+              sys.exit(0)
+
+          total = sum(categories.values())
           rows = []
-          for account, amount in sorted(expense_data.items()):
-              name = account.replace('Expenses:', '', 1)
-              rows.append(f'"Expenses (GBP)","{name}",{amount:.0f}')
+          for name, amount in sorted(categories.items(), key=lambda x: -x[1]):
+              rows.append(f'"Expenses ({total:.0f} {report_currency})","{name}",{amount:.0f}')
 
           mermaid_code = 'sankey-beta\n\n' + '\n'.join(rows)
           print("Mermaid:\n" + mermaid_code)
@@ -120,8 +174,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MONTH_LABEL: ${{ steps.daterange.outputs.month_label }}
         run: |
-          curl -sS -X POST \
-            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+          HTTP_CODE=$(curl -sS -o /tmp/tg_response.json -w '%{http_code}' -X POST \
+            -F "chat_id=$TELEGRAM_CHAT_ID" \
             -F "photo=@/tmp/sankey.png" \
-            -F "caption=Monthly Expenses — ${MONTH_LABEL} (GBP, 1 GBP = 9 CNY)" \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto" | jq
+            -F "caption=Monthly Expenses — ${MONTH_LABEL}" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Telegram API returned $HTTP_CODE"
+            cat /tmp/tg_response.json
+            exit 1
+          fi
+          jq . /tmp/tg_response.json
