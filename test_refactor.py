@@ -296,6 +296,32 @@ class TestNormalizeAndValidate(unittest.TestCase):
         result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
         self.assertIn("Expenses:Food", result)
 
+    def test_recheck_conversational_output_rejected(self):
+        """LLM recheck returning conversational text with embedded code fence should be cleaned."""
+        raw_llm = (
+            '已将该笔理发支出计入 **Expenses:Health**：\n'
+            '  ```beancount\n'
+            '  2024-01-15 * "Yorkhill Barbers" "理发"\n'
+            '  ```\n'
+            '  Assets:Cash         -13 GBP\n'
+            '  Expenses:Food      13 GBP'
+        )
+        result = self.bot.normalize_and_validate_llm_entry(raw_llm, self.accounts)
+        self.assertIn("2024-01-15", result)
+        self.assertNotIn("已将", result)
+        self.assertNotIn("```", result)
+        self.assertNotIn("**", result)
+
+    def test_non_directive_header_rejected(self):
+        """If first non-comment line is not a beancount directive, raise ValueError."""
+        raw_llm = (
+            'Here is the corrected entry:\n'
+            '  Assets:Cash  -10 USD\n'
+            '  Expenses:Food  10 USD'
+        )
+        with self.assertRaises(ValueError):
+            self.bot.normalize_and_validate_llm_entry(raw_llm, self.accounts)
+
 
 class TestEnsureDatetimeMetadata(unittest.TestCase):
     def setUp(self):
