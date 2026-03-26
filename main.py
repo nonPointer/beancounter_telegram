@@ -129,9 +129,16 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     _chinese_date_map = {
         '大前天': timedelta(days=-3),
         '前天': timedelta(days=-2),
+        '前晚': timedelta(days=-2),
         '昨天': timedelta(days=-1),
+        '昨晚': timedelta(days=-1),
+        '昨早': timedelta(days=-1),
         '今天': timedelta(days=0),
+        '今晚': timedelta(days=0),
+        '今早': timedelta(days=0),
         '明天': timedelta(days=1),
+        '明早': timedelta(days=1),
+        '明晚': timedelta(days=1),
         '后天': timedelta(days=2),
     }
     _cn_day_names = {'一': 0, '二': 1, '三': 2, '四': 3,

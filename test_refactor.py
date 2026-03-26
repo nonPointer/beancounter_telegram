@@ -1131,6 +1131,27 @@ class TestParseNaturalDate(unittest.TestCase):
         self.assertEqual(date, "2026-03-25")
         self.assertEqual(remaining, "买咖啡")
 
+    def test_chinese_last_night(self):
+        date, custom, remaining = self._parse("昨晚 7 点 在 Tesco 用 cash 9.75 GBP 买红酒和可颂")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-25")
+        self.assertIn("Tesco", remaining)
+
+    def test_chinese_time_of_day_variants(self):
+        variants = {
+            "昨早 买咖啡": ("2026-03-25", "买咖啡"),
+            "今晚 聚餐": ("2026-03-26", "聚餐"),
+            "今早 地铁": ("2026-03-26", "地铁"),
+            "前晚 看电影": ("2026-03-24", "看电影"),
+            "明早 早餐": ("2026-03-27", "早餐"),
+            "明晚 约饭": ("2026-03-27", "约饭"),
+        }
+        for text, (expected_date, expected_remaining) in variants.items():
+            date, custom, remaining = self._parse(text)
+            self.assertTrue(custom, f"Failed to parse date from: {text!r}")
+            self.assertEqual(date, expected_date, f"Wrong date for: {text!r}")
+            self.assertEqual(remaining, expected_remaining, f"Wrong remaining for: {text!r}")
+
     def test_chinese_day_before_yesterday(self):
         date, custom, remaining = self._parse("前天 午饭")
         self.assertTrue(custom)
