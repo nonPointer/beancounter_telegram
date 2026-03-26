@@ -1082,5 +1082,107 @@ class TestGitHubDownloadFileETagCache(unittest.TestCase):
         self.assertNotIn("main.bean", self.bot._file_etag_cache)
 
 
+class TestParseNaturalDate(unittest.TestCase):
+    """Fuzz-style tests for parse_natural_date — especially decimal-amount false positives."""
+
+    def setUp(self):
+        self.now = datetime(2026, 3, 26, 12, 0, 0)
+
+    def _parse(self, text):
+        return main.parse_natural_date(text, self.now)
+
+    # --- Decimal amounts must NOT be consumed as dates ---
+
+    def test_decimal_amount_not_parsed_as_date(self):
+        """'6.16' should not become June 16."""
+        date, custom, remaining = self._parse("Uber 礼品卡打车消费 6.16 gbp")
+        self.assertFalse(custom)
+        self.assertIn("6.16", remaining)
+
+    def test_various_decimal_amounts(self):
+        cases = [
+            "咖啡 3.50 usd",
+            "午饭 12.00 cny",
+            "taxi 9.99 gbp",
+            "book 1.23 eur",
+            "Uber 礼品卡 6.16 gbp",
+        ]
+        for text in cases:
+            date, custom, remaining = self._parse(text)
+            self.assertFalse(custom, f"False positive date parse for: {text!r}")
+            self.assertEqual(remaining, text)
+
+    def test_integer_amount_not_parsed(self):
+        """Amounts without decimals in typical transaction text."""
+        date, custom, remaining = self._parse("lunch 50 cny")
+        self.assertFalse(custom)
+        self.assertEqual(remaining, "lunch 50 cny")
+
+    # --- Valid dates should still work ---
+
+    def test_iso_date(self):
+        date, custom, remaining = self._parse("2026-03-20")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-20")
+
+    def test_chinese_yesterday(self):
+        date, custom, remaining = self._parse("昨天 买咖啡")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-25")
+        self.assertEqual(remaining, "买咖啡")
+
+    def test_chinese_day_before_yesterday(self):
+        date, custom, remaining = self._parse("前天 午饭")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-24")
+        self.assertEqual(remaining, "午饭")
+
+    def test_english_yesterday(self):
+        date, custom, remaining = self._parse("yesterday")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-25")
+
+    def test_last_friday(self):
+        date, custom, remaining = self._parse("last friday")
+        self.assertTrue(custom)
+        # 2026-03-26 is Thursday, last friday = 2026-03-20
+        self.assertEqual(date, "2026-03-20")
+
+    def test_3_days_ago(self):
+        date, custom, remaining = self._parse("3 days ago")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-23")
+
+    def test_chinese_n_days_ago(self):
+        date, custom, remaining = self._parse("3天前 晚饭")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-23")
+        self.assertEqual(remaining, "晚饭")
+
+    def test_chinese_last_week(self):
+        date, custom, remaining = self._parse("上周五")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-20")
+
+    # --- Edge cases ---
+
+    def test_empty_input(self):
+        date, custom, remaining = self._parse("")
+        self.assertFalse(custom)
+        self.assertEqual(date, "2026-03-26")
+
+    def test_plain_text_no_date(self):
+        date, custom, remaining = self._parse("买了一杯咖啡")
+        self.assertFalse(custom)
+        self.assertEqual(remaining, "买了一杯咖啡")
+
+    def test_date_on_first_line_preserves_rest(self):
+        text = "2026-01-15\n午饭 50 CNY"
+        date, custom, remaining = self._parse(text)
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-01-15")
+        self.assertEqual(remaining, "午饭 50 CNY")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

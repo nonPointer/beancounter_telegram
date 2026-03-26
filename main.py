@@ -246,9 +246,11 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         'ago', 'last', 'next', 'this', 'previous',
     }
     _tokens = first_line.lower().split()
+    _has_decimal = any(re.fullmatch(r'-?\d+\.\d+', t) for t in _tokens)
     _try_pdt = (
         (len(_tokens) >= 2 or bool(set(_tokens) & _pdt_keywords))
         and len(_tokens) <= 4  # skip long sentences to avoid false positives
+        and not _has_decimal  # skip if a token looks like a monetary amount (e.g. 6.16)
     )
     if _try_pdt:
         now_naive = now.replace(tzinfo=None) if now.tzinfo else now

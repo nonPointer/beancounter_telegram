@@ -89,7 +89,12 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 - Key regex constraint: all `re.MULTILINE` patterns use `[ \t]*` (not `\s*`) to avoid crossing line boundaries
 
 ### Date handling
-First line of user input is tested with `datetime.strptime(line, '%Y-%m-%d')`; if it parses, it overrides today's date and is stripped from the input before LLM call.
+`parse_natural_date(text, now)` extracts an optional date from the first line of user input using a three-layer fallback:
+1. **Chinese keywords** — prefix-matched `昨天`, `前天`, `上周五`, `3天前`, etc.
+2. **dateutil** — structured dates (`2024-03-15`, `March 15`, `3/15`); guarded against pure-numeric and very short inputs
+3. **parsedatetime** — relative English dates (`yesterday`, `last friday`, `3 days ago`); guarded against long sentences and inputs containing decimal amounts (e.g. `6.16`) to prevent monetary values from being misinterpreted as dates
+
+If a date is detected, it overrides today's date and the first line is stripped from the input before LLM call.
 
 ### GitHub Actions workflows (`.github/workflows/*.yml.example`)
 - `monthly-report.yml.example` — daily Sankey chart of monthly expenses sent to Telegram; configurable `REPORT_CURRENCY` and `FX_RATES` (JSON dict) at workflow `env` level; aggregates sub-accounts into top-level categories
