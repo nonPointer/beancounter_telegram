@@ -1205,5 +1205,84 @@ class TestParseNaturalDate(unittest.TestCase):
         self.assertEqual(remaining, "午饭 50 CNY")
 
 
+class TestBeancountSyntaxValidation(unittest.TestCase):
+    """Beancount syntax validation and LLM retry loop."""
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_valid_entry_returns_none(self):
+        entry = '2024-03-15 * "Payee" "Narration"\n  Expenses:Food  30 CNY\n  Assets:Bank  -30 CNY'
+        self.assertIsNone(self.bot.validate_beancount_syntax(entry))
+
+    def test_invalid_syntax_returns_error(self):
+        entry = '2024-03-15 ** "Bad"\n  Expenses:Food  30 CNY\n  Assets:Bank  -30 CNY'
+        result = self.bot.validate_beancount_syntax(entry)
+        self.assertIsNotNone(result)
+
+    def test_commented_entry_valid(self):
+        entry = '; comment\n2024-03-15 * "Payee" "Narration"\n  Expenses:Food  30 CNY\n  Assets:Bank  -30 CNY'
+        self.assertIsNone(self.bot.validate_beancount_syntax(entry))
+
+    def test_investment_entry_valid(self):
+        entry = '2026-03-06 * "Broker" "Buy 10 AAPL"\n  Assets:Broker:AAPL  10 AAPL @@ 1500 USD\n  Assets:Broker:Cash  -1500 USD'
+        self.assertIsNone(self.bot.validate_beancount_syntax(entry))
+
+    def test_sell_bare_at_at_valid(self):
+        entry = '2026-03-06 * "Broker" "Sell 10 AAPL"\n  Assets:Cash  1600 USD\n  Income:Gains  -100 USD\n  Assets:Broker:AAPL  -10 AAPL @@'
+        self.assertIsNone(self.bot.validate_beancount_syntax(entry))
+
+    def test_no_entries_returns_error(self):
+        result = self.bot.validate_beancount_syntax("; just a comment")
+        self.assertIsNotNone(result)
+
+    def _make_backend(self, model="m"):
+        return {"base_url": "http://fake", "api_key": "k", "model": model}
+
+    def _mock_llm_response(self, content):
+        resp = MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_call_openai_compatible_retries_on_syntax_error(self):
+        """LLM is called again when beancount validation fails, up to MAX_BEANCOUNT_RETRIES."""
+        self.bot.llm_enabled = True
+        entry = '2024-01-01 * "P" "N"\n  Expenses:Food  10 CNY\n  Assets:Bank  -10 CNY'
+
+        call_count = 0
+
+        def fake_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return self._mock_llm_response(entry)
+
+        # First call returns entry that fails beancount validation, second succeeds
+        with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
+            with patch("requests.post", side_effect=fake_post):
+                with patch.object(self.bot, "validate_beancount_syntax",
+                                  side_effect=["fake error", None]):
+                    result = self.bot.call_openai_compatible(
+                        "test", ["Expenses:Food", "Assets:Bank"], "2024-01-01"
+                    )
+        self.assertEqual(call_count, 2)
+        self.assertIn("2024-01-01", result)
+
+    def test_call_openai_compatible_raises_after_max_retries(self):
+        """Raises ValueError after MAX_BEANCOUNT_RETRIES failures."""
+        self.bot.llm_enabled = True
+        entry = '2024-01-01 * "P" "N"\n  Expenses:Food  10 CNY\n  Assets:Bank  -10 CNY'
+
+        with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
+            with patch("requests.post", return_value=self._mock_llm_response(entry)):
+                with patch.object(self.bot, "validate_beancount_syntax",
+                                  return_value="persistent error"):
+                    with self.assertRaises(ValueError, msg="syntax validation failed"):
+                        self.bot.call_openai_compatible(
+                            "test", ["Expenses:Food", "Assets:Bank"], "2024-01-01"
+                        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

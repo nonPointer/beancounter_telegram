@@ -60,8 +60,11 @@ Optional tuning: `ACCOUNTS_CACHE_TTL` (default 300s), `DRAFT_TTL_SECONDS` (defau
 ### LLM backend fallback
 `LLM_BACKENDS` list is tried in order; `Bot._call_llm_backends(payload)` raises `ValueError` if all fail. Text and vision paths both use this helper. LLM output starting with `NEED_ACCOUNT:` signals missing account context and is surfaced as a user-facing error.
 
+### Beancount syntax validation
+After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
+
 ### Pending draft lifecycle
-1. LLM generates entry → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
+1. LLM generates entry → beancount syntax validated (with auto-retry) → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
 2. Bot sends entry text + inline confirm/decline/edit buttons to user
 3. On confirm → GitHub commit; on decline → discard; on no action → expires after `DRAFT_TTL_SECONDS` and `cleanup_expired_drafts()` notifies user
 

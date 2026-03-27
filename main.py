@@ -13,9 +13,12 @@ import parsedatetime as pdt
 import pytz
 from dateutil.parser import parse as dateutil_parse
 import requests
+from beancount.parser import parser as beancount_parser
 from jinja2 import Environment, FileSystemLoader
 
 from prompts import BEANCOUNT_SYSTEM_PROMPT, build_user_prompt, INVEST_ORDER_SYSTEM_PROMPT, build_invest_order_prompt
+
+MAX_BEANCOUNT_RETRIES = 3
 
 with open("config.json", "r") as f:
     config = json.load(f)
@@ -655,6 +658,15 @@ class Bot:
 
         return "\n".join(out)
 
+    def validate_beancount_syntax(self, entry_text: str) -> str | None:
+        """Validate entry with the beancount parser. Returns error string or None."""
+        entries, errors, _ = beancount_parser.parse_string(entry_text)
+        if errors:
+            return "; ".join(e.message for e in errors)
+        if not entries:
+            return "No valid beancount entry parsed"
+        return None
+
     def extract_accounts_from_entry(self, entry_text: str) -> list[str]:
         accounts = []
         posting_line_re = re.compile(r'^\s+(\S+)\s+')
@@ -728,25 +740,45 @@ class Bot:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
-        user_prompt = build_user_prompt(txn_date, self._accounts_for_prompt(), user_input, previous_draft, decline_reason, current_time)
-        payload = {
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": BEANCOUNT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
+        accounts_for_prompt = self._accounts_for_prompt()
+        syntax_error = None
+        entry = None
 
-        raw_text = self._call_llm_backends(payload)
+        for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
+            if attempt == 0:
+                prompt_draft = previous_draft
+                prompt_reason = decline_reason
+            else:
+                prompt_draft = entry
+                prompt_reason = f"Beancount syntax error: {syntax_error}"
 
-        if raw_text.upper().startswith("NEED_ACCOUNT:"):
-            guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
-            raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
+            user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time)
+            payload = {
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": BEANCOUNT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
 
-        try:
-            return self.normalize_and_validate_llm_entry(raw_text, accounts)
-        except Exception as e:
-            raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+            raw_text = self._call_llm_backends(payload)
+
+            if raw_text.upper().startswith("NEED_ACCOUNT:"):
+                guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
+                raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
+
+            try:
+                entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
+            except Exception as e:
+                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+
+            syntax_error = self.validate_beancount_syntax(entry)
+            if syntax_error is None:
+                return entry
+
+            log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
+
+        raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
 
     def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
         r = requests.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
@@ -766,25 +798,49 @@ class Bot:
             raise ValueError(self.llm_unavailable_message())
 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        payload = {
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": INVEST_ORDER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        {"type": "text", "text": build_invest_order_prompt(txn_date, self._accounts_for_prompt(), current_time)},
-                    ],
-                },
-            ],
-        }
+        base_prompt = build_invest_order_prompt(txn_date, self._accounts_for_prompt(), current_time)
+        syntax_error = None
+        entry = None
 
-        raw_text = self._call_llm_backends(payload, " vision", vision=True)
-        try:
-            return self.normalize_and_validate_llm_entry(raw_text, accounts)
-        except Exception as e:
-            raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+        for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
+            if attempt == 0:
+                prompt_text = base_prompt
+            else:
+                prompt_text = (
+                    f"{base_prompt}\n\n"
+                    f"Previous draft had beancount syntax errors:\n{entry}\n\n"
+                    f"Error: {syntax_error}\n\n"
+                    "Fix the syntax errors and regenerate."
+                )
+
+            payload = {
+                "temperature": 0.1,
+                "messages": [
+                    {"role": "system", "content": INVEST_ORDER_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    },
+                ],
+            }
+
+            raw_text = self._call_llm_backends(payload, " vision", vision=True)
+
+            try:
+                entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
+            except Exception as e:
+                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+
+            syntax_error = self.validate_beancount_syntax(entry)
+            if syntax_error is None:
+                return entry
+
+            log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
+
+        raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
 
     def handle_photo_message(self, message):
         msg = message["message"]
