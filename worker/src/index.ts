@@ -16,10 +16,6 @@ interface Env {
 	CHAT_ID?: string;
 	/** JSON array of LLMBackend objects */
 	LLM_BACKENDS?: string;
-	/** Legacy single-backend env vars */
-	LLM_API_BASE_URL?: string;
-	LLM_API_KEY?: string;
-	LLM_MODEL?: string;
 	KV: KVNamespace;
 }
 
@@ -473,11 +469,8 @@ export function getLLMBackends(env: Env): LLMBackend[] {
 			const parsed = JSON.parse(env.LLM_BACKENDS) as LLMBackend[];
 			return parsed.filter((b) => b.LLM_API_BASE_URL && b.LLM_API_KEY && b.LLM_MODEL);
 		} catch {
-			// fall through to legacy
+			// invalid JSON
 		}
-	}
-	if (env.LLM_API_BASE_URL && env.LLM_API_KEY && env.LLM_MODEL) {
-		return [{ LLM_API_BASE_URL: env.LLM_API_BASE_URL, LLM_API_KEY: env.LLM_API_KEY, LLM_MODEL: env.LLM_MODEL }];
 	}
 	return [];
 }
@@ -485,7 +478,7 @@ export function getLLMBackends(env: Env): LLMBackend[] {
 async function callLLMRaw(env: Env, messages: unknown[], temperature: number): Promise<string> {
 	const backends = getLLMBackends(env);
 	if (backends.length === 0) {
-		throw new Error('LLM is not configured. Please set LLM_BACKENDS or LLM_API_BASE_URL/LLM_API_KEY/LLM_MODEL.');
+		throw new Error('LLM is not configured. Please set LLM_BACKENDS.');
 	}
 
 	let lastError: Error | null = null;
@@ -726,28 +719,26 @@ async function callLLMText(
 	}
 }
 
-async function callLLMVision(
+async function callLLMVisionGeneric(
 	env: Env,
 	imageBuffer: ArrayBuffer,
 	accounts: string[],
-	currencies: Record<string, string>,
-	txnDate: string,
-	comments: Record<string, string> = {},
-	currentTime?: string,
+	systemPrompt: string,
+	userPrompt: string,
+	temperature: number,
 ): Promise<string> {
-	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
 	const b64 = arrayBufferToBase64(imageBuffer);
 	const messages = [
-		{ role: 'system', content: INVEST_ORDER_SYSTEM_PROMPT },
+		{ role: 'system', content: systemPrompt },
 		{
 			role: 'user',
 			content: [
 				{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } },
-				{ type: 'text', text: buildInvestOrderPrompt(txnDate, acctWithCurr, currentTime) },
+				{ type: 'text', text: userPrompt },
 			],
 		},
 	];
-	const rawText = await callLLMRaw(env, messages, 0.1);
+	const rawText = await callLLMRaw(env, messages, temperature);
 	try {
 		return normalizeAndValidateLLMEntry(rawText, accounts);
 	} catch (e) {
@@ -755,34 +746,22 @@ async function callLLMVision(
 	}
 }
 
-async function callLLMVisionExpense(
-	env: Env,
-	imageBuffer: ArrayBuffer,
-	accounts: string[],
-	currencies: Record<string, string>,
-	txnDate: string,
-	caption: string,
-	comments: Record<string, string> = {},
-	currentTime?: string,
+function callLLMVision(
+	env: Env, imageBuffer: ArrayBuffer, accounts: string[],
+	currencies: Record<string, string>, txnDate: string,
+	comments: Record<string, string> = {}, currentTime?: string,
 ): Promise<string> {
 	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
-	const b64 = arrayBufferToBase64(imageBuffer);
-	const messages = [
-		{ role: 'system', content: EXPENSE_SCREENSHOT_SYSTEM_PROMPT },
-		{
-			role: 'user',
-			content: [
-				{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } },
-				{ type: 'text', text: buildExpenseScreenshotPrompt(txnDate, acctWithCurr, caption, currentTime) },
-			],
-		},
-	];
-	const rawText = await callLLMRaw(env, messages, 0.2);
-	try {
-		return normalizeAndValidateLLMEntry(rawText, accounts);
-	} catch (e) {
-		throw new Error(`${e}\nInvalid LLM output:\n${rawText}`);
-	}
+	return callLLMVisionGeneric(env, imageBuffer, accounts, INVEST_ORDER_SYSTEM_PROMPT, buildInvestOrderPrompt(txnDate, acctWithCurr, currentTime), 0.1);
+}
+
+function callLLMVisionExpense(
+	env: Env, imageBuffer: ArrayBuffer, accounts: string[],
+	currencies: Record<string, string>, txnDate: string, caption: string,
+	comments: Record<string, string> = {}, currentTime?: string,
+): Promise<string> {
+	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
+	return callLLMVisionGeneric(env, imageBuffer, accounts, EXPENSE_SCREENSHOT_SYSTEM_PROMPT, buildExpenseScreenshotPrompt(txnDate, acctWithCurr, caption, currentTime), 0.2);
 }
 
 // --- Account matching ---
@@ -1214,10 +1193,7 @@ async function handleMessage(
 		const payload = text.substring(rawCommand.length).trim();
 
 		if (command === 'tz') {
-			let newTz = payload;
-			if (payload === 'London') newTz = 'Europe/London';
-			else if (payload === 'Beijing') newTz = 'Asia/Shanghai';
-
+			const newTz = payload;
 			if (!isValidTimezone(newTz)) {
 				await reply(`Unknown timezone: ${payload}`);
 				return;
