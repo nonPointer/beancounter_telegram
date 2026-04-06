@@ -53,11 +53,11 @@ describe('addDays', () => {
 // --- accountsForPrompt ---
 
 describe('accountsForPrompt', () => {
-	it('annotates accounts that have a currency', () => {
+	it('annotates accounts that have a currency with parentheses', () => {
 		const result = accountsForPrompt(['Assets:WeChat:Current', 'Expenses:Food'], {
 			'Assets:WeChat:Current': 'CNY',
 		});
-		expect(result).toContain('Assets:WeChat:Current CNY');
+		expect(result).toContain('Assets:WeChat:Current (CNY)');
 		expect(result).toContain('Expenses:Food');
 	});
 
@@ -68,6 +68,25 @@ describe('accountsForPrompt', () => {
 
 	it('handles empty lists', () => {
 		expect(accountsForPrompt([], {})).toEqual([]);
+	});
+
+	it('includes comments when provided', () => {
+		const result = accountsForPrompt(
+			['Assets:WeChat:Current', 'Expenses:Food'],
+			{ 'Assets:WeChat:Current': 'CNY' },
+			{ 'Assets:WeChat:Current': '微信支付' },
+		);
+		expect(result).toContain('Assets:WeChat:Current (CNY) ; 微信支付');
+		expect(result).toContain('Expenses:Food');
+	});
+
+	it('includes comment without currency', () => {
+		const result = accountsForPrompt(
+			['Expenses:Food'],
+			{},
+			{ 'Expenses:Food': '餐饮' },
+		);
+		expect(result).toEqual(['Expenses:Food ; 餐饮']);
 	});
 });
 
