@@ -64,12 +64,6 @@ def _parse_llm_backends() -> list[dict]:
                     entry["vision_model"] = vision_model
                 backends.append(entry)
         return backends
-    # Backward compat: single-backend keys
-    url = config.get("LLM_API_BASE_URL", "").rstrip("/")
-    key = config.get("LLM_API_KEY", "")
-    model = config.get("LLM_MODEL", "")
-    if url and key and model:
-        return [{"base_url": url, "api_key": key, "model": model}]
     return []
 
 
@@ -1421,16 +1415,11 @@ class Bot:
             payload = text[len(command):].strip()
             log(f"Command: {command}, Payload: {payload}")
             if command == "tz":
-                if payload == 'London':
-                    self.timezone = pytz.timezone("Europe/London")
-                elif payload == 'Beijing':
-                    self.timezone = pytz.timezone("Asia/Shanghai")
-                else:
-                    try:
-                        self.timezone = pytz.timezone(payload)
-                    except pytz.UnknownTimeZoneError:
-                        reply(f"Unknown timezone: {payload}")
-                        return
+                try:
+                    self.timezone = pytz.timezone(payload)
+                except pytz.UnknownTimeZoneError:
+                    reply(f"Unknown timezone: {payload}")
+                    return
                 reply(f"Timezone set to {self.timezone}")
                 reply(f"Current time: {datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')}")
                 return
