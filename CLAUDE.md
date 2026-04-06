@@ -21,6 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Worker (Cloudflare) — from worker/ directory
 npm run dev    # local dev
 npm run deploy # deploy to Cloudflare
+npx vitest run # run worker tests
 ```
 
 ## Architecture
@@ -36,9 +37,10 @@ The project has two independent components that share the same config schema:
 **2. Cloudflare Worker (`worker/src/index.ts`)** — webhook-based alternative
 - TypeScript, same feature set, uses KV for pending entry state
 - Configured via Cloudflare environment bindings (same key names as `config.json`)
+- Must be kept in sync with Python: `stripCodeFence`, `normalizeAndValidateLLMEntry`, `accountsForPrompt`, and system prompts should match behavior
 
 ### Key modules
-- `main.py` — bot entry point, `Bot` class (~1480 lines)
+- `main.py` — bot entry point, `Bot` class (~1700 lines)
 - `prompts.py` — LLM system prompts and user prompt builders for both text and vision paths
 - `templates/*.bean.j2` — Jinja2 templates for beancount directives (`open`, `close`, `balance`, `pad`, `transaction`)
 
@@ -61,7 +63,7 @@ Optional tuning: `ACCOUNTS_CACHE_TTL` (default 300s), `DRAFT_TTL_SECONDS` (defau
 `LLM_BACKENDS` list is tried in order; `Bot._call_llm_backends(payload)` raises `ValueError` if all fail. Text and vision paths both use this helper. LLM output starting with `NEED_ACCOUNT:` signals missing account context and is surfaced as a user-facing error.
 
 ### Beancount syntax validation
-After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
+After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop. The worker does not have beancount parser validation.
 
 ### Pending draft lifecycle
 1. LLM generates entry → beancount syntax validated (with auto-retry) → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
@@ -72,11 +74,11 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 
 ### /undo command
 - `/undo` — previews and removes the last beancount directive from `main.bean` (any top-level directive: transaction, balance, pad, open, close)
-- `extract_last_directive_block(content)` — module-level pure function; scans backward for last `YYYY-MM-DD ` line, extracts the full block, returns `(directive_text, new_file_content)`
+- `extract_last_directive_block(content)` — module-level pure function; scans backward for last `YYYY-MM-DD ` line, includes leading `;` comment lines in the removed block, returns `(directive_text, new_file_content)`
 - Callback actions: `undo_confirm:<id>` commits `new_content` to GitHub; `undo_cancel:<id>` discards
 
 ### /last and /today commands
-- `/last [N]` — shows the last N directives from `main.bean` (default 5); accepts optional count argument
+- `/last [N]` — shows the last N directives from `main.bean` (default 5, max 50); output truncated at 4000 chars for Telegram message limit
 - `/today` — shows all directives matching today's date (timezone-aware via `self.timezone`)
 - Both use `extract_all_directive_blocks(content)` — module-level pure function that returns `[(date_str, block_text), ...]` in file order; each block includes leading `;` comment lines
 - Read-only commands; no pending entry or confirmation flow
@@ -88,8 +90,11 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 
 ### LLM output sanitization
 - `strip_code_fence()` — removes markdown code fences, then extracts the beancount entry by finding the `YYYY-MM-DD` transaction header line; discards any surrounding natural language (important for recheck flow where LLMs sometimes return conversational responses)
-- `normalize_and_validate_llm_entry()` — validates header is a beancount directive, filters metadata lines with strict regex (only `key: value` and `;` comments), rejects natural language; also handles balance validation, cross-currency FX annotation, and `:Current` suffix resolution
+- `normalize_and_validate_llm_entry()` — validates header is a beancount directive, strips parenthesized annotations like `(GBP)` that LLMs copy from account lists, filters metadata lines with strict regex (only `key: value` and `;` comments), rejects natural language; also handles balance validation, cross-currency FX annotation, and `:Current` suffix resolution
 - Key regex constraint: all `re.MULTILINE` patterns use `[ \t]*` (not `\s*`) to avoid crossing line boundaries
+
+### Account list prompt format
+Accounts are sent to the LLM with annotations: `Assets:Bank:CMB (CNY) ; 招商��行`. The `(currency)` and `; alias` parts are for LLM context only — the sanitizer strips them if the LLM copies them into postings. Both Python (`_accounts_for_prompt`) and worker (`accountsForPrompt`) must produce the same format.
 
 ### Date handling
 `parse_natural_date(text, now)` extracts an optional date from the first line of user input using a three-layer fallback:
@@ -98,6 +103,17 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 3. **parsedatetime** — relative English dates (`yesterday`, `last friday`, `3 days ago`); guarded against long sentences and inputs containing decimal amounts (e.g. `6.16`) to prevent monetary values from being misinterpreted as dates
 
 If a date is detected, it overrides today's date and the first line is stripped from the input before LLM call.
+
+### Thread safety (Python bot)
+- `_pending_lock` — protects `pending_llm_entries` and `pending_decline_reasons` dicts
+- `_accounts_cache_lock` — protects `_accounts_cache` read/write (network calls run outside the lock)
+- `print_lock` — serializes log output
+- Each message/callback is processed in its own daemon thread
+
+### Input validation
+- `/open` validates account name against beancount pattern (`^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$`) and currency against `^[A-Z][A-Z0-9]{0,9}$`
+- `/update` validates amount is numeric
+- Manual transaction postings validate currency format
 
 ### GitHub Actions workflows (`.github/workflows/*.yml.example`)
 - `monthly-report.yml.example` — daily Sankey chart of monthly expenses sent to Telegram; configurable `REPORT_CURRENCY` and `FX_RATES` (JSON dict) at workflow `env` level; aggregates sub-accounts into top-level categories
