@@ -280,21 +280,6 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     return now.strftime('%Y-%m-%d'), False, text
 
 
-class rotating_loading:
-    def __init__(self, stop_event: threading.Event):
-        self.stop_event = stop_event
-
-    def start(self):
-        symbols = ['/', '-', '\\', '|']
-        duration = 0.2
-        i = 0
-        while not self.stop_event.wait(duration):
-            with print_lock:
-                print('\r' + symbols[i % len(symbols)], end='', flush=True)
-            i += 1
-        with print_lock:
-            print('\r \r', end='', flush=True)
-
 
 ACCOUNTS_CACHE_TTL = get_int_config("ACCOUNTS_CACHE_TTL", 300)
 DRAFT_TTL_SECONDS = get_int_config("DRAFT_TTL_SECONDS", 120)
@@ -1732,22 +1717,15 @@ class Bot:
     def get_updates(self):
         params = {"offset": self.update_id + 1, "timeout": 30}
         try:
-            loading_stop_event = threading.Event()
-            loading = threading.Thread(target=rotating_loading(loading_stop_event).start)
-            loading.start()
             response = requests.get(self.api_base + "/getUpdates", params=params, timeout=params["timeout"] + 1)
-            loading_stop_event.set()
-
             if response.status_code != 200:
                 log(f"Error: {response.status_code}")
                 return {"result": []}
         except KeyboardInterrupt:
             log("Got KeyboardInterrupt in Bot thread.")
-            loading_stop_event.set()
             self.stop.set()
             exit(0)
         except Exception as e:
-            loading_stop_event.set()
             log(e)
             log("Timeout or Connection Error")
             return {"result": []}
