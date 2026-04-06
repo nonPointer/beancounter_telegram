@@ -85,7 +85,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 
 // --- Date / Timezone ---
 
-function formatInTimezone(tz: string): { dateStr: string; datetimeStr: string } {
+function formatInTimezone(tz: string): { dateStr: string; datetimeStr: string; timeStr: string } {
 	const now = new Date();
 	const parts = new Intl.DateTimeFormat('en-CA', {
 		timeZone: tz,
@@ -101,7 +101,8 @@ function formatInTimezone(tz: string): { dateStr: string; datetimeStr: string } 
 	const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
 	const dateStr = `${get('year')}-${get('month')}-${get('day')}`;
 	const datetimeStr = `${dateStr} ${get('hour')}:${get('minute')}:${get('second')}`;
-	return { dateStr, datetimeStr };
+	const timeStr = `${get('hour')}:${get('minute')}`;
+	return { dateStr, datetimeStr, timeStr };
 }
 
 export function addDays(dateStr: string, days: number): string {
@@ -352,6 +353,8 @@ const BEANCOUNT_SYSTEM_PROMPT =
 	"If user mentions a specific item name (e.g., 'coke', 'coffee', 'pizza'), use that item name in the narration, NOT a generic category. " +
 	"Examples: 'coke' → narration 'Coke' (NOT '购物' or '饮料'); 'coffee' → narration 'Coffee' (NOT '饮料'); 'pizza' → narration 'Pizza' (NOT '餐饮'). " +
 	"Use specific meal types from user input: 'brunch' → 'Brunch', 'lunch' → 'Lunch', 'dinner' / 晚餐 → '晚餐', 'breakfast' → 'Breakfast'. " +
+	'When the current time is provided, use it to infer meal context if the user mentions eating without specifying the meal type ' +
+	"(e.g., morning → 'Breakfast', noon → 'Lunch', evening → 'Dinner'). " +
 	"Use generic categories ONLY when no specific item is mentioned: '购物', '餐饮', '交通'. " +
 	"DO NOT use action verbs like '吃', '买', '购买' as narration. " +
 	"Examples of good narrations: 'Coke', 'Coffee', 'Brunch', '晚餐', '打车', '转账', '充值'. " +
@@ -374,7 +377,13 @@ const BEANCOUNT_SYSTEM_PROMPT =
 	'If only a total transfer amount is given, one consolidated posting is fine. ' +
 	'WRONG: Expenses:Food 84 GBP with Assets:Bank 63 GBP does NOT balance and is incorrect. ' +
 	'Never use Income or Assets:Receivable for money transferred back from a split expense. ' +
-	"The account list may include a default currency after each account name (e.g. 'Assets:WeChat:Current CNY'). " +
+	'The account list may include annotations after the account name: ' +
+	"a default currency in parentheses (e.g. 'Assets:Bank:WeChat (CNY)'), " +
+	"and/or a human-readable alias after ';' (e.g. 'Assets:Bank:CMB (CNY) ; 招商银行'). " +
+	'CRITICAL: These annotations are NOT part of the account name. ' +
+	"When generating beancount postings, use ONLY the account name — never include '(CNY)' or '; alias' in the posting. " +
+	"Correct: '  Assets:Bank:CMB  -50 CNY'. Wrong: '  Assets:Bank:CMB (CNY) ; 招商银行  -50 CNY'. " +
+	"Use the '; alias' as a hint to match user-mentioned names to the correct account (e.g. user says '招商银行' → use 'Assets:Bank:CMB'). " +
 	"When the user does not specify a currency, use the default currency of the payment/source account as shown in the account list. " +
 	"If no currency is specified by the user and the payment account has no default currency listed, fall back to context or ask. " +
 	"If only one currency appears in the user's input, treat it as the default currency for all amounts in the transaction. " +
@@ -430,9 +439,11 @@ export function buildUserPrompt(
 	userInput: string,
 	previousDraft?: string,
 	declineReason?: string,
+	currentTime?: string,
 ): string {
+	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
 	let prompt =
-		`Transaction date is ${txnDate}. Use this exact date in the output.\n` +
+		`Transaction date is ${txnDate}. Use this exact date in the output.${timeInfo}\n` +
 		'Account list:\n' +
 		accountsWithCurrencies.join('\n') +
 		'\n\n' +
@@ -445,9 +456,10 @@ export function buildUserPrompt(
 	return prompt;
 }
 
-function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[]): string {
+function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[], currentTime?: string): string {
+	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
 	return (
-		`Reference date (today): ${txnDate}.\n` +
+		`Reference date (today): ${txnDate}${timeInfo}.\n` +
 		'Account list:\n' +
 		accountsWithCurrencies.join('\n') +
 		'\n\nAnalyze the investment order screenshot and generate the beancount transaction. ' +
@@ -701,11 +713,12 @@ async function callLLMText(
 	previousDraft?: string,
 	declineReason?: string,
 	comments: Record<string, string> = {},
+	currentTime?: string,
 ): Promise<string> {
 	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
 	const messages = [
 		{ role: 'system', content: BEANCOUNT_SYSTEM_PROMPT },
-		{ role: 'user', content: buildUserPrompt(txnDate, acctWithCurr, userInput, previousDraft, declineReason) },
+		{ role: 'user', content: buildUserPrompt(txnDate, acctWithCurr, userInput, previousDraft, declineReason, currentTime) },
 	];
 	const rawText = await callLLMRaw(env, messages, 0.2);
 	try {
@@ -722,6 +735,7 @@ async function callLLMVision(
 	currencies: Record<string, string>,
 	txnDate: string,
 	comments: Record<string, string> = {},
+	currentTime?: string,
 ): Promise<string> {
 	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
 	const b64 = arrayBufferToBase64(imageBuffer);
@@ -731,7 +745,7 @@ async function callLLMVision(
 			role: 'user',
 			content: [
 				{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } },
-				{ type: 'text', text: buildInvestOrderPrompt(txnDate, acctWithCurr) },
+				{ type: 'text', text: buildInvestOrderPrompt(txnDate, acctWithCurr, currentTime) },
 			],
 		},
 	];
@@ -931,6 +945,7 @@ async function runRecheckWithReason(
 	currencies: Record<string, string>,
 	declineReason: string,
 	comments: Record<string, string> = {},
+	currentTime?: string,
 ): Promise<void> {
 	const pending = await getPendingEntry(env, pendingId);
 	if (!pending) {
@@ -939,7 +954,7 @@ async function runRecheckWithReason(
 	}
 
 	try {
-		const newEntry = await callLLMText(env, pending.userInput, accounts, currencies, pending.dateStr, pending.entryText, declineReason, comments);
+		const newEntry = await callLLMText(env, pending.userInput, accounts, currencies, pending.dateStr, pending.entryText, declineReason, comments, currentTime);
 		const entryWithComment = prependNaturalLanguageComment(newEntry, pending.userInput);
 		const newCommitMessage = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
 
@@ -1070,7 +1085,7 @@ async function handlePhotoMessage(
 		getTimezoneForChat(env, chatId),
 		parseAccountsWithCurrencies(env),
 	]);
-	const { dateStr } = formatInTimezone(tz);
+	const { dateStr, timeStr } = formatInTimezone(tz);
 
 	if (accounts.length === 0) {
 		await reply('No accounts available. Please check GitHub account parsing first.');
@@ -1092,7 +1107,7 @@ async function handlePhotoMessage(
 	}
 
 	try {
-		const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, comments);
+		const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, comments, timeStr);
 		const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
 		const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
 		await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
@@ -1125,7 +1140,7 @@ async function handleMessage(
 		env.KV.get(declineStateKey),
 	]);
 
-	let { dateStr, datetimeStr } = formatInTimezone(tz);
+	let { dateStr, datetimeStr, timeStr } = formatInTimezone(tz);
 	let customDate = false;
 
 	// Custom date prefix
@@ -1144,7 +1159,7 @@ async function handleMessage(
 			return;
 		}
 		await env.KV.delete(declineStateKey);
-		await runRecheckWithReason(env, chatId, waitingPendingId, accounts, currencies, reasonText, comments);
+		await runRecheckWithReason(env, chatId, waitingPendingId, accounts, currencies, reasonText, comments, timeStr);
 		return;
 	}
 
@@ -1320,7 +1335,7 @@ async function handleMessage(
 		// LLM path (single-line, or structured parsing failed)
 		if (!appendix) {
 			try {
-				const entry = await callLLMText(env, text, accounts, currencies, dateStr, undefined, undefined, comments);
+				const entry = await callLLMText(env, text, accounts, currencies, dateStr, undefined, undefined, comments, customDate ? undefined : timeStr);
 				const entryWithComment = prependNaturalLanguageComment(entry, text);
 				const cm = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
 				await sendDraftForReview(env, chatId, 'LLM draft (checked padding)', entryWithComment, text, cm, dateStr);
