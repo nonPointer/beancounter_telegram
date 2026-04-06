@@ -16,7 +16,11 @@ import requests
 from beancount.parser import parser as beancount_parser
 from jinja2 import Environment, FileSystemLoader
 
-from prompts import BEANCOUNT_SYSTEM_PROMPT, build_user_prompt, INVEST_ORDER_SYSTEM_PROMPT, build_invest_order_prompt
+from prompts import (
+    BEANCOUNT_SYSTEM_PROMPT, build_user_prompt,
+    INVEST_ORDER_SYSTEM_PROMPT, build_invest_order_prompt,
+    EXPENSE_SCREENSHOT_SYSTEM_PROMPT, build_expense_screenshot_prompt,
+)
 
 MAX_BEANCOUNT_RETRIES = 3
 
@@ -854,6 +858,55 @@ class Bot:
 
         raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
 
+    def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_time: str = "") -> str:
+        if not self.llm_enabled:
+            raise ValueError(self.llm_unavailable_message())
+
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        base_prompt = build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_time)
+        syntax_error = None
+        entry = None
+
+        for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
+            if attempt == 0:
+                prompt_text = base_prompt
+            else:
+                prompt_text = (
+                    f"{base_prompt}\n\n"
+                    f"Previous draft had beancount syntax errors:\n{entry}\n\n"
+                    f"Error: {syntax_error}\n\n"
+                    "Fix the syntax errors and regenerate."
+                )
+
+            payload = {
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": EXPENSE_SCREENSHOT_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    },
+                ],
+            }
+
+            raw_text = self._call_llm_backends(payload, " vision-expense", vision=True)
+
+            try:
+                entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
+            except Exception as e:
+                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
+
+            syntax_error = self.validate_beancount_syntax(entry)
+            if syntax_error is None:
+                return entry
+
+            log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
+
+        raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
+
     def handle_photo_message(self, message):
         msg = message["message"]
         chat_id = msg["chat"]["id"]
@@ -882,39 +935,55 @@ class Bot:
 
         # Use highest-resolution photo
         file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
-        log(f"Processing investment order screenshot (caption: {caption!r})")
 
         image_bytes = self.get_telegram_file_bytes(file_id)
         if not image_bytes:
             reply("Failed to download the image.")
             return
 
+        # Route: caption containing invest/cfd/stocksisa/isa keywords → investment order
+        _invest_keywords = {'invest', 'cfd', 'stocksisa', 'isa'}
+        _caption_words = set(caption.lower().split())
+        is_invest = bool(_caption_words & _invest_keywords)
+
         try:
-            appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, time_str)
-            if caption:
-                appendix = self.prepend_natural_language_comment(appendix, caption)
-            commit_message = self.add_non_pnl_accounts_to_commit_message(
-                'Add investment entry by Telegram Bot\n\n', appendix
-            )
+            if is_invest:
+                log(f"Processing investment order screenshot (caption: {caption!r})")
+                appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, time_str)
+                if caption:
+                    appendix = self.prepend_natural_language_comment(appendix, caption)
+                commit_prefix = 'Add investment entry by Telegram Bot\n\n'
+                draft_label = "Investment order draft"
+                user_input = caption or "(investment order screenshot)"
+            else:
+                log(f"Processing expense screenshot (caption: {caption!r})")
+                appendix = self.call_openai_vision_expense(image_bytes, accounts, date_str, caption, time_str)
+                if caption:
+                    appendix = self.prepend_natural_language_comment(appendix, caption)
+                commit_prefix = 'Add entry by Telegram Bot\n\n'
+                draft_label = "Expense screenshot draft"
+                user_input = caption or "(expense screenshot)"
+
+            commit_message = self.add_non_pnl_accounts_to_commit_message(commit_prefix, appendix)
 
             pending_id = self.next_pending_id()
             with self._pending_lock:
                 self.pending_llm_entries[pending_id] = self._make_pending_entry(
-                    chat_id, appendix, commit_message, caption or "(investment order screenshot)", date_str
+                    chat_id, appendix, commit_message, user_input, date_str
                 )
 
-            log("Investment order draft:\n" + appendix)
+            log(f"{draft_label}:\n" + appendix)
             self.send_message(
                 chat_id,
-                "Investment order draft:\n"
+                f"{draft_label}:\n"
                 f"<pre><code>{html.escape(appendix)}</code></pre>\n"
                 "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
                 reply_markup=self.build_review_buttons(pending_id),
                 parse_mode="HTML",
             )
         except Exception as e:
-            log(f"Investment order processing failed: {e}")
-            reply(f"Failed to process investment order: {e}")
+            log(f"Photo processing failed: {e}")
+            reply(f"Failed to process screenshot: {e}")
 
     def handle_undo(self, chat_id: int):
         f = self.github_download_file()
