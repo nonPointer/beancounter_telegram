@@ -116,6 +116,47 @@ INVEST_ORDER_SYSTEM_PROMPT = (
 )
 
 
+EXPENSE_SCREENSHOT_SYSTEM_PROMPT = (
+    "You are a Beancount assistant specializing in expense notification screenshots. "
+    "Analyze the screenshot (e.g. bank push notification, credit card alert, payment confirmation) "
+    "and generate ONE valid beancount transaction. "
+    "CRITICAL: Use ONLY accounts from the provided account list. NEVER create new accounts. "
+    "Extract from the screenshot: "
+    "  - Merchant/payee name (e.g. 'Sainsbury's', 'Amazon', 'Uber') "
+    "  - Amount and currency "
+    "  - Payment source (bank or card name shown in the notification, e.g. 'Chase', 'Monzo', 'HSBC') "
+    "Map the payment source to the best matching Liabilities or Assets account in the account list. "
+    "For credit card notifications, use a Liabilities:CreditCard:* account. "
+    "For debit/bank notifications, use an Assets:Bank:* account. "
+    "Choose the Expenses account that best matches the merchant type. "
+    "The narration should come from the user's caption message if provided, NOT from the screenshot. "
+    "If no caption is provided, derive a concise narration from the merchant name or purchase context. "
+    "Keep narrations concise (1-3 words). Write in Chinese unless the caption is in English. "
+    "Transaction date: use today's date (provided in the prompt) unless the screenshot clearly shows a different date. "
+    "Output beancount text only, no markdown, no explanations.\n\n"
+    "Example (Chase credit card notification for Sainsbury's, caption: '买菜'):\n"
+    "2026-04-06 * \"Sainsbury's\" \"买菜\"\n"
+    "  Expenses:Food                    5.50 GBP\n"
+    "  Liabilities:CreditCard:Chase    -5.50 GBP\n"
+)
+
+
+def build_expense_screenshot_prompt(
+    txn_date: str, accounts: list[str], caption: str = "", current_time: str = ""
+) -> str:
+    time_info = f" (current time: {current_time})" if current_time else ""
+    prompt = (
+        f"Transaction date is {txn_date}. Use this exact date in the output.{time_info}\n"
+        "Account list:\n"
+        + "\n".join(accounts)
+        + "\n\n"
+        "Analyze the expense notification screenshot and generate the beancount transaction."
+    )
+    if caption:
+        prompt += f"\nUser caption (use as narration context): {caption}"
+    return prompt
+
+
 def build_invest_order_prompt(txn_date: str, accounts: list[str], current_time: str = "") -> str:
     time_info = f" (current time: {current_time})" if current_time else ""
     return (

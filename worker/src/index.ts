@@ -456,6 +456,40 @@ export function buildUserPrompt(
 	return prompt;
 }
 
+const EXPENSE_SCREENSHOT_SYSTEM_PROMPT =
+	'You are a Beancount assistant specializing in expense notification screenshots. ' +
+	'Analyze the screenshot (e.g. bank push notification, credit card alert, payment confirmation) ' +
+	'and generate ONE valid beancount transaction. ' +
+	'CRITICAL: Use ONLY accounts from the provided account list. NEVER create new accounts. ' +
+	'Extract from the screenshot: ' +
+	"  - Merchant/payee name (e.g. 'Sainsbury\\'s', 'Amazon', 'Uber') " +
+	'  - Amount and currency ' +
+	"  - Payment source (bank or card name shown in the notification, e.g. 'Chase', 'Monzo', 'HSBC') " +
+	'Map the payment source to the best matching Liabilities or Assets account in the account list. ' +
+	'For credit card notifications, use a Liabilities:CreditCard:* account. ' +
+	'For debit/bank notifications, use an Assets:Bank:* account. ' +
+	'Choose the Expenses account that best matches the merchant type. ' +
+	"The narration should come from the user's caption message if provided, NOT from the screenshot. " +
+	'If no caption is provided, derive a concise narration from the merchant name or purchase context. ' +
+	'Keep narrations concise (1-3 words). Write in Chinese unless the caption is in English. ' +
+	"Transaction date: use today's date (provided in the prompt) unless the screenshot clearly shows a different date. " +
+	'Output beancount text only, no markdown, no explanations.\n\n' +
+	"Example (Chase credit card notification for Sainsbury's, caption: '买菜'):\n" +
+	'2026-04-06 * "Sainsbury\'s" "买菜"\n' +
+	'  Expenses:Food                    5.50 GBP\n' +
+	'  Liabilities:CreditCard:Chase    -5.50 GBP\n';
+
+function buildExpenseScreenshotPrompt(txnDate: string, accountsWithCurrencies: string[], caption?: string, currentTime?: string): string {
+	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
+	let prompt =
+		`Transaction date is ${txnDate}. Use this exact date in the output.${timeInfo}\n` +
+		'Account list:\n' +
+		accountsWithCurrencies.join('\n') +
+		'\n\nAnalyze the expense notification screenshot and generate the beancount transaction.';
+	if (caption) prompt += `\nUser caption (use as narration context): ${caption}`;
+	return prompt;
+}
+
 function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[], currentTime?: string): string {
 	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
 	return (
@@ -750,6 +784,36 @@ async function callLLMVision(
 		},
 	];
 	const rawText = await callLLMRaw(env, messages, 0.1);
+	try {
+		return normalizeAndValidateLLMEntry(rawText, accounts);
+	} catch (e) {
+		throw new Error(`${e}\nInvalid LLM output:\n${rawText}`);
+	}
+}
+
+async function callLLMVisionExpense(
+	env: Env,
+	imageBuffer: ArrayBuffer,
+	accounts: string[],
+	currencies: Record<string, string>,
+	txnDate: string,
+	caption: string,
+	comments: Record<string, string> = {},
+	currentTime?: string,
+): Promise<string> {
+	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
+	const b64 = arrayBufferToBase64(imageBuffer);
+	const messages = [
+		{ role: 'system', content: EXPENSE_SCREENSHOT_SYSTEM_PROMPT },
+		{
+			role: 'user',
+			content: [
+				{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } },
+				{ type: 'text', text: buildExpenseScreenshotPrompt(txnDate, acctWithCurr, caption, currentTime) },
+			],
+		},
+	];
+	const rawText = await callLLMRaw(env, messages, 0.2);
 	try {
 		return normalizeAndValidateLLMEntry(rawText, accounts);
 	} catch (e) {
@@ -1106,14 +1170,25 @@ async function handlePhotoMessage(
 		return;
 	}
 
+	const investKeywords = new Set(['invest', 'cfd', 'stocksisa', 'isa']);
+	const isInvest = caption.toLowerCase().split(/\s+/).some(w => investKeywords.has(w));
+
 	try {
-		const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, comments, timeStr);
-		const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
-		const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
-		await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
+		if (isInvest) {
+			const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, comments, timeStr);
+			const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
+			const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
+			await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
+		} else {
+			const entry = await callLLMVisionExpense(env, imageBuffer, accounts, currencies, dateStr, caption, comments, timeStr);
+			const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
+			const cm = buildCommitMessage('Add expense entry by Telegram Bot\n\n', entryWithComment);
+			await sendDraftForReview(env, chatId, 'Expense draft', entryWithComment, caption || '(expense screenshot)', cm, dateStr);
+		}
 	} catch (e) {
 		const errMsg = e instanceof Error ? e.message : String(e);
-		await reply(`Failed to process investment order: ${errMsg}`);
+		const label = isInvest ? 'investment order' : 'expense screenshot';
+		await reply(`Failed to process ${label}: ${errMsg}`);
 	}
 }
 
