@@ -229,12 +229,12 @@ async function githubTriggerWorkflow(env: Env, workflowFile: string, inputs: Rec
 
 // --- Account parsing (with default currencies) ---
 
-async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string[]; currencies: Record<string, string> }> {
+async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string[]; currencies: Record<string, string>; comments: Record<string, string> }> {
 	const cached = await env.KV.get(ACCOUNTS_CACHE_KEY, 'json');
 	if (cached) {
-		const { accounts, currencies, timestamp } = cached as { accounts: string[]; currencies: Record<string, string>; timestamp: number };
+		const { accounts, currencies, comments, timestamp } = cached as { accounts: string[]; currencies: Record<string, string>; comments: Record<string, string>; timestamp: number };
 		if (Date.now() - timestamp < ACCOUNTS_CACHE_TTL * 1000) {
-			return { accounts, currencies };
+			return { accounts, currencies, comments: comments || {} };
 		}
 	}
 
@@ -249,7 +249,7 @@ async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string
 
 	if (!response.ok) {
 		console.error('Error fetching accounts:', response.status);
-		return { accounts: [], currencies: {} };
+		return { accounts: [], currencies: {}, comments: {} };
 	}
 
 	const files = (await response.json()) as Array<{ name: string; url: string }>;
@@ -270,17 +270,19 @@ async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string
 		}),
 	);
 
-	const opened: Record<string, string | null> = {};
+	const opened: Record<string, { currency: string | null; comment: string | null }> = {};
 	const closed = new Set<string>();
 
 	for (const content of fileContents) {
 		if (!content) continue;
 
-		const openMatches = content.matchAll(/\d{4}-\d{2}-\d{2} open (\S+)(?:\s+([A-Z][A-Z0-9]{0,9}))?/g);
+		const openMatches = content.matchAll(/\d{4}-\d{2}-\d{2} open (\S+)(?:\s+([A-Z][A-Z0-9]{0,9}))?(.*)$/gm);
 		for (const match of openMatches) {
 			const account = match[1].trim();
 			const currency = match[2] || null;
-			opened[account] = currency;
+			const rest = match[3] || '';
+			const comment = rest.includes(';') ? rest.split(';', 2)[1].trim() : null;
+			opened[account] = { currency, comment };
 		}
 
 		const closeMatches = content.matchAll(/\d{4}-\d{2}-\d{2} close (\S+)/g);
@@ -290,26 +292,33 @@ async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string
 	}
 
 	const currencies: Record<string, string> = {};
+	const comments: Record<string, string> = {};
 	const accounts: string[] = [];
-	for (const [account, currency] of Object.entries(opened)) {
+	for (const [account, { currency, comment }] of Object.entries(opened)) {
 		if (!closed.has(account)) {
 			accounts.push(account);
 			if (currency) currencies[account] = currency;
+			if (comment) comments[account] = comment;
 		}
 	}
 	accounts.sort();
 
 	await env.KV.put(
 		ACCOUNTS_CACHE_KEY,
-		JSON.stringify({ accounts, currencies, timestamp: Date.now() }),
+		JSON.stringify({ accounts, currencies, comments, timestamp: Date.now() }),
 		{ expirationTtl: ACCOUNTS_CACHE_TTL * 2 },
 	);
 
-	return { accounts, currencies };
+	return { accounts, currencies, comments };
 }
 
-export function accountsForPrompt(accounts: string[], currencies: Record<string, string>): string[] {
-	return accounts.map((a) => (currencies[a] ? `${a} ${currencies[a]}` : a));
+export function accountsForPrompt(accounts: string[], currencies: Record<string, string>, comments: Record<string, string> = {}): string[] {
+	return accounts.map((a) => {
+		let entry = a;
+		if (currencies[a]) entry += ` (${currencies[a]})`;
+		if (comments[a]) entry += ` ; ${comments[a]}`;
+		return entry;
+	});
 }
 
 // --- LLM Prompts ---
@@ -390,9 +399,14 @@ const INVEST_ORDER_SYSTEM_PROMPT =
 	'  - If there is an explicit FX fee or trading fee shown in the screenshot, add a separate Expenses posting. ' +
 	'  - Credit (negative) the cash/settlement account for the total amount paid (including fees). ' +
 	'For SELL orders: ' +
-	'  - Credit (negative) the holding account: -QUANTITY TICKER {} ' +
+	'  - Debit the cash/settlement account for the net proceeds (the actual cash amount credited, from the screenshot). ' +
+	'  - Add a capital gain/loss posting to an Income account for the result/P&L shown in the screenshot: ' +
+	'    Income:Investments:CapitalGains  -RESULT_AMOUNT RESULT_CURRENCY ' +
+	'    (negative value for a gain, positive value for a loss) ' +
+	'  - Credit (negative) the holding account using bare @@ with NO amount after it — beancount computes cost automatically: ' +
+	'    -QUANTITY TICKER @@ ' +
+	'    Do NOT put any amount or currency after @@. Do NOT calculate or look up cost basis. ' +
 	'  - If there is a fee, add a separate Expenses posting. ' +
-	'  - Debit the cash/settlement account for net proceeds. ' +
 	'Transaction date: use the fill/execution date from the screenshot, NOT the submission date. ' +
 	"Payee: broker or platform name (e.g. 'Trading 212', 'IBKR', 'Robinhood'). " +
 	"Narration: format as 'Buy QUANTITY TICKER (Full Company Name)' or 'Sell QUANTITY TICKER (Full Company Name)', e.g. 'Buy 15.5 GOOGL (Google)' or 'Sell 10 AAPL (Apple)'. " +
@@ -402,7 +416,13 @@ const INVEST_ORDER_SYSTEM_PROMPT =
 	'2026-03-06 * "Trading 212" "Buy 15.5 GOOGL (Google)"\n' +
 	'  Assets:Broker:GOOGL      15.5 GOOGL @@ 3464.78 GBP  ; @ 297.75 USD\n' +
 	'  Expenses:Investments:Fee   5.20 GBP\n' +
-	'  Assets:Broker:Cash       -3469.98 GBP\n';
+	'  Assets:Broker:Cash       -3469.98 GBP\n' +
+	'\n' +
+	'Example SELL with capital gain (result = 266.98 GBP from screenshot, net proceeds = 2406.54 GBP):\n' +
+	'2026-03-06 * "Trading 212" "Sell 23 ANET (Arista Networks)"\n' +
+	'  Assets:Broker:Cash        2406.54 GBP\n' +
+	'  Income:Broker:CapitalGains  -266.98 GBP\n' +
+	'  Assets:Broker:ANET           -23 ANET   @@\n';
 
 export function buildUserPrompt(
 	txnDate: string,
@@ -510,11 +530,47 @@ export function preferCurrentAccount(account: string, accounts: string[]): strin
 
 export function stripCodeFence(text: string): string {
 	const stripped = text.trim();
-	if (stripped.startsWith('```') && stripped.endsWith('```')) {
-		const lines = stripped.split('\n');
-		if (lines.length >= 3) return lines.slice(1, -1).join('\n').trim();
+	// Remove code fence markers (```lang or ```) but only the marker line itself
+	const cleaned = stripped
+		.split('\n')
+		.filter((line) => !/^[ \t]*```\w*[ \t]*$/.test(line))
+		.join('\n')
+		.trim();
+	// Extract beancount entry: find the transaction header and collect from there
+	const headerRe = /^[ \t]*\d{4}-\d{2}-\d{2}\s+[*!txn]/m;
+	const m = headerRe.exec(cleaned);
+	if (m) {
+		// Collect leading ; comment lines immediately before the header
+		const before = cleaned.slice(0, m.index);
+		const comments: string[] = [];
+		const beforeLines = before.split('\n');
+		for (let i = beforeLines.length - 1; i >= 0; i--) {
+			const line = beforeLines[i];
+			if (line.trim().startsWith(';')) {
+				comments.unshift(line);
+			} else if (line.trim() === '') {
+				continue;
+			} else {
+				break;
+			}
+		}
+		// Collect header + all subsequent indented/posting/comment lines
+		const after = cleaned.slice(m.index);
+		const afterLines = after.split('\n');
+		const entryLines: string[] = [];
+		for (let i = 0; i < afterLines.length; i++) {
+			const line = afterLines[i];
+			if (i === 0) {
+				entryLines.push(line.trim());
+			} else if (line.trim() === '' || line[0] === ' ' || line[0] === '\t' || line.trim().startsWith(';')) {
+				entryLines.push(line);
+			} else {
+				break;
+			}
+		}
+		return [...comments, ...entryLines].join('\n').trim();
 	}
-	return stripped;
+	return cleaned;
 }
 
 export function normalizeAndValidateLLMEntry(entryText: string, accounts: string[]): string {
@@ -528,12 +584,34 @@ export function normalizeAndValidateLLMEntry(entryText: string, accounts: string
 		throw new Error('LLM output is too short. Expected a transaction header and at least two postings.');
 	}
 
-	const header = rawLines[0].trim();
-	const metadataLines: string[] = [];
+	// Skip leading ; comment lines to find the header
+	let headerIdx = 0;
+	const leadingComments: string[] = [];
+	for (let i = 0; i < rawLines.length; i++) {
+		if (rawLines[i].trim().startsWith(';')) {
+			leadingComments.push(rawLines[i].trim());
+		} else {
+			headerIdx = i;
+			break;
+		}
+	}
+
+	const header = rawLines[headerIdx].trim();
+	// Validate header looks like a beancount directive (YYYY-MM-DD ...)
+	if (!/^\d{4}-\d{2}-\d{2}\s+/.test(header)) {
+		throw new Error(`LLM output invalid: first line is not a beancount directive header: '${header}'`);
+	}
+
+	const metadataLines: string[] = leadingComments.map((c) => (c.startsWith('  ') ? c : `  ${c}`));
 	const postings: Array<{ account: string; amount: string; currency: string; rest: string }> = [];
 	const postingRe = /^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s+(\S+)(?:\s+(.*))?$/;
+	// Beancount metadata: key-value (e.g. "  key: value") or inline comments ("; ...")
+	const metadataRe = /^\s*(\w[\w-]*\s*:.*|;.*)$/;
+	// Strip parenthesized currency/alias annotations that LLMs sometimes copy
+	const parenAnnotationRe = /\s+\([^)]*\)(?=\s)/g;
 
-	for (const line of rawLines.slice(1)) {
+	for (let line of rawLines.slice(headerIdx + 1)) {
+		line = line.replace(parenAnnotationRe, '');
 		const pm = postingRe.exec(line);
 		if (pm) {
 			postings.push({
@@ -542,7 +620,8 @@ export function normalizeAndValidateLLMEntry(entryText: string, accounts: string
 				currency: pm[3],
 				rest: (pm[4] || '').trim(),
 			});
-		} else {
+		} else if (metadataRe.test(line)) {
+			// Only keep valid beancount metadata/comment lines; skip natural language
 			metadataLines.push(`  ${line.trim()}`);
 		}
 	}
@@ -569,7 +648,7 @@ export function normalizeAndValidateLLMEntry(entryText: string, accounts: string
 			throw new Error('LLM output invalid: two postings must be one positive and one negative.');
 		}
 
-		if (c0 === c1 && a0 + a1 !== 0) {
+		if (c0 === c1 && Math.abs(a0 + a1) > 0.0001) {
 			throw new Error(`LLM output invalid: same-currency postings are unbalanced (${a0} + ${a1} != 0).`);
 		}
 
@@ -621,8 +700,9 @@ async function callLLMText(
 	txnDate: string,
 	previousDraft?: string,
 	declineReason?: string,
+	comments: Record<string, string> = {},
 ): Promise<string> {
-	const acctWithCurr = accountsForPrompt(accounts, currencies);
+	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
 	const messages = [
 		{ role: 'system', content: BEANCOUNT_SYSTEM_PROMPT },
 		{ role: 'user', content: buildUserPrompt(txnDate, acctWithCurr, userInput, previousDraft, declineReason) },
@@ -641,8 +721,9 @@ async function callLLMVision(
 	accounts: string[],
 	currencies: Record<string, string>,
 	txnDate: string,
+	comments: Record<string, string> = {},
 ): Promise<string> {
-	const acctWithCurr = accountsForPrompt(accounts, currencies);
+	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
 	const b64 = arrayBufferToBase64(imageBuffer);
 	const messages = [
 		{ role: 'system', content: INVEST_ORDER_SYSTEM_PROMPT },
@@ -849,6 +930,7 @@ async function runRecheckWithReason(
 	accounts: string[],
 	currencies: Record<string, string>,
 	declineReason: string,
+	comments: Record<string, string> = {},
 ): Promise<void> {
 	const pending = await getPendingEntry(env, pendingId);
 	if (!pending) {
@@ -857,7 +939,7 @@ async function runRecheckWithReason(
 	}
 
 	try {
-		const newEntry = await callLLMText(env, pending.userInput, accounts, currencies, pending.dateStr, pending.entryText, declineReason);
+		const newEntry = await callLLMText(env, pending.userInput, accounts, currencies, pending.dateStr, pending.entryText, declineReason, comments);
 		const entryWithComment = prependNaturalLanguageComment(newEntry, pending.userInput);
 		const newCommitMessage = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
 
@@ -984,7 +1066,7 @@ async function handlePhotoMessage(
 		return;
 	}
 
-	const [tz, { accounts, currencies }] = await Promise.all([
+	const [tz, { accounts, currencies, comments }] = await Promise.all([
 		getTimezoneForChat(env, chatId),
 		parseAccountsWithCurrencies(env),
 	]);
@@ -1010,7 +1092,7 @@ async function handlePhotoMessage(
 	}
 
 	try {
-		const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr);
+		const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, comments);
 		const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
 		const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
 		await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
@@ -1037,7 +1119,7 @@ async function handleMessage(
 	}
 
 	const declineStateKey = `decline_state:${chatId}`;
-	const [{ accounts, currencies }, tz, waitingPendingId] = await Promise.all([
+	const [{ accounts, currencies, comments }, tz, waitingPendingId] = await Promise.all([
 		parseAccountsWithCurrencies(env),
 		getTimezoneForChat(env, chatId),
 		env.KV.get(declineStateKey),
@@ -1062,7 +1144,7 @@ async function handleMessage(
 			return;
 		}
 		await env.KV.delete(declineStateKey);
-		await runRecheckWithReason(env, chatId, waitingPendingId, accounts, currencies, reasonText);
+		await runRecheckWithReason(env, chatId, waitingPendingId, accounts, currencies, reasonText, comments);
 		return;
 	}
 
@@ -1238,7 +1320,7 @@ async function handleMessage(
 		// LLM path (single-line, or structured parsing failed)
 		if (!appendix) {
 			try {
-				const entry = await callLLMText(env, text, accounts, currencies, dateStr);
+				const entry = await callLLMText(env, text, accounts, currencies, dateStr, undefined, undefined, comments);
 				const entryWithComment = prependNaturalLanguageComment(entry, text);
 				const cm = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
 				await sendDraftForReview(env, chatId, 'LLM draft (checked padding)', entryWithComment, text, cm, dateStr);
@@ -1276,6 +1358,8 @@ export default {
 			if (secret !== env.WEBHOOK_SECRET) {
 				return new Response('Unauthorized', { status: 403 });
 			}
+		} else {
+			console.warn('WEBHOOK_SECRET is not set. Webhook requests are not authenticated.');
 		}
 
 		try {

@@ -312,6 +312,17 @@ class TestNormalizeAndValidate(unittest.TestCase):
         self.assertNotIn("```", result)
         self.assertNotIn("**", result)
 
+    def test_paren_currency_annotation_stripped(self):
+        """Parenthesized currency annotations from account list are stripped."""
+        entry = (
+            '2026-04-06 * "Chase" "Sainsbury\'s"\n'
+            '  Expenses:Food                     5.50 GBP\n'
+            '  Liabilities:CreditCard:Chase (GBP)  -5.50 GBP'
+        )
+        result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+        self.assertIn("Liabilities:CreditCard:Chase", result)
+        self.assertNotIn("(GBP)", result)
+
     def test_non_directive_header_rejected(self):
         """If first non-comment line is not a beancount directive, raise ValueError."""
         raw_llm = (

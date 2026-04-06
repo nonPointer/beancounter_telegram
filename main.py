@@ -358,6 +358,10 @@ def extract_last_directive_block(content: str) -> tuple[str, str] | None:
             break
     if last_idx is None:
         return None
+    # Look backward for leading ';' comment lines
+    comment_start = last_idx
+    while comment_start > 0 and lines[comment_start - 1].startswith(';'):
+        comment_start -= 1
     # Find block end: stop at next col-0 non-blank line
     block_end = last_idx + 1
     while block_end < len(lines):
@@ -371,9 +375,9 @@ def extract_last_directive_block(content: str) -> tuple[str, str] | None:
     # Trim trailing blank lines from block
     while block_end > last_idx + 1 and lines[block_end - 1].strip() == '':
         block_end -= 1
-    directive_text = '\n'.join(lines[last_idx:block_end])
+    directive_text = '\n'.join(lines[comment_start:block_end])
     # Remove block + its leading blank separator
-    remove_start = last_idx
+    remove_start = comment_start
     if remove_start > 0 and lines[remove_start - 1].strip() == '':
         remove_start -= 1
     new_lines = lines[:remove_start] + lines[block_end:]
@@ -393,6 +397,7 @@ class Bot:
         self.pending_decline_reasons = {}
         self._pending_lock = threading.Lock()
         self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0}
+        self._accounts_cache_lock = threading.Lock()
         self._file_etag_cache = {}  # file_path -> {"etag": str, "content": str, "sha": str}
         self.llm_enabled = LLM_ENABLED
 
@@ -414,8 +419,9 @@ class Bot:
 
     def parse_accounts(self):
         now = time.time()
-        if self._accounts_cache["accounts"] is not None and now - self._accounts_cache["ts"] < ACCOUNTS_CACHE_TTL:
-            return self._accounts_cache["accounts"]
+        with self._accounts_cache_lock:
+            if self._accounts_cache["accounts"] is not None and now - self._accounts_cache["ts"] < ACCOUNTS_CACHE_TTL:
+                return self._accounts_cache["accounts"]
 
         list_headers = {
             "Authorization": f"token {GITHUB_TOKEN}",
@@ -466,10 +472,11 @@ class Bot:
         currencies = {k: v[0] for k, v in all_opened.items() if k not in all_closed and v[0]}
         comments = {k: v[1] for k, v in all_opened.items() if k not in all_closed and v[1]}
         accounts = sorted(k for k in all_opened if k not in all_closed)
-        self._accounts_cache["accounts"] = accounts
-        self._accounts_cache["currencies"] = currencies
-        self._accounts_cache["comments"] = comments
-        self._accounts_cache["ts"] = now
+        with self._accounts_cache_lock:
+            self._accounts_cache["accounts"] = accounts
+            self._accounts_cache["currencies"] = currencies
+            self._accounts_cache["comments"] = comments
+            self._accounts_cache["ts"] = now
         return accounts
 
     def _accounts_for_prompt(self) -> list[str]:
@@ -572,7 +579,12 @@ class Bot:
         # Beancount metadata: key-value (e.g. "  key: value") or inline comments ("; ...")
         metadata_re = re.compile(r'^\s*(\w[\w-]*\s*:.*|;.*)$')
 
+        # Strip parenthesized currency/alias annotations that LLMs sometimes copy
+        # from the account list (e.g. "Assets:Bank:CMB (CNY)" → "Assets:Bank:CMB")
+        paren_annotation_re = re.compile(r'\s+\([^)]*\)(?=\s)')
+
         for line in raw_lines[header_idx + 1:]:
+            line = paren_annotation_re.sub('', line)
             pm = posting_re.match(line)
             if pm:
                 account = self.prefer_current_account(pm.group(1), accounts)
@@ -942,6 +954,7 @@ class Bot:
         )
 
     def handle_last(self, chat_id: int, count: int = 5):
+        count = min(count, 50)
         f = self.github_download_file()
         if not f:
             self.send_message(chat_id, "Failed to download main.bean from GitHub.")
@@ -952,9 +965,16 @@ class Bot:
             return
         last_blocks = blocks[-count:]
         text = "\n\n".join(block_text for _, block_text in last_blocks)
+        truncated = False
+        if len(text) > 4000:
+            text = text[:4000]
+            truncated = True
+        msg = f"最近 {len(last_blocks)} 条记录：\n<pre><code>{html.escape(text)}</code></pre>"
+        if truncated:
+            msg += "\n（内容过长，已截断显示）"
         self.send_message(
             chat_id,
-            f"最近 {len(last_blocks)} 条记录：\n<pre><code>{html.escape(text)}</code></pre>",
+            msg,
             parse_mode="HTML",
         )
 
@@ -1379,6 +1399,11 @@ class Bot:
                     return
 
                 amount = parts[2]
+                try:
+                    float(amount)
+                except ValueError:
+                    reply(f"Invalid amount: {amount}. Must be a valid number.")
+                    return
                 currency = parts[3]
 
                 try:
@@ -1408,9 +1433,9 @@ class Bot:
                 count = 5
                 if payload:
                     try:
-                        count = max(1, int(payload))
+                        count = min(max(1, int(payload)), 50)
                     except ValueError:
-                        reply("用法：/last [数量]，默认 5")
+                        reply("用法：/last [数量]，默认 5，最大 50")
                         return
                 self.handle_last(chat_id, count)
                 return
@@ -1429,6 +1454,12 @@ class Bot:
                 return
             account = matches[0][0]
             currency = matches[0][1]
+            if not re.match(r'^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$', account):
+                reply("Invalid account name. Must be colon-separated capitalized segments, e.g. Assets:Bank:Foo")
+                return
+            if not re.match(r'^[A-Z][A-Z0-9]{0,9}$', currency):
+                reply("Invalid currency. Must be 1-10 uppercase alphanumeric characters starting with a letter, e.g. USD, CNY")
+                return
             prefix = account.split(":")[0].lower()
             target_file_path = ACCOUNT_TYPE_MAP.get(prefix, FILE_PATH)
             appendix = jinja2.get_template("open.bean.j2").render(
