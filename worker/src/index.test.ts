@@ -126,17 +126,6 @@ describe('getLLMBackends', () => {
 		expect(result[0].LLM_MODEL).toBe('gpt-4');
 	});
 
-	it('falls back to legacy single-backend env vars', () => {
-		const env = {
-			LLM_API_BASE_URL: 'https://api.example.com/v1',
-			LLM_API_KEY: 'sk-abc',
-			LLM_MODEL: 'gpt-3.5',
-		} as unknown as Parameters<typeof getLLMBackends>[0];
-		const result = getLLMBackends(env);
-		expect(result).toHaveLength(1);
-		expect(result[0].LLM_MODEL).toBe('gpt-3.5');
-	});
-
 	it('returns empty array when nothing configured', () => {
 		const env = {} as unknown as Parameters<typeof getLLMBackends>[0];
 		expect(getLLMBackends(env)).toEqual([]);

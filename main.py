@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from pprint import pprint
+from pprint import pformat
 
 import parsedatetime as pdt
 import pytz
@@ -74,16 +74,9 @@ LLM_MISSING_CONFIG_KEYS = [] if LLM_ENABLED else ["LLM_BACKENDS"]
 jinja2 = Environment(loader=FileSystemLoader(searchpath="./templates"))
 
 
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
+_C_GREEN = '\033[92m'
+_C_BLUE = '\033[94m'
+_C_RESET = '\033[0m'
 
 
 print_lock = threading.Lock()
@@ -91,12 +84,11 @@ print_lock = threading.Lock()
 
 def log(message):
     with print_lock:
-        print(f"\r \r{bcolors.OKGREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{bcolors.ENDC}", end="")
+        print(f"\r \r{_C_GREEN}[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}]{_C_RESET}", end="")
         if isinstance(message, str):
             print(" " + message)
         else:
-            print()
-            pprint(message)
+            print(" " + pformat(message))
 
 
 _FAKE_YEAR = 9999
@@ -788,12 +780,14 @@ class Bot:
             return None
         return dl.content
 
-    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, current_time: str = "") -> str:
+    def _call_vision_with_retry(
+        self, image_bytes: bytes, accounts: list[str],
+        system_prompt: str, base_prompt: str, temperature: float, log_label: str,
+    ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        base_prompt = build_invest_order_prompt(txn_date, self._accounts_for_prompt(), current_time)
         syntax_error = None
         entry = None
 
@@ -809,9 +803,9 @@ class Bot:
                 )
 
             payload = {
-                "temperature": 0.1,
+                "temperature": temperature,
                 "messages": [
-                    {"role": "system", "content": INVEST_ORDER_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
                         "content": [
@@ -822,7 +816,7 @@ class Bot:
                 ],
             }
 
-            raw_text = self._call_llm_backends(payload, " vision", vision=True)
+            raw_text = self._call_llm_backends(payload, f" {log_label}", vision=True)
 
             try:
                 entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
@@ -836,55 +830,20 @@ class Bot:
             log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
 
         raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
+
+    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, current_time: str = "") -> str:
+        return self._call_vision_with_retry(
+            image_bytes, accounts, INVEST_ORDER_SYSTEM_PROMPT,
+            build_invest_order_prompt(txn_date, self._accounts_for_prompt(), current_time),
+            temperature=0.1, log_label="vision",
+        )
 
     def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_time: str = "") -> str:
-        if not self.llm_enabled:
-            raise ValueError(self.llm_unavailable_message())
-
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        base_prompt = build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_time)
-        syntax_error = None
-        entry = None
-
-        for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
-            if attempt == 0:
-                prompt_text = base_prompt
-            else:
-                prompt_text = (
-                    f"{base_prompt}\n\n"
-                    f"Previous draft had beancount syntax errors:\n{entry}\n\n"
-                    f"Error: {syntax_error}\n\n"
-                    "Fix the syntax errors and regenerate."
-                )
-
-            payload = {
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": EXPENSE_SCREENSHOT_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                            {"type": "text", "text": prompt_text},
-                        ],
-                    },
-                ],
-            }
-
-            raw_text = self._call_llm_backends(payload, " vision-expense", vision=True)
-
-            try:
-                entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
-            except Exception as e:
-                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
-
-            syntax_error = self.validate_beancount_syntax(entry)
-            if syntax_error is None:
-                return entry
-
-            log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
-
-        raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
+        return self._call_vision_with_retry(
+            image_bytes, accounts, EXPENSE_SCREENSHOT_SYSTEM_PROMPT,
+            build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_time),
+            temperature=0.2, log_label="vision-expense",
+        )
 
     def handle_photo_message(self, message):
         msg = message["message"]
@@ -929,20 +888,16 @@ class Bot:
             if is_invest:
                 log(f"Processing investment order screenshot (caption: {caption!r})")
                 appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, time_str)
-                if caption:
-                    appendix = self.prepend_natural_language_comment(appendix, caption)
+                draft_label, user_input = "Investment order draft", caption or "(investment order screenshot)"
                 commit_prefix = 'Add investment entry by Telegram Bot\n\n'
-                draft_label = "Investment order draft"
-                user_input = caption or "(investment order screenshot)"
             else:
                 log(f"Processing expense screenshot (caption: {caption!r})")
                 appendix = self.call_openai_vision_expense(image_bytes, accounts, date_str, caption, time_str)
-                if caption:
-                    appendix = self.prepend_natural_language_comment(appendix, caption)
+                draft_label, user_input = "Expense screenshot draft", caption or "(expense screenshot)"
                 commit_prefix = 'Add entry by Telegram Bot\n\n'
-                draft_label = "Expense screenshot draft"
-                user_input = caption or "(expense screenshot)"
 
+            if caption:
+                appendix = self.prepend_natural_language_comment(appendix, caption)
             commit_message = self.add_non_pnl_accounts_to_commit_message(commit_prefix, appendix)
 
             pending_id = self.next_pending_id()
@@ -1728,7 +1683,7 @@ class Bot:
         messages = [x for x in updates["result"] if "message" in x]
 
         if self.debug:
-            pprint(updates)
+            log(updates)
 
         for message in edited_messages:
             self.update_id = message["update_id"]
@@ -1748,7 +1703,7 @@ class Bot:
             username = chat.get("username", "")
             text = message["message"].get("text")
 
-            fmt = f"{bcolors.OKBLUE}[{chat_id}]{bcolors.ENDC} {first_name} {last_name} (@{username}):"
+            fmt = f"{_C_BLUE}[{chat_id}]{_C_RESET} {first_name} {last_name} (@{username}):"
             photo = message["message"].get("photo")
             if text:
                 hd = threading.Thread(target=self.handle_message, args=(message,), daemon=True)
