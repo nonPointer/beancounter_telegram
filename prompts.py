@@ -68,6 +68,13 @@ INVEST_ORDER_SYSTEM_PROMPT = (
     "- 资本损益：Income 账户，盈利为负值，亏损为正值。\n"
     "- 持仓账户：-QUANTITY TICKER @@（@@ 后不写金额，beancount 自动计算成本）。\n"
     "- 如有手续费，单独一条 Expenses posting。\n\n"
+    "【账户选择】\n"
+    "- 同一券商可能有多个子账户（如 Trading212 的 Stocks ISA 和 Invest）。\n"
+    "- 用户会在 caption 中用关键词指定账户类型（如 stocksisa、isa、invest、cfd）。\n"
+    "- 根据 caption 关键词匹配账户列表中对应的子账户"
+    "（如 caption 含 stocksisa 或 isa → 使用含 StocksISA 的账户；"
+    "caption 含 invest → 使用含 Invest 的账户）。\n"
+    "- 现金账户和持仓账户必须属于同一子账户。\n\n"
     "【通用规则】\n"
     "- 日期：用截图中的成交日期，非提交日期。\n"
     "- payee：券商名称（如 Trading 212、IBKR）。\n"
@@ -121,9 +128,9 @@ def build_expense_screenshot_prompt(
     return prompt
 
 
-def build_invest_order_prompt(txn_date: str, accounts: list[str], current_time: str = "") -> str:
+def build_invest_order_prompt(txn_date: str, accounts: list[str], caption: str = "", current_time: str = "") -> str:
     time_info = f" (current time: {current_time})" if current_time else ""
-    return (
+    prompt = (
         f"Reference date (today): {txn_date}{time_info}.\n"
         "Account list:\n"
         + "\n".join(accounts)
@@ -131,6 +138,9 @@ def build_invest_order_prompt(txn_date: str, accounts: list[str], current_time: 
         "Analyze the investment order screenshot and generate the beancount transaction. "
         "Use the fill/execution date shown in the screenshot as the transaction date."
     )
+    if caption:
+        prompt += f"\n用户 caption（根据关键词选择对应子账户）：{caption}"
+    return prompt
 
 
 def build_user_prompt(

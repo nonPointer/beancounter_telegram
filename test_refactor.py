@@ -103,8 +103,9 @@ class TestCallLlmBackends(unittest.TestCase):
     def test_raises_when_all_fail(self):
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
             with patch("requests.post", side_effect=ConnectionError("nope")):
-                with self.assertRaises(ValueError, msg="All LLM backends failed"):
+                with self.assertRaises(ValueError) as cm:
                     self.bot._call_llm_backends({})
+                self.assertIn("All LLM backends failed", str(cm.exception))
 
     def test_vision_uses_vision_model(self):
         mock_resp = MagicMock()
@@ -235,8 +236,9 @@ class TestNormalizeAndValidate(unittest.TestCase):
         self.assertIn("Expenses:Food", result)
 
     def test_too_short_raises(self):
-        with self.assertRaises(ValueError, msg="too short"):
+        with self.assertRaises(ValueError) as cm:
             self.bot.normalize_and_validate_llm_entry("header\n  X  1 USD", self.accounts)
+        self.assertIn("too short", str(cm.exception).lower())
 
     def test_fewer_than_two_postings_raises(self):
         entry = '2024-01-15 * "A" "B"\n  metadata: "x"\n  metadata2: "y"'
@@ -1289,10 +1291,11 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
             with patch("requests.post", return_value=self._mock_llm_response(entry)):
                 with patch.object(self.bot, "validate_beancount_syntax",
                                   return_value="persistent error"):
-                    with self.assertRaises(ValueError, msg="syntax validation failed"):
+                    with self.assertRaises(ValueError) as cm:
                         self.bot.call_openai_compatible(
                             "test", ["Expenses:Food", "Assets:Bank"], "2024-01-01"
                         )
+                    self.assertIn("syntax validation failed", str(cm.exception).lower())
 
 
 if __name__ == "__main__":

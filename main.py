@@ -675,7 +675,7 @@ class Bot:
         # Insert datetime after the transaction header, even when leading comment lines exist.
         header_idx = None
         for idx, line in enumerate(lines):
-            if re.match(r'^\d{4}-\d{2}-\d{2}\s+\*\s+', line.strip()):
+            if re.match(r'^\d{4}-\d{2}-\d{2}\s+[*!]\s+', line.strip()) or re.match(r'^\d{4}-\d{2}-\d{2}\s+txn\s+', line.strip()):
                 header_idx = idx
                 break
 
@@ -831,10 +831,10 @@ class Bot:
 
         raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
 
-    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, current_time: str = "") -> str:
+    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_time: str = "") -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, INVEST_ORDER_SYSTEM_PROMPT,
-            build_invest_order_prompt(txn_date, self._accounts_for_prompt(), current_time),
+            build_invest_order_prompt(txn_date, self._accounts_for_prompt(), caption, current_time),
             temperature=0.1, log_label="vision",
         )
 
@@ -887,7 +887,7 @@ class Bot:
         try:
             if is_invest:
                 log(f"Processing investment order screenshot (caption: {caption!r})")
-                appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, time_str)
+                appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, caption, time_str)
                 draft_label, user_input = "Investment order draft", caption or "(investment order screenshot)"
                 commit_prefix = 'Add investment entry by Telegram Bot\n\n'
             else:
@@ -1470,7 +1470,7 @@ class Bot:
             if not matches:
                 reply("Invalid close command format. Use: close [account]")
                 return
-            account_input = matches[0][0] if isinstance(matches[0], tuple) else matches[0]
+            account_input = matches[0]
             account = self.match_account(account_input)
             if not account:
                 reply(f"Account not found (no open record): {account_input}")
