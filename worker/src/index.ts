@@ -383,6 +383,13 @@ const INVEST_ORDER_SYSTEM_PROMPT =
 	'- 资本损益：Income 账户，盈利为负值，亏损为正值。\n' +
 	'- 持仓账户：-QUANTITY TICKER @@（@@ 后不写金额，beancount 自动计算成本）。\n' +
 	'- 如有手续费，单独一条 Expenses posting。\n\n' +
+	'【账户选择】\n' +
+	'- 同一券商可能有多个子账户（如 Trading212 的 Stocks ISA 和 Invest）。\n' +
+	'- 用户会在 caption 中用关键词指定账户类型（如 stocksisa、isa、invest、cfd）。\n' +
+	'- 根据 caption 关键词匹配账户列表中对应的子账户' +
+	'（如 caption 含 stocksisa 或 isa → 使用含 StocksISA 的账户；' +
+	'caption 含 invest → 使用含 Invest 的账户）。\n' +
+	'- 现金账户和持仓账户必须属于同一子账户。\n\n' +
 	'【通用规则】\n' +
 	'- 日期：用截图中的成交日期，非提交日期。\n' +
 	"- payee：券商名称（如 Trading 212、IBKR）。\n" +
@@ -450,15 +457,16 @@ function buildExpenseScreenshotPrompt(txnDate: string, accountsWithCurrencies: s
 	return prompt;
 }
 
-function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[], currentTime?: string): string {
+function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[], caption?: string, currentTime?: string): string {
 	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
-	return (
+	let prompt =
 		`Reference date (today): ${txnDate}${timeInfo}.\n` +
 		'Account list:\n' +
 		accountsWithCurrencies.join('\n') +
 		'\n\nAnalyze the investment order screenshot and generate the beancount transaction. ' +
-		'Use the fill/execution date shown in the screenshot as the transaction date.'
-	);
+		'Use the fill/execution date shown in the screenshot as the transaction date.';
+	if (caption) prompt += `\n用户 caption（根据关键词选择对应子账户）：${caption}`;
+	return prompt;
 }
 
 // --- LLM functions ---
@@ -498,8 +506,12 @@ async function callLLMRaw(env: Env, messages: unknown[], temperature: number): P
 				throw new Error(`LLM API error: ${response.status} ${response.statusText}`);
 			}
 
-			const data = (await response.json()) as { choices: Array<{ message: { content: string } }> };
-			const rawText = data.choices[0].message.content.trim();
+			const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+			const content = data.choices?.[0]?.message?.content;
+			if (!content) {
+				throw new Error(`Invalid LLM response: no content in choices`);
+			}
+			const rawText = content.trim();
 
 			if (rawText.toUpperCase().startsWith('NEED_ACCOUNT:')) {
 				const guidance = rawText.includes(':') ? rawText.split(':', 2)[1].trim() : '';
@@ -675,7 +687,7 @@ export function normalizeAndValidateLLMEntry(entryText: string, accounts: string
 					const rate = abs0 / abs1;
 					postings[1].rest = (postings[1].rest + ` @ ${rate.toFixed(8).replace(/\.?0+$/, '')} ${c0}`).trim();
 				} else {
-					postings[0].rest = (postings[0].rest + ` @@ ${abs1.toFixed(8).replace(/\.?0+$/, '')} ${c1}`).trim();
+					throw new Error('LLM output invalid: one cross-currency posting has zero amount; cannot infer FX rate.');
 				}
 			}
 		}
@@ -749,10 +761,10 @@ async function callLLMVisionGeneric(
 function callLLMVision(
 	env: Env, imageBuffer: ArrayBuffer, accounts: string[],
 	currencies: Record<string, string>, txnDate: string,
-	comments: Record<string, string> = {}, currentTime?: string,
+	caption: string, comments: Record<string, string> = {}, currentTime?: string,
 ): Promise<string> {
 	const acctWithCurr = accountsForPrompt(accounts, currencies, comments);
-	return callLLMVisionGeneric(env, imageBuffer, accounts, INVEST_ORDER_SYSTEM_PROMPT, buildInvestOrderPrompt(txnDate, acctWithCurr, currentTime), 0.1);
+	return callLLMVisionGeneric(env, imageBuffer, accounts, INVEST_ORDER_SYSTEM_PROMPT, buildInvestOrderPrompt(txnDate, acctWithCurr, caption, currentTime), 0.1);
 }
 
 function callLLMVisionExpense(
@@ -801,7 +813,8 @@ export function ensureDatetimeMetadata(entryText: string, datetimeStr: string): 
 
 	let headerIdx = 0;
 	for (let i = 0; i < lines.length; i++) {
-		if (/^\d{4}-\d{2}-\d{2}\s+\*\s+/.test(lines[i].trim())) {
+		const trimmed = lines[i].trim();
+		if (/^\d{4}-\d{2}-\d{2}\s+[*!]\s+/.test(trimmed) || /^\d{4}-\d{2}-\d{2}\s+txn\s+/.test(trimmed)) {
 			headerIdx = i;
 			break;
 		}
@@ -1118,7 +1131,7 @@ async function handlePhotoMessage(
 
 	try {
 		if (isInvest) {
-			const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, comments, timeStr);
+			const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, caption, comments, timeStr);
 			const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
 			const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
 			await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
@@ -1243,9 +1256,19 @@ async function handleMessage(
 	else if (text.toLowerCase().startsWith('open')) {
 		const m = /\S+\s+(\S+)\s+(\S+)/.exec(text);
 		if (!m) { await reply('Invalid open command format.'); return; }
-		const prefix = m[1].split(':')[0].toLowerCase();
+		const account = m[1];
+		const currency = m[2];
+		if (!/^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$/.test(account)) {
+			await reply('Invalid account name. Must be colon-separated capitalized segments, e.g. Assets:Bank:Foo');
+			return;
+		}
+		if (!/^[A-Z][A-Z0-9]{0,9}$/.test(currency)) {
+			await reply('Invalid currency. Must be 1-10 uppercase alphanumeric characters starting with a letter, e.g. USD, CNY');
+			return;
+		}
+		const prefix = account.split(':')[0].toLowerCase();
 		targetFilePath = ACCOUNT_TYPE_MAP[prefix];
-		appendix = renderOpen(dateStr, m[1], m[2], datetimeStr);
+		appendix = renderOpen(dateStr, account, currency, datetimeStr);
 	}
 
 	// --- close ---
@@ -1342,6 +1365,29 @@ async function handleMessage(
 				}
 
 				if (structuredValid && postings.length >= 2) {
+					if (postings.length === 2) {
+						const a0 = parseFloat(postings[0].amount);
+						const a1 = parseFloat(postings[1].amount);
+						const c0 = postings[0].currency;
+						const c1 = postings[1].currency;
+
+						if (a0 * a1 >= 0) {
+							await reply('两条 posting 必须一正一负。');
+							return;
+						}
+						if (c0 === c1 && Math.abs(a0 + a1) > 0.0001) {
+							await reply(`同币种 ${c0} 的两条 posting 金额不平衡：${a0} + ${a1} != 0`);
+							return;
+						}
+						if (c0 !== c1) {
+							const r0 = postings[0].rest;
+							const r1 = postings[1].rest;
+							if (!r0.includes('@') && !r0.includes('{') && !r1.includes('@') && !r1.includes('{')) {
+								await reply(`不同币种 (${c0}/${c1}) 的交易需要标记成本 {} 或价格 @。`);
+								return;
+							}
+						}
+					}
 					appendix = renderTransaction(dateStr, payee, narration, postings, tag, link, datetimeStr);
 				}
 			}
