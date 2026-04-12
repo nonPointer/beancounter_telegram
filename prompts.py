@@ -47,11 +47,18 @@ BEANCOUNT_SYSTEM_PROMPT = (
     "- 跨币种交易用 @ 或 @@ 标注汇率。\n\n"
     "【输出格式】\n"
     "- 仅输出 beancount 文本，不要 markdown、不要解释。\n"
-    "- 每笔交易通常恰好两条 posting，一正一负。\n\n"
-    "示例格式：\n"
+    "- 每笔交易所有 posting 金额之和必须为零。\n"
+    "- 简单交易通常两条 posting（一正一负）；"
+    "多付款来源时需要多条 posting（如一条 Expenses 正值 + 多条付款负值）。\n\n"
+    "示例 1（单一付款）：\n"
     "YYYY-MM-DD * \"商家\" \"描述\"\n"
-    "  Account:Name  -10 USD\n"
-    "  Account:Other  10 USD\n"
+    "  Expenses:Category  10 USD\n"
+    "  Assets:Bank:Current  -10 USD\n\n"
+    "示例 2（多付款来源）：\n"
+    "YYYY-MM-DD * \"商家\" \"描述\"\n"
+    "  Expenses:Category  10 USD\n"
+    "  Liabilities:CreditCard  -6 USD\n"
+    "  Assets:GiftCard  -4 USD\n"
 )
 
 
