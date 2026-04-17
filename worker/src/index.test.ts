@@ -382,10 +382,19 @@ describe('normalizeAndValidateLLMEntry', () => {
 		expect(result).toContain('Assets:WeChat:Current');
 	});
 
-	it('auto-inserts FX rate for cross-currency pair', () => {
+	it('auto-inserts @@ when rate has more than 2 decimal places', () => {
+		// 100 CNY / 13 USD → rate ≈ 7.692... (>2 decimals) → @@
 		const entry = '2024-01-15 * "Shop" "Coffee"\n  Expenses:Food  100 CNY\n  Assets:Cash  -13 USD';
 		const result = normalizeAndValidateLLMEntry(entry, accounts);
-		expect(result).toContain('@');
+		expect(result).toContain('@@ 100 CNY');
+	});
+
+	it('auto-inserts @ when rate has 2 or fewer decimal places', () => {
+		// 3000 GBP / 26700 CNY → rate = 8.9 (1 decimal) → @
+		const entry = '2024-01-15 * "FX" "Exchange"\n  Assets:WeChat:Current  3000 GBP\n  Assets:Cash  -26700 CNY';
+		const result = normalizeAndValidateLLMEntry(entry, accounts);
+		expect(result).toContain('@ 8.9 CNY');
+		expect(result).not.toContain('@@');
 	});
 
 	it('accepts valid 3-posting split-bill entry', () => {

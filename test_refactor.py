@@ -302,14 +302,26 @@ class TestNormalizeAndValidate(unittest.TestCase):
         result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
         self.assertIn("Assets:WeChat:Current", result)
 
-    def test_cross_currency_auto_fx(self):
+    def test_cross_currency_at_at_when_rate_has_many_decimals(self):
+        # 100 CNY / 13 USD → rate ≈ 7.692... (>2 decimals) → @@
         entry = (
             '2024-01-15 * "Shop" "Coffee"\n'
             "  Expenses:Food  100 CNY\n"
             "  Assets:Cash  -13 USD"
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
-        self.assertIn("@", result)
+        self.assertIn("@@ 100 CNY", result)
+
+    def test_cross_currency_at_when_rate_has_few_decimals(self):
+        # 3000 GBP / 26700 CNY → rate = 8.9 (1 decimal) → @
+        entry = (
+            '2024-01-15 * "FX" "Exchange"\n'
+            "  Assets:WeChat:Current  3000 GBP\n"
+            "  Assets:Cash  -26700 CNY"
+        )
+        result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
+        self.assertIn("@ 8.9 CNY", result)
+        self.assertNotIn("@@", result)
 
     def test_three_posting_balance_check(self):
         # Valid 3-posting split bill
