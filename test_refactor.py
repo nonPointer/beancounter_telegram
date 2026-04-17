@@ -379,19 +379,19 @@ class TestEnsureDatetimeMetadata(unittest.TestCase):
 
     def test_inserts_after_header(self):
         entry = '2024-01-15 * "A" "B"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD'
-        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15 12:00:00")
+        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15T12:00:00+00:00")
         lines = result.splitlines()
         self.assertEqual(lines[0], '2024-01-15 * "A" "B"')
-        self.assertIn('datetime: "2024-01-15 12:00:00"', lines[1])
+        self.assertIn('datetime: "2024-01-15T12:00:00+00:00"', lines[1])
 
     def test_idempotent_if_already_present(self):
         entry = (
             '2024-01-15 * "A" "B"\n'
-            '  datetime: "2024-01-15 12:00:00"\n'
+            '  datetime: "2024-01-15T12:00:00+00:00"\n'
             "  Expenses:Food  10 USD\n"
             "  Assets:Cash  -10 USD"
         )
-        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15 12:00:00")
+        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15T12:00:00+00:00")
         self.assertEqual(result.count('datetime:'), 1)
 
     def test_works_with_leading_comment(self):
@@ -401,13 +401,13 @@ class TestEnsureDatetimeMetadata(unittest.TestCase):
             "  Expenses:Food  10 USD\n"
             "  Assets:Cash  -10 USD"
         )
-        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15 09:30:00")
+        result = self.bot.ensure_datetime_metadata(entry, "2024-01-15T09:30:00+00:00")
         lines = result.splitlines()
         header_idx = next(i for i, l in enumerate(lines) if l.startswith("2024-01-15 *"))
         self.assertIn('datetime:', lines[header_idx + 1])
 
     def test_empty_string_returned_unchanged(self):
-        self.assertEqual(self.bot.ensure_datetime_metadata("", "2024-01-15 00:00:00"), "")
+        self.assertEqual(self.bot.ensure_datetime_metadata("", "2024-01-15T00:00:00+00:00"), "")
 
 
 class TestInsertPromptMetadata(unittest.TestCase):
@@ -528,7 +528,7 @@ class TestExtractAccountsFromEntry(unittest.TestCase):
     def test_metadata_lines_not_included(self):
         entry = (
             '2024-01-15 * "Shop" "Lunch"\n'
-            '  datetime: "2024-01-15 12:00:00"\n'
+            '  datetime: "2024-01-15T12:00:00+00:00"\n'
             "  Expenses:Food  20 USD\n"
             "  Assets:Cash  -20 USD"
         )

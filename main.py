@@ -1270,7 +1270,7 @@ class Bot:
             return
 
         appendix = pending["appendix"]
-        approve_datetime_str = datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')
+        approve_datetime_str = datetime.now(self.timezone).isoformat(timespec='seconds')
         appendix = self.ensure_datetime_metadata(appendix, approve_datetime_str)
         commit_message = pending["commit_message"]
         ok = self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip())
@@ -1350,7 +1350,7 @@ class Bot:
 
         dt = datetime.now(self.timezone)
         time_str = dt.strftime('%H:%M')
-        datetime_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+        datetime_str = dt.isoformat(timespec='seconds')
 
         # Detect beancount directive commands from raw text BEFORE natural
         # language date parsing.  parsedatetime can false-positive on numbers

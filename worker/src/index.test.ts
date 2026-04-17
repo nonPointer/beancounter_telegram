@@ -244,30 +244,30 @@ describe('buildCommitMessage', () => {
 describe('ensureDatetimeMetadata', () => {
 	it('inserts datetime after the transaction header', () => {
 		const entry = '2024-01-15 * "A" "B"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD';
-		const result = ensureDatetimeMetadata(entry, '2024-01-15 12:00:00');
+		const result = ensureDatetimeMetadata(entry, '2024-01-15T12:00:00+00:00');
 		const lines = result.split('\n');
 		expect(lines[0]).toBe('2024-01-15 * "A" "B"');
-		expect(lines[1]).toContain('datetime: "2024-01-15 12:00:00"');
+		expect(lines[1]).toContain('datetime: "2024-01-15T12:00:00+00:00"');
 	});
 
 	it('is idempotent when datetime already present', () => {
 		const entry =
-			'2024-01-15 * "A" "B"\n  datetime: "2024-01-15 12:00:00"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD';
-		const result = ensureDatetimeMetadata(entry, '2024-01-15 12:00:00');
+			'2024-01-15 * "A" "B"\n  datetime: "2024-01-15T12:00:00+00:00"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD';
+		const result = ensureDatetimeMetadata(entry, '2024-01-15T12:00:00+00:00');
 		expect(result.split('datetime:').length).toBe(2); // only one occurrence
 	});
 
 	it('works with a leading comment line before the header', () => {
 		const entry =
 			'; original input\n2024-01-15 * "A" "B"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD';
-		const result = ensureDatetimeMetadata(entry, '2024-01-15 09:00:00');
+		const result = ensureDatetimeMetadata(entry, '2024-01-15T09:00:00+00:00');
 		const lines = result.split('\n');
 		const headerIdx = lines.findIndex((l) => l.startsWith('2024-01-15 *'));
 		expect(lines[headerIdx + 1]).toContain('datetime:');
 	});
 
 	it('returns empty string unchanged', () => {
-		expect(ensureDatetimeMetadata('', '2024-01-15 00:00:00')).toBe('');
+		expect(ensureDatetimeMetadata('', '2024-01-15T00:00:00+00:00')).toBe('');
 	});
 });
 
