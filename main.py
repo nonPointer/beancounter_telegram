@@ -849,17 +849,17 @@ class Bot:
 
         raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
 
-    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_time: str = "") -> str:
+    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, INVEST_ORDER_SYSTEM_PROMPT,
-            build_invest_order_prompt(txn_date, self._accounts_for_prompt(), caption, current_time),
+            build_invest_order_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
             temperature=0.1, log_label="vision",
         )
 
-    def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_time: str = "") -> str:
+    def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, EXPENSE_SCREENSHOT_SYSTEM_PROMPT,
-            build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_time),
+            build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
             temperature=0.2, log_label="vision-expense",
         )
 
@@ -888,6 +888,7 @@ class Bot:
         dt = datetime.now(self.timezone)
         date_str = dt.strftime('%Y-%m-%d')
         time_str = dt.strftime('%H:%M')
+        datetime_str = dt.isoformat(timespec='seconds')
 
         # Use highest-resolution photo
         file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
@@ -905,12 +906,12 @@ class Bot:
         try:
             if is_invest:
                 log(f"Processing investment order screenshot (caption: {caption!r})")
-                appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, caption, time_str)
+                appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, caption, datetime_str)
                 draft_label, user_input = "Investment order draft", caption or "(investment order screenshot)"
                 commit_prefix = 'Add investment entry by Telegram Bot\n\n'
             else:
                 log(f"Processing expense screenshot (caption: {caption!r})")
-                appendix = self.call_openai_vision_expense(image_bytes, accounts, date_str, caption, time_str)
+                appendix = self.call_openai_vision_expense(image_bytes, accounts, date_str, caption, datetime_str)
                 draft_label, user_input = "Expense screenshot draft", caption or "(expense screenshot)"
                 commit_prefix = 'Add entry by Telegram Bot\n\n'
 
