@@ -447,16 +447,22 @@ const EXPENSE_SCREENSHOT_SYSTEM_PROMPT =
 	'将支付来源映射到账户列表中最匹配的 Liabilities（信用卡）或 Assets（借记卡/银行）账户。\n' +
 	'选择最匹配商家类型的 Expenses 账户。\n\n' +
 	'narration：如果用户附带了 caption 消息，用 caption 作为 narration；' +
-	'否则从商家名称推断简洁 narration（1-3 词，中文优先）。\n' +
-	'日期：默认使用提供的日期，除非截图中明确显示不同日期。\n' +
+	'否则从商家名称推断简洁 narration（1-3 词，中文优先）。\n\n' +
+	'【时间】\n' +
+	'- 日期：默认使用提供的日期，除非截图中明确显示不同日期。\n' +
+	'- 如果截图是 iOS 通知且显示相对时间（如 "5m ago"、"2h ago"），' +
+	'基于 prompt 中提供的 current datetime 推算实际交易时间，' +
+	'并在分录头部之后插入 datetime 元数据（ISO 8601 格式）：\n' +
+	'    datetime: "YYYY-MM-DDTHH:MM:SS±HH:MM"\n' +
+	'- 无法识别相对时间时不要输出 datetime 元数据。\n\n' +
 	'仅输出 beancount 文本，不要 markdown、不要解释。\n\n' +
 	"示例（Chase 信用卡通知，Sainsbury's 消费，caption: '买菜'）：\n" +
 	'2026-04-06 * "Sainsbury\'s" "买菜"\n' +
 	'  Expenses:Food                    5.50 GBP\n' +
 	'  Liabilities:CreditCard:Chase    -5.50 GBP\n';
 
-function buildExpenseScreenshotPrompt(txnDate: string, accountsWithCurrencies: string[], caption?: string, currentTime?: string): string {
-	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
+function buildExpenseScreenshotPrompt(txnDate: string, accountsWithCurrencies: string[], caption?: string, currentDatetime?: string): string {
+	const timeInfo = currentDatetime ? ` (current datetime: ${currentDatetime})` : '';
 	let prompt =
 		`Transaction date is ${txnDate}. Use this exact date in the output.${timeInfo}\n` +
 		'Account list:\n' +
@@ -466,8 +472,8 @@ function buildExpenseScreenshotPrompt(txnDate: string, accountsWithCurrencies: s
 	return prompt;
 }
 
-function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[], caption?: string, currentTime?: string): string {
-	const timeInfo = currentTime ? ` (current time: ${currentTime})` : '';
+function buildInvestOrderPrompt(txnDate: string, accountsWithCurrencies: string[], caption?: string, currentDatetime?: string): string {
+	const timeInfo = currentDatetime ? ` (current datetime: ${currentDatetime})` : '';
 	let prompt =
 		`Reference date (today): ${txnDate}${timeInfo}.\n` +
 		'Account list:\n' +
@@ -1129,7 +1135,7 @@ async function handlePhotoMessage(
 		getTimezoneForChat(env, chatId),
 		parseAccountsWithCurrencies(env),
 	]);
-	const { dateStr, timeStr } = formatInTimezone(tz);
+	const { dateStr, timeStr, datetimeStr } = formatInTimezone(tz);
 
 	if (accounts.length === 0) {
 		await reply('No accounts available. Please check GitHub account parsing first.');
@@ -1155,12 +1161,12 @@ async function handlePhotoMessage(
 
 	try {
 		if (isInvest) {
-			const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, caption, comments, timeStr);
+			const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, caption, comments, datetimeStr);
 			const entryWithComment = caption ? insertPromptMetadata(entry, caption) : entry;
 			const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
 			await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
 		} else {
-			const entry = await callLLMVisionExpense(env, imageBuffer, accounts, currencies, dateStr, caption, comments, timeStr);
+			const entry = await callLLMVisionExpense(env, imageBuffer, accounts, currencies, dateStr, caption, comments, datetimeStr);
 			const entryWithComment = caption ? insertPromptMetadata(entry, caption) : entry;
 			const cm = buildCommitMessage('Add expense entry by Telegram Bot\n\n', entryWithComment);
 			await sendDraftForReview(env, chatId, 'Expense draft', entryWithComment, caption || '(expense screenshot)', cm, dateStr);

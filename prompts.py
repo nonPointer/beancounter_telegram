@@ -109,8 +109,14 @@ EXPENSE_SCREENSHOT_SYSTEM_PROMPT = (
     "将支付来源映射到账户列表中最匹配的 Liabilities（信用卡）或 Assets（借记卡/银行）账户。\n"
     "选择最匹配商家类型的 Expenses 账户。\n\n"
     "narration：如果用户附带了 caption 消息，用 caption 作为 narration；"
-    "否则从商家名称推断简洁 narration（1-3 词，中文优先）。\n"
-    "日期：默认使用提供的日期，除非截图中明确显示不同日期。\n"
+    "否则从商家名称推断简洁 narration（1-3 词，中文优先）。\n\n"
+    "【时间】\n"
+    "- 日期：默认使用提供的日期，除非截图中明确显示不同日期。\n"
+    "- 如果截图是 iOS 通知且显示相对时间（如 \"5m ago\"、\"2h ago\"），"
+    "基于 prompt 中提供的 current datetime 推算实际交易时间，"
+    "并在分录头部之后插入 datetime 元数据（ISO 8601 格式）：\n"
+    "    datetime: \"YYYY-MM-DDTHH:MM:SS±HH:MM\"\n"
+    "- 无法识别相对时间时不要输出 datetime 元数据。\n\n"
     "仅输出 beancount 文本，不要 markdown、不要解释。\n\n"
     "示例（Chase 信用卡通知，Sainsbury's 消费，caption: '买菜'）：\n"
     "2026-04-06 * \"Sainsbury's\" \"买菜\"\n"
@@ -120,9 +126,9 @@ EXPENSE_SCREENSHOT_SYSTEM_PROMPT = (
 
 
 def build_expense_screenshot_prompt(
-    txn_date: str, accounts: list[str], caption: str = "", current_time: str = ""
+    txn_date: str, accounts: list[str], caption: str = "", current_datetime: str = ""
 ) -> str:
-    time_info = f" (current time: {current_time})" if current_time else ""
+    time_info = f" (current datetime: {current_datetime})" if current_datetime else ""
     prompt = (
         f"Transaction date is {txn_date}. Use this exact date in the output.{time_info}\n"
         "Account list:\n"
@@ -135,8 +141,8 @@ def build_expense_screenshot_prompt(
     return prompt
 
 
-def build_invest_order_prompt(txn_date: str, accounts: list[str], caption: str = "", current_time: str = "") -> str:
-    time_info = f" (current time: {current_time})" if current_time else ""
+def build_invest_order_prompt(txn_date: str, accounts: list[str], caption: str = "", current_datetime: str = "") -> str:
+    time_info = f" (current datetime: {current_datetime})" if current_datetime else ""
     prompt = (
         f"Reference date (today): {txn_date}{time_info}.\n"
         "Account list:\n"

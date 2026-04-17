@@ -793,23 +793,23 @@ class TestBuildUserPromptCurrentTime(unittest.TestCase):
 
 
 class TestBuildInvestOrderPromptCurrentTime(unittest.TestCase):
-    """Tests for current_time parameter in build_invest_order_prompt."""
+    """Tests for current_datetime parameter in build_invest_order_prompt."""
 
-    def test_without_current_time(self):
+    def test_without_current_datetime(self):
         from prompts import build_invest_order_prompt
         result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"])
-        self.assertNotIn("current time", result)
+        self.assertNotIn("current datetime", result)
         self.assertIn("Reference date (today): 2026-03-13.", result)
 
-    def test_with_empty_current_time(self):
+    def test_with_empty_current_datetime(self):
         from prompts import build_invest_order_prompt
-        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_time="")
-        self.assertNotIn("current time", result)
+        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_datetime="")
+        self.assertNotIn("current datetime", result)
 
-    def test_with_current_time(self):
+    def test_with_current_datetime(self):
         from prompts import build_invest_order_prompt
-        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_time="09:30")
-        self.assertIn("(current time: 09:30)", result)
+        result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_datetime="2026-03-13T09:30:00+08:00")
+        self.assertIn("(current datetime: 2026-03-13T09:30:00+08:00)", result)
         self.assertIn("Reference date (today): 2026-03-13", result)
 
 
