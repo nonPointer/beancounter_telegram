@@ -609,15 +609,23 @@ class Bot:
                     if abs0 == 0 and abs1 == 0:
                         raise ValueError("LLM output invalid: zero amounts in cross-currency postings.")
 
-                    # Put cost mark on the side that yields the larger numerical FX rate.
+                    # Annotation always goes on the more-valuable-currency posting (smaller absolute
+                    # amount), expressing how much of the cheaper currency 1 unit of the dearer one
+                    # buys.  Use @ (unit price) when rate has ≤2 decimal places, otherwise @@ (total).
+                    def _fx_annotation(rate_str: str, total_str: str, currency: str) -> str:
+                        decimals = len(rate_str.split('.')[1]) if '.' in rate_str else 0
+                        if decimals <= 2:
+                            return f" @ {rate_str} {currency}"
+                        return f" @@ {total_str} {currency}"
+
                     if abs0 <= abs1 and abs0 != 0:
                         rate = abs1 / abs0
                         rate_str = f"{rate:.8f}".rstrip('0').rstrip('.')
-                        postings[0]["rest"] = (postings[0]["rest"] + f" @ {rate_str} {c1}").strip()
+                        postings[0]["rest"] = (postings[0]["rest"] + _fx_annotation(rate_str, postings[1]["amount"].lstrip('-'), c1)).strip()
                     elif abs1 != 0:
                         rate = abs0 / abs1
                         rate_str = f"{rate:.8f}".rstrip('0').rstrip('.')
-                        postings[1]["rest"] = (postings[1]["rest"] + f" @ {rate_str} {c0}").strip()
+                        postings[1]["rest"] = (postings[1]["rest"] + _fx_annotation(rate_str, postings[0]["amount"].lstrip('-'), c0)).strip()
                     else:
                         # abs0 > 0, abs1 == 0: degenerate cross-currency posting; cannot infer FX rate.
                         raise ValueError(

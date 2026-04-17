@@ -687,12 +687,22 @@ export function normalizeAndValidateLLMEntry(entryText: string, accounts: string
 					throw new Error('LLM output invalid: zero amounts in cross-currency postings.');
 				}
 
+				// Annotation always goes on the more-valuable-currency posting (smaller absolute amount),
+			// expressing how much of the cheaper currency 1 unit of the dearer one buys.
+			// Use @ (unit price) when rate has ≤2 decimal places, otherwise @@ (total cost).
+				const fxAnnotation = (rateStr: string, total: string, currency: string) => {
+					const decimals = rateStr.includes('.') ? rateStr.split('.')[1].length : 0;
+					return decimals <= 2 ? ` @ ${rateStr} ${currency}` : ` @@ ${total} ${currency}`;
+				};
+
 				if (abs0 <= abs1 && abs0 !== 0) {
 					const rate = abs1 / abs0;
-					postings[0].rest = (postings[0].rest + ` @ ${rate.toFixed(8).replace(/\.?0+$/, '')} ${c1}`).trim();
+					const rateStr = rate.toFixed(8).replace(/\.?0+$/, '');
+					postings[0].rest = (postings[0].rest + fxAnnotation(rateStr, postings[1].amount.replace(/^-/, ''), c1)).trim();
 				} else if (abs1 !== 0) {
 					const rate = abs0 / abs1;
-					postings[1].rest = (postings[1].rest + ` @ ${rate.toFixed(8).replace(/\.?0+$/, '')} ${c0}`).trim();
+					const rateStr = rate.toFixed(8).replace(/\.?0+$/, '');
+					postings[1].rest = (postings[1].rest + fxAnnotation(rateStr, postings[0].amount.replace(/^-/, ''), c0)).trim();
 				} else {
 					throw new Error('LLM output invalid: one cross-currency posting has zero amount; cannot infer FX rate.');
 				}
