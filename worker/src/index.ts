@@ -636,7 +636,7 @@ export function normalizeAndValidateLLMEntry(entryText: string, accounts: string
 	const postings: Array<{ account: string; amount: string; currency: string; rest: string }> = [];
 	const postingRe = /^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s+(\S+)(?:\s+(.*))?$/;
 	// Beancount metadata: key-value (e.g. "  key: value") or inline comments ("; ...")
-	const metadataRe = /^\s*(\w[\w-]*\s*:.*|;.*)$/;
+	const metadataRe = /^\s*([a-z][a-zA-Z0-9_-]*\s*:.*|;.*)$/;
 	// Strip parenthesized currency/alias annotations that LLMs sometimes copy
 	const parenAnnotationRe = /\s+\([^)]*\)(?=\s)/g;
 
@@ -859,7 +859,7 @@ export function insertPromptMetadata(entryText: string, userInput: string): stri
 	const lines = entryText.split('\n');
 	if (lines.some(line => /^\s*prompt\s*:/.test(line))) return entryText;
 
-	const escaped = normalized.replace(/"/g, '\\"');
+	const escaped = normalized.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 	const metadataLine = `  prompt: "${escaped}"`;
 
 	const headerIdx = lines.findIndex(line =>

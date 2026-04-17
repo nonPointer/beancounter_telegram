@@ -303,6 +303,11 @@ describe('insertPromptMetadata', () => {
 		const result = insertPromptMetadata(entry, 'say "hi"');
 		expect(result).toContain('  prompt: "say \\"hi\\""');
 	});
+
+	it('escapes backslashes in user input', () => {
+		const result = insertPromptMetadata(entry, 'path\\to\\file');
+		expect(result).toContain('  prompt: "path\\\\to\\\\file"');
+	});
 });
 
 // --- render helpers ---

@@ -442,6 +442,11 @@ class TestInsertPromptMetadata(unittest.TestCase):
         result = self.bot.insert_prompt_metadata(entry, 'say "hi"')
         self.assertIn('  prompt: "say \\"hi\\""', result)
 
+    def test_escapes_backslashes_in_input(self):
+        entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
+        result = self.bot.insert_prompt_metadata(entry, 'path\\to\\file')
+        self.assertIn('  prompt: "path\\\\to\\\\file"', result)
+
 
 class TestMatchAccount(unittest.TestCase):
     def setUp(self):

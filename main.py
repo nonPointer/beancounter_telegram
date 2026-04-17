@@ -552,7 +552,8 @@ class Bot:
 
         posting_re = re.compile(r'^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s+(\S+)(?:\s+(.*))?$')
         # Beancount metadata: key-value (e.g. "  key: value") or inline comments ("; ...")
-        metadata_re = re.compile(r'^\s*(\w[\w-]*\s*:.*|;.*)$')
+        # Keys must start with [a-z] per beancount spec.
+        metadata_re = re.compile(r'^\s*([a-z][a-zA-Z0-9_-]*\s*:.*|;.*)$')
 
         # Strip parenthesized currency/alias annotations that LLMs sometimes copy
         # from the account list (e.g. "Assets:Bank:CMB (CNY)" → "Assets:Bank:CMB")
@@ -701,7 +702,7 @@ class Bot:
         if any(re.match(r'^\s*prompt\s*:', line) for line in lines):
             return entry_text
 
-        escaped = normalized.replace('"', '\\"')
+        escaped = normalized.replace('\\', '\\\\').replace('"', '\\"')
         metadata_line = f'  prompt: "{escaped}"'
 
         header_idx = None
