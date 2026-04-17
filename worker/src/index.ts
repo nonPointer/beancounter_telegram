@@ -92,11 +92,13 @@ function formatInTimezone(tz: string): { dateStr: string; datetimeStr: string; t
 		minute: '2-digit',
 		second: '2-digit',
 		hour12: false,
+		timeZoneName: 'longOffset',
 	}).formatToParts(now);
 
 	const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
 	const dateStr = `${get('year')}-${get('month')}-${get('day')}`;
-	const datetimeStr = `${dateStr} ${get('hour')}:${get('minute')}:${get('second')}`;
+	const tzOffset = get('timeZoneName').replace('GMT', '') || '+00:00';
+	const datetimeStr = `${dateStr}T${get('hour')}:${get('minute')}:${get('second')}${tzOffset}`;
 	const timeStr = `${get('hour')}:${get('minute')}`;
 	return { dateStr, datetimeStr, timeStr };
 }
