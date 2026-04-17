@@ -834,19 +834,24 @@ export function ensureDatetimeMetadata(entryText: string, datetimeStr: string): 
 	].join('\n');
 }
 
-export function prependNaturalLanguageComment(entryText: string, userInput: string): string {
-	const normalized = (userInput || '')
-		.trim()
-		.split('\n')
-		.join(' ')
-		.trim();
+export function insertPromptMetadata(entryText: string, userInput: string): string {
+	const normalized = (userInput || '').trim().split('\n').join(' ').trim();
 	if (!normalized) return entryText;
 
-	const commentLine = `; ${normalized}`;
-	const firstLine = entryText.trim().split('\n')[0].trim();
-	if (firstLine === commentLine) return entryText;
+	const lines = entryText.split('\n');
+	if (lines.some(line => /^\s*prompt\s*:/.test(line))) return entryText;
 
-	return `${commentLine}\n${entryText}`;
+	const escaped = normalized.replace(/"/g, '\\"');
+	const metadataLine = `  prompt: "${escaped}"`;
+
+	const headerIdx = lines.findIndex(line =>
+		/^\d{4}-\d{2}-\d{2}\s+[*!]\s+/.test(line.trim()) ||
+		/^\d{4}-\d{2}-\d{2}\s+txn\s+/.test(line.trim())
+	);
+
+	if (headerIdx === -1) return entryText;
+
+	return [...lines.slice(0, headerIdx + 1), metadataLine, ...lines.slice(headerIdx + 1)].join('\n');
 }
 
 // --- Templates ---
@@ -982,7 +987,7 @@ async function runRecheckWithReason(
 
 	try {
 		const newEntry = await callLLMText(env, pending.userInput, accounts, currencies, pending.dateStr, pending.entryText, declineReason, comments, currentTime);
-		const entryWithComment = prependNaturalLanguageComment(newEntry, pending.userInput);
+		const entryWithComment = insertPromptMetadata(newEntry, pending.userInput);
 		const newCommitMessage = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
 
 		await deletePendingEntry(env, pendingId);
@@ -1139,12 +1144,12 @@ async function handlePhotoMessage(
 	try {
 		if (isInvest) {
 			const entry = await callLLMVision(env, imageBuffer, accounts, currencies, dateStr, caption, comments, timeStr);
-			const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
+			const entryWithComment = caption ? insertPromptMetadata(entry, caption) : entry;
 			const cm = buildCommitMessage('Add investment entry by Telegram Bot\n\n', entryWithComment);
 			await sendDraftForReview(env, chatId, 'Investment order draft', entryWithComment, caption || '(investment order screenshot)', cm, dateStr);
 		} else {
 			const entry = await callLLMVisionExpense(env, imageBuffer, accounts, currencies, dateStr, caption, comments, timeStr);
-			const entryWithComment = caption ? prependNaturalLanguageComment(entry, caption) : entry;
+			const entryWithComment = caption ? insertPromptMetadata(entry, caption) : entry;
 			const cm = buildCommitMessage('Add expense entry by Telegram Bot\n\n', entryWithComment);
 			await sendDraftForReview(env, chatId, 'Expense draft', entryWithComment, caption || '(expense screenshot)', cm, dateStr);
 		}
@@ -1404,7 +1409,7 @@ async function handleMessage(
 		if (!appendix) {
 			try {
 				const entry = await callLLMText(env, text, accounts, currencies, dateStr, undefined, undefined, comments, customDate ? undefined : timeStr);
-				const entryWithComment = prependNaturalLanguageComment(entry, text);
+				const entryWithComment = insertPromptMetadata(entry, text);
 				const cm = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
 				await sendDraftForReview(env, chatId, 'LLM draft (checked padding)', entryWithComment, text, cm, dateStr);
 				return;

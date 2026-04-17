@@ -6,6 +6,30 @@ import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+# Stub beancount (requires C extension that may not be compiled locally).
+import re as _re
+import types as _types
+
+def _fake_parse_string(text):
+    """Minimal beancount parser stub: recognises valid txn headers and ** as syntax error."""
+    class _Err:
+        def __init__(self, msg): self.message = msg
+    if _re.search(r'^\d{4}-\d{2}-\d{2}\s+\*\*', text, _re.MULTILINE):
+        return ([], [_Err('unexpected token **')], {})
+    if _re.search(r'^\d{4}-\d{2}-\d{2}\s+[*!]\s+', text, _re.MULTILINE):
+        return ([object()], [], {})
+    return ([], [], {})
+
+_bc = _types.ModuleType('beancount')
+_bc_parser = _types.ModuleType('beancount.parser')
+_bc_parser_parser = _types.ModuleType('beancount.parser.parser')
+_bc_parser_parser.parse_string = _fake_parse_string
+_bc_parser.parser = _bc_parser_parser
+_bc.parser = _bc_parser
+sys.modules.setdefault('beancount', _bc)
+sys.modules.setdefault('beancount.parser', _bc_parser)
+sys.modules.setdefault('beancount.parser.parser', _bc_parser_parser)
+
 # Stub config.json so main.py can be imported without the real file.
 FAKE_CONFIG = {
     "GITHUB_TOKEN": "tok",
@@ -374,30 +398,37 @@ class TestEnsureDatetimeMetadata(unittest.TestCase):
         self.assertEqual(self.bot.ensure_datetime_metadata("", "2024-01-15 00:00:00"), "")
 
 
-class TestPrependNaturalLanguageComment(unittest.TestCase):
+class TestInsertPromptMetadata(unittest.TestCase):
     def setUp(self):
         with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
             self.bot = main.Bot()
 
-    def test_prepends_comment(self):
+    def test_inserts_metadata_after_header(self):
         entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
-        result = self.bot.prepend_natural_language_comment(entry, "lunch at KFC")
-        self.assertTrue(result.startswith("; lunch at KFC\n"))
+        result = self.bot.insert_prompt_metadata(entry, "lunch at KFC")
+        lines = result.splitlines()
+        self.assertEqual(lines[0], '2024-01-15 * "A" "B"')
+        self.assertEqual(lines[1], '  prompt: "lunch at KFC"')
 
     def test_empty_user_input_unchanged(self):
         entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
-        self.assertEqual(self.bot.prepend_natural_language_comment(entry, ""), entry)
-        self.assertEqual(self.bot.prepend_natural_language_comment(entry, "   "), entry)
+        self.assertEqual(self.bot.insert_prompt_metadata(entry, ""), entry)
+        self.assertEqual(self.bot.insert_prompt_metadata(entry, "   "), entry)
 
     def test_idempotent_if_already_present(self):
-        entry = "; lunch at KFC\n2024-01-15 * \"A\" \"B\"\n  X  10 USD\n  Y  -10 USD"
-        result = self.bot.prepend_natural_language_comment(entry, "lunch at KFC")
-        self.assertEqual(result.count("; lunch at KFC"), 1)
+        entry = '2024-01-15 * "A" "B"\n  prompt: "lunch at KFC"\n  X  10 USD\n  Y  -10 USD'
+        result = self.bot.insert_prompt_metadata(entry, "lunch at KFC")
+        self.assertEqual(result.count('prompt:'), 1)
 
     def test_multiline_input_flattened(self):
         entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
-        result = self.bot.prepend_natural_language_comment(entry, "lunch\nat KFC")
-        self.assertTrue(result.startswith("; lunch at KFC\n"))
+        result = self.bot.insert_prompt_metadata(entry, "lunch\nat KFC")
+        self.assertIn('  prompt: "lunch at KFC"', result)
+
+    def test_escapes_quotes_in_input(self):
+        entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
+        result = self.bot.insert_prompt_metadata(entry, 'say "hi"')
+        self.assertIn('  prompt: "say \\"hi\\""', result)
 
 
 class TestMatchAccount(unittest.TestCase):

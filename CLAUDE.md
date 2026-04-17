@@ -93,6 +93,20 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 - `normalize_and_validate_llm_entry()` — validates header is a beancount directive, strips parenthesized annotations like `(GBP)` that LLMs copy from account lists, filters metadata lines with strict regex (only `key: value` and `;` comments), rejects natural language; also handles balance validation, cross-currency FX annotation, and `:Current` suffix resolution
 - Key regex constraint: all `re.MULTILINE` patterns use `[ \t]*` (not `\s*`) to avoid crossing line boundaries
 
+### User input recording
+After LLM generation, `insert_prompt_metadata()` (Python) / `insertPromptMetadata()` (worker) inserts the original user text as a `prompt` metadata field directly after the transaction header line:
+```beancount
+2026-04-17 * "星巴克" "咖啡"
+  prompt: "今天买了一杯咖啡 35 元"
+  datetime: "14:30"
+  Expenses:Food:Coffee  35 CNY
+  Assets:WeChat:Current
+```
+- Text messages: always inserted; photo messages: inserted only when caption is present
+- Double quotes in the prompt value are escaped as `\"`
+- Idempotent: skips insertion if `prompt:` key already exists
+- Falls back to no-op if no transaction header line is found (e.g. balance directives)
+
 ### Account list prompt format
 Accounts are sent to the LLM with annotations: `Assets:Bank:CMB (CNY) ; 招商��行`. The `(currency)` and `; alias` parts are for LLM context only — the sanitizer strips them if the LLM copies them into postings. Both Python (`_accounts_for_prompt`) and worker (`accountsForPrompt`) must produce the same format.
 

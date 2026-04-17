@@ -11,7 +11,7 @@ import {
 	matchAccount,
 	normalizeAndValidateLLMEntry,
 	preferCurrentAccount,
-	prependNaturalLanguageComment,
+	insertPromptMetadata,
 	renderBalance,
 	renderClose,
 	renderOpen,
@@ -271,30 +271,37 @@ describe('ensureDatetimeMetadata', () => {
 	});
 });
 
-// --- prependNaturalLanguageComment ---
+// --- insertPromptMetadata ---
 
-describe('prependNaturalLanguageComment', () => {
+describe('insertPromptMetadata', () => {
 	const entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD';
 
-	it('prepends a comment line', () => {
-		const result = prependNaturalLanguageComment(entry, 'lunch at KFC');
-		expect(result.startsWith('; lunch at KFC\n')).toBe(true);
+	it('inserts prompt metadata after the header line', () => {
+		const result = insertPromptMetadata(entry, 'lunch at KFC');
+		const lines = result.split('\n');
+		expect(lines[0]).toBe('2024-01-15 * "A" "B"');
+		expect(lines[1]).toBe('  prompt: "lunch at KFC"');
 	});
 
 	it('is idempotent', () => {
-		const withComment = `; lunch at KFC\n${entry}`;
-		const result = prependNaturalLanguageComment(withComment, 'lunch at KFC');
-		expect(result.split('; lunch at KFC').length).toBe(2);
+		const withMeta = '2024-01-15 * "A" "B"\n  prompt: "lunch at KFC"\n  X  10 USD\n  Y  -10 USD';
+		const result = insertPromptMetadata(withMeta, 'lunch at KFC');
+		expect(result.split('prompt:').length).toBe(2);
 	});
 
 	it('returns entry unchanged on empty input', () => {
-		expect(prependNaturalLanguageComment(entry, '')).toBe(entry);
-		expect(prependNaturalLanguageComment(entry, '   ')).toBe(entry);
+		expect(insertPromptMetadata(entry, '')).toBe(entry);
+		expect(insertPromptMetadata(entry, '   ')).toBe(entry);
 	});
 
 	it('flattens multi-line user input', () => {
-		const result = prependNaturalLanguageComment(entry, 'lunch\nat KFC');
-		expect(result.startsWith('; lunch at KFC\n')).toBe(true);
+		const result = insertPromptMetadata(entry, 'lunch\nat KFC');
+		expect(result).toContain('  prompt: "lunch at KFC"');
+	});
+
+	it('escapes double quotes in user input', () => {
+		const result = insertPromptMetadata(entry, 'say "hi"');
+		expect(result).toContain('  prompt: "say \\"hi\\""');
 	});
 });
 

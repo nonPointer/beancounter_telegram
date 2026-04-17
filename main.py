@@ -684,18 +684,28 @@ class Bot:
 
         return "\n".join(lines[: header_idx + 1] + [f'  datetime: "{datetime_str}"'] + lines[header_idx + 1 :])
 
-    def prepend_natural_language_comment(self, entry_text: str, user_input: str) -> str:
-        # Keep original natural-language input as a beancount comment above the generated journal.
+    def insert_prompt_metadata(self, entry_text: str, user_input: str) -> str:
         normalized = " ".join((user_input or "").strip().splitlines()).strip()
         if not normalized:
             return entry_text
 
-        comment_line = f"; {normalized}"
-        stripped_lines = [line.strip() for line in entry_text.splitlines() if line.strip()]
-        if stripped_lines and stripped_lines[0] == comment_line:
+        lines = entry_text.splitlines()
+        if any(re.match(r'^\s*prompt\s*:', line) for line in lines):
             return entry_text
 
-        return f"{comment_line}\n{entry_text}"
+        escaped = normalized.replace('"', '\\"')
+        metadata_line = f'  prompt: "{escaped}"'
+
+        header_idx = None
+        for idx, line in enumerate(lines):
+            if re.match(r'^\d{4}-\d{2}-\d{2}\s+[*!]\s+', line.strip()) or re.match(r'^\d{4}-\d{2}-\d{2}\s+txn\s+', line.strip()):
+                header_idx = idx
+                break
+
+        if header_idx is None:
+            return entry_text
+
+        return "\n".join(lines[:header_idx + 1] + [metadata_line] + lines[header_idx + 1:])
 
     def _call_llm_backends(self, payload: dict, log_prefix: str = "", vision: bool = False) -> str:
         last_error: Exception | None = None
@@ -897,7 +907,7 @@ class Bot:
                 commit_prefix = 'Add entry by Telegram Bot\n\n'
 
             if caption:
-                appendix = self.prepend_natural_language_comment(appendix, caption)
+                appendix = self.insert_prompt_metadata(appendix, caption)
             commit_message = self.add_non_pnl_accounts_to_commit_message(commit_prefix, appendix)
 
             pending_id = self.next_pending_id()
@@ -1125,7 +1135,7 @@ class Bot:
                 decline_reason=decline_reason,
                 current_time=datetime.now(self.timezone).strftime('%H:%M'),
             )
-            new_appendix = self.prepend_natural_language_comment(new_appendix, pending["user_input"])
+            new_appendix = self.insert_prompt_metadata(new_appendix, pending["user_input"])
             new_commit_message = self.add_non_pnl_accounts_to_commit_message(
                 'Add entry by Telegram Bot\n\n', new_appendix
             )
@@ -1531,7 +1541,7 @@ class Bot:
                 return
             try:
                 appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str)
-                appendix = self.prepend_natural_language_comment(appendix, text)
+                appendix = self.insert_prompt_metadata(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
                 pending_id = self.next_pending_id()
