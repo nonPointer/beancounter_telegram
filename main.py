@@ -669,8 +669,23 @@ class Bot:
         for line in entry_text.splitlines():
             m = posting_line_re.match(line)
             if m:
-                accounts.append(m.group(1))
+                token = m.group(1)
+                # Skip metadata lines (key: value) — only real posting lines start with an account name.
+                if re.match(r'^[A-Z][A-Za-z0-9]*(?::[A-Z][A-Za-z0-9\-]*)+$', token):
+                    accounts.append(token)
         return accounts
+
+    def validate_accounts_exist(self, entry_text: str, accounts: list[str]) -> str | None:
+        """Check every posting account in entry_text exists in the known accounts list."""
+        known = set(accounts)
+        used = self.extract_accounts_from_entry(entry_text)
+        missing = [a for a in used if a not in known]
+        if missing:
+            # De-duplicate preserving order.
+            seen = set()
+            unique_missing = [a for a in missing if not (a in seen or seen.add(a))]
+            return f"Unknown account(s): {', '.join(unique_missing)}"
+        return None
 
     def ensure_datetime_metadata(self, entry_text: str, datetime_str: str) -> str:
         lines = entry_text.splitlines()
@@ -747,7 +762,7 @@ class Bot:
             raise ValueError(self.llm_unavailable_message())
 
         accounts_for_prompt = self._accounts_for_prompt()
-        syntax_error = None
+        validation_error = None
         entry = None
 
         for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
@@ -756,7 +771,7 @@ class Bot:
                 prompt_reason = decline_reason
             else:
                 prompt_draft = entry
-                prompt_reason = f"Beancount syntax error: {syntax_error}"
+                prompt_reason = f"Previous draft validation error: {validation_error}"
 
             user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time)
             payload = {
@@ -778,13 +793,13 @@ class Bot:
             except Exception as e:
                 raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
 
-            syntax_error = self.validate_beancount_syntax(entry)
-            if syntax_error is None:
+            validation_error = self.validate_beancount_syntax(entry) or self.validate_accounts_exist(entry, accounts)
+            if validation_error is None:
                 return entry
 
-            log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
+            log(f"Draft validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {validation_error}")
 
-        raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
+        raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
 
     def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
         r = requests.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
@@ -807,7 +822,7 @@ class Bot:
             raise ValueError(self.llm_unavailable_message())
 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        syntax_error = None
+        validation_error = None
         entry = None
 
         for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
@@ -816,9 +831,9 @@ class Bot:
             else:
                 prompt_text = (
                     f"{base_prompt}\n\n"
-                    f"Previous draft had beancount syntax errors:\n{entry}\n\n"
-                    f"Error: {syntax_error}\n\n"
-                    "Fix the syntax errors and regenerate."
+                    f"Previous draft had validation errors:\n{entry}\n\n"
+                    f"Error: {validation_error}\n\n"
+                    "Fix the errors and regenerate."
                 )
 
             payload = {
@@ -842,13 +857,13 @@ class Bot:
             except Exception as e:
                 raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
 
-            syntax_error = self.validate_beancount_syntax(entry)
-            if syntax_error is None:
+            validation_error = self.validate_beancount_syntax(entry) or self.validate_accounts_exist(entry, accounts)
+            if validation_error is None:
                 return entry
 
-            log(f"Beancount syntax validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {syntax_error}")
+            log(f"Draft validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {validation_error}")
 
-        raise ValueError(f"Beancount syntax validation failed after {MAX_BEANCOUNT_RETRIES} retries: {syntax_error}")
+        raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
 
     def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
         return self._call_vision_with_retry(

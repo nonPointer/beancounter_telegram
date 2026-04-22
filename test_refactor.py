@@ -1343,7 +1343,7 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
                         self.bot.call_openai_compatible(
                             "test", ["Expenses:Food", "Assets:Bank"], "2024-01-01"
                         )
-                    self.assertIn("syntax validation failed", str(cm.exception).lower())
+                    self.assertIn("validation failed", str(cm.exception).lower())
 
 
 if __name__ == "__main__":
