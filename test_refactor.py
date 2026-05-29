@@ -100,7 +100,7 @@ class TestCallLlmBackends(unittest.TestCase):
         mock_resp.raise_for_status = MagicMock()
 
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
-            with patch("requests.post", return_value=mock_resp):
+            with patch.object(main.HTTP, "post", return_value=mock_resp):
                 result = self.bot._call_llm_backends({})
         self.assertEqual(result, "hello")
 
@@ -119,14 +119,14 @@ class TestCallLlmBackends(unittest.TestCase):
 
         backends = [self._make_backend(model="m1"), self._make_backend(model="m2")]
         with patch.object(main, "LLM_BACKENDS", backends):
-            with patch("requests.post", side_effect=fake_post):
+            with patch.object(main.HTTP, "post", side_effect=fake_post):
                 result = self.bot._call_llm_backends({})
         self.assertEqual(result, "ok")
         self.assertEqual(call_count, 2)
 
     def test_raises_when_all_fail(self):
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
-            with patch("requests.post", side_effect=ConnectionError("nope")):
+            with patch.object(main.HTTP, "post", side_effect=ConnectionError("nope")):
                 with self.assertRaises(ValueError) as cm:
                     self.bot._call_llm_backends({})
                 self.assertIn("All LLM backends failed", str(cm.exception))
@@ -138,7 +138,7 @@ class TestCallLlmBackends(unittest.TestCase):
 
         backend = {**self._make_backend(model="text-model"), "vision_model": "vision-model"}
         with patch.object(main, "LLM_BACKENDS", [backend]):
-            with patch("requests.post", return_value=mock_resp) as mock_post:
+            with patch.object(main.HTTP, "post", return_value=mock_resp) as mock_post:
                 self.bot._call_llm_backends({}, vision=True)
 
         sent_model = mock_post.call_args[1]["json"]["model"]
@@ -151,7 +151,7 @@ class TestCallLlmBackends(unittest.TestCase):
 
         backend = self._make_backend(model="text-model")  # no vision_model
         with patch.object(main, "LLM_BACKENDS", [backend]):
-            with patch("requests.post", return_value=mock_resp) as mock_post:
+            with patch.object(main.HTTP, "post", return_value=mock_resp) as mock_post:
                 self.bot._call_llm_backends({}, vision=True)
 
         sent_model = mock_post.call_args[1]["json"]["model"]
@@ -164,7 +164,7 @@ class TestCallLlmBackends(unittest.TestCase):
 
         backend = {**self._make_backend(model="text-model"), "vision_model": "vision-model"}
         with patch.object(main, "LLM_BACKENDS", [backend]):
-            with patch("requests.post", return_value=mock_resp) as mock_post:
+            with patch.object(main.HTTP, "post", return_value=mock_resp) as mock_post:
                 self.bot._call_llm_backends({})
 
         sent_model = mock_post.call_args[1]["json"]["model"]
@@ -1078,7 +1078,7 @@ class TestGitHubDownloadFileETagCache(unittest.TestCase):
         content_b64 = __import__("base64").b64encode(b"hello").decode()
         resp = self._mock_response(200, {"content": content_b64, "sha": "abc"}, {"ETag": '"etag1"'})
 
-        with patch("requests.get", return_value=resp):
+        with patch.object(main.HTTP, "get", return_value=resp):
             result = self.bot.github_download_file("main.bean")
 
         self.assertEqual(result["content"], "hello")
@@ -1092,7 +1092,7 @@ class TestGitHubDownloadFileETagCache(unittest.TestCase):
         }
         resp = self._mock_response(304)
 
-        with patch("requests.get", return_value=resp) as mock_get:
+        with patch.object(main.HTTP, "get", return_value=resp) as mock_get:
             result = self.bot.github_download_file("main.bean")
 
         self.assertEqual(result["content"], "cached content")
@@ -1109,7 +1109,7 @@ class TestGitHubDownloadFileETagCache(unittest.TestCase):
         content_b64 = __import__("base64").b64encode(b"new content").decode()
         resp = self._mock_response(200, {"content": content_b64, "sha": "new_sha"}, {"ETag": '"new"'})
 
-        with patch("requests.get", return_value=resp):
+        with patch.object(main.HTTP, "get", return_value=resp):
             result = self.bot.github_download_file("main.bean")
 
         self.assertEqual(result["content"], "new content")
@@ -1120,14 +1120,14 @@ class TestGitHubDownloadFileETagCache(unittest.TestCase):
             "etag": '"e"', "content": "x", "sha": "s",
         }
         resp = self._mock_response(200)
-        with patch("requests.put", return_value=resp):
+        with patch.object(main.HTTP, "put", return_value=resp):
             self.bot.github_upload_file("new", "sha", "msg", "main.bean")
 
         self.assertNotIn("main.bean", self.bot._file_etag_cache)
 
     def test_404_not_cached(self):
         resp = self._mock_response(404)
-        with patch("requests.get", return_value=resp):
+        with patch.object(main.HTTP, "get", return_value=resp):
             result = self.bot.github_download_file("main.bean")
 
         self.assertEqual(result["content"], "")
@@ -1137,7 +1137,7 @@ class TestGitHubDownloadFileETagCache(unittest.TestCase):
         content_b64 = __import__("base64").b64encode(b"data").decode()
         resp = self._mock_response(200, {"content": content_b64, "sha": "s"}, {})
 
-        with patch("requests.get", return_value=resp):
+        with patch.object(main.HTTP, "get", return_value=resp):
             self.bot.github_download_file("main.bean")
 
         self.assertNotIn("main.bean", self.bot._file_etag_cache)
@@ -1321,7 +1321,7 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
 
         # First call returns entry that fails beancount validation, second succeeds
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
-            with patch("requests.post", side_effect=fake_post):
+            with patch.object(main.HTTP, "post", side_effect=fake_post):
                 with patch.object(self.bot, "validate_beancount_syntax",
                                   side_effect=["fake error", None]):
                     result = self.bot.call_openai_compatible(
@@ -1336,7 +1336,7 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
         entry = '2024-01-01 * "P" "N"\n  Expenses:Food  10 CNY\n  Assets:Bank  -10 CNY'
 
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
-            with patch("requests.post", return_value=self._mock_llm_response(entry)):
+            with patch.object(main.HTTP, "post", return_value=self._mock_llm_response(entry)):
                 with patch.object(self.bot, "validate_beancount_syntax",
                                   return_value="persistent error"):
                     with self.assertRaises(ValueError) as cm:
