@@ -623,39 +623,51 @@ class TestEnsureDatetimeMetadataFuzz(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  6. prepend_natural_language_comment
+#  6. insert_prompt_metadata
 # ═══════════════════════════════════════════════════════════════════
-class TestPrependNaturalLanguageCommentFuzz(unittest.TestCase):
+class TestInsertPromptMetadataFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
 
     def test_empty_input(self):
         entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
-        self.assertEqual(self.bot.prepend_natural_language_comment(entry, ""), entry)
+        self.assertEqual(self.bot.insert_prompt_metadata(entry, ""), entry)
 
     def test_whitespace_only_input(self):
         entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
-        self.assertEqual(self.bot.prepend_natural_language_comment(entry, "   \n  "), entry)
+        self.assertEqual(self.bot.insert_prompt_metadata(entry, "   \n  "), entry)
+
+    def test_inserted_after_header(self):
+        entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
+        result = self.bot.insert_prompt_metadata(entry, "买咖啡")
+        lines = result.splitlines()
+        self.assertEqual(lines[0], '2024-01-01 * "A" "B"')
+        self.assertEqual(lines[1], '  prompt: "买咖啡"')
 
     def test_multiline_input_flattened(self):
         entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
-        result = self.bot.prepend_natural_language_comment(entry, "line1\nline2\nline3")
-        self.assertTrue(result.startswith("; line1 line2 line3\n"))
+        result = self.bot.insert_prompt_metadata(entry, "line1\nline2\nline3")
+        self.assertIn('  prompt: "line1 line2 line3"', result)
 
     def test_idempotent(self):
-        entry = '; hello\n2024-01-01 * "A" "B"\n  X:Y  1 USD'
-        result = self.bot.prepend_natural_language_comment(entry, "hello")
-        self.assertEqual(result.count("; hello"), 1)
+        entry = '2024-01-01 * "A" "B"\n  prompt: "old"\n  X:Y  1 USD'
+        result = self.bot.insert_prompt_metadata(entry, "new")
+        self.assertEqual(result.count("prompt:"), 1)
+        self.assertIn('prompt: "old"', result)
 
-    def test_different_comment_adds_new(self):
-        entry = '; hello\n2024-01-01 * "A" "B"\n  X:Y  1 USD'
-        result = self.bot.prepend_natural_language_comment(entry, "world")
-        self.assertTrue(result.startswith("; world\n"))
+    def test_quote_escaping(self):
+        entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
+        result = self.bot.insert_prompt_metadata(entry, 'say "hi"')
+        self.assertIn(r'  prompt: "say \"hi\""', result)
+
+    def test_no_header_returns_unchanged(self):
+        entry = '2024-01-01 balance Assets:Cash  100 USD'
+        self.assertEqual(self.bot.insert_prompt_metadata(entry, "anything"), entry)
 
     def test_unicode_input(self):
         entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
-        result = self.bot.prepend_natural_language_comment(entry, "午餐 🍜 café")
-        self.assertIn("; 午餐 🍜 café", result)
+        result = self.bot.insert_prompt_metadata(entry, "午餐 🍜 café")
+        self.assertIn('  prompt: "午餐 🍜 café"', result)
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -13,6 +13,7 @@ import parsedatetime as pdt
 import pytz
 from dateutil.parser import parse as dateutil_parse
 import requests
+from requests.adapters import HTTPAdapter
 from beancount.parser import parser as beancount_parser
 from jinja2 import Environment, FileSystemLoader
 
@@ -23,6 +24,23 @@ from prompts import (
 )
 
 MAX_BEANCOUNT_RETRIES = 3
+
+
+def _build_http_session() -> requests.Session:
+    """Shared session reused for all outbound HTTP (LLM, GitHub, Telegram).
+
+    Connection pooling avoids a fresh TLS handshake on every call. No automatic
+    retries are configured on purpose: the LLM layer relies on fast failover to
+    the next backend, which urllib3-level retries would delay.
+    """
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+HTTP = _build_http_session()
 
 with open("config.json", "r") as f:
     config = json.load(f)
@@ -404,7 +422,7 @@ class Bot:
             "X-GitHub-Api-Version": "2022-11-28"
         }
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/accounts?ref={BRANCH_NAME}"
-        r = requests.get(url, headers=list_headers, timeout=30)
+        r = HTTP.get(url, headers=list_headers, timeout=30)
         if r.status_code != 200:
             log(f"Error fetching accounts: {r.status_code}")
             log(r.text)
@@ -412,7 +430,7 @@ class Bot:
         bean_items = [item for item in r.json() if item["name"].endswith(".bean")]
 
         def fetch_account_file(item):
-            file_r = requests.get(item["url"], headers=list_headers, timeout=30)
+            file_r = HTTP.get(item["url"], headers=list_headers, timeout=30)
             if file_r.status_code != 200:
                 return {}, []
             content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
@@ -741,9 +759,16 @@ class Bot:
                     "Authorization": f"Bearer {backend['api_key']}",
                     "Content-Type": "application/json",
                 }
-                response = requests.post(url, headers=headers, json={**payload, "model": model}, timeout=60)
+                response = HTTP.post(url, headers=headers, json={**payload, "model": model}, timeout=60)
                 response.raise_for_status()
-                return response.json()["choices"][0]["message"]["content"].strip()
+                data = response.json()
+                try:
+                    content = data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError) as e:
+                    raise ValueError(f"Malformed LLM response: {data}") from e
+                if content is None:
+                    raise ValueError(f"LLM returned null content: {data}")
+                return content.strip()
             except Exception as e:
                 log(f"LLM backend '{model}'{log_prefix} failed: {e}, trying next...")
                 last_error = e
@@ -802,13 +827,13 @@ class Bot:
         raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
 
     def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
-        r = requests.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
+        r = HTTP.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
         if r.status_code != 200:
             log(f"Error getting file info: {r.status_code}")
             return None
         file_path = r.json()["result"]["file_path"]
         token = config["TELEGRAM_BOT_TOKEN"]
-        dl = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=60)
+        dl = HTTP.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=60)
         if dl.status_code != 200:
             log(f"Error downloading file: {dl.status_code}")
             return None
@@ -965,7 +990,7 @@ class Bot:
             return
         directive_text, new_content = result
         header_line = directive_text.splitlines()[0]
-        quoted = re.findall(r'"([^"]*)"', header_line)
+        quoted = re.findall(r'"((?:\\.|[^"\\])*)"', header_line)
         if len(quoted) >= 2:
             description = f"{quoted[0]} {quoted[1]}"
         elif len(quoted) == 1:
@@ -1040,7 +1065,7 @@ class Bot:
             data["parse_mode"] = parse_mode
         if reply_markup is not None:
             data["reply_markup"] = reply_markup
-        response = requests.post(self.api_base + "/sendMessage", json=data, timeout=30)
+        response = HTTP.post(self.api_base + "/sendMessage", json=data, timeout=30)
         if response.status_code != 200:
             log(f"Error sending message: {response.status_code}")
             log(response.text)
@@ -1050,7 +1075,7 @@ class Bot:
         data = {"callback_query_id": callback_query_id}
         if text:
             data["text"] = text
-        requests.post(self.api_base + "/answerCallbackQuery", json=data, timeout=30)
+        HTTP.post(self.api_base + "/answerCallbackQuery", json=data, timeout=30)
 
     def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
         data = {
@@ -1058,7 +1083,7 @@ class Bot:
             "message_id": message_id,
             "reply_markup": reply_markup or {"inline_keyboard": []},
         }
-        requests.post(self.api_base + "/editMessageReplyMarkup", json=data, timeout=30)
+        HTTP.post(self.api_base + "/editMessageReplyMarkup", json=data, timeout=30)
 
     def _make_pending_entry(self, chat_id: int, appendix: str, commit_message: str, user_input: str, date_str: str) -> dict:
         return {
@@ -1306,7 +1331,7 @@ class Bot:
         cached = self._file_etag_cache.get(file_path)
         if cached:
             headers["If-None-Match"] = cached["etag"]
-        r = requests.get(url=url, headers=headers, timeout=30)
+        r = HTTP.get(url=url, headers=headers, timeout=30)
         if r.status_code == 304 and cached:
             return {"content": cached["content"], "sha": cached["sha"]}
         if r.status_code == 200:
@@ -1333,7 +1358,7 @@ class Bot:
         }
         if sha:
             data["sha"] = sha
-        r = requests.put(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
+        r = HTTP.put(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
         if r.status_code in [200, 201]:
             self._file_etag_cache.pop(file_path, None)
             return True
@@ -1345,7 +1370,7 @@ class Bot:
     def github_trigger_workflow(self, workflow_file: str, inputs: dict) -> tuple[bool, str]:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{workflow_file}/dispatches"
         data = {"ref": BRANCH_NAME, "inputs": inputs}
-        r = requests.post(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
+        r = HTTP.post(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
         if r.status_code == 204:
             return True, ""
         else:
@@ -1696,7 +1721,7 @@ class Bot:
     def get_updates(self):
         params = {"offset": self.update_id + 1, "timeout": 30}
         try:
-            response = requests.get(self.api_base + "/getUpdates", params=params, timeout=params["timeout"] + 1)
+            response = HTTP.get(self.api_base + "/getUpdates", params=params, timeout=params["timeout"] + 1)
             if response.status_code != 200:
                 log(f"Error: {response.status_code}")
                 return {"result": []}
