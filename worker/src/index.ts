@@ -385,13 +385,19 @@ const INVEST_ORDER_SYSTEM_PROMPT =
 	'【买入】\n' +
 	'- 持仓账户用 @@ 总成本记法（不含手续费）：QUANTITY TICKER @@ TOTAL_COST CURRENCY ; @ PRICE_PER_SHARE PRICE_CURRENCY\n' +
 	"- 单价写在行尾注释（; 后），不要用花括号 {} 成本记法。\n" +
-	'- 如有手续费，单独一条 Expenses posting。\n' +
+	'- 如有手续费，单独一条 Expenses:Financial posting。\n' +
 	'- 现金账户负金额为总支付额（含手续费）。\n\n' +
 	'【卖出】\n' +
 	'- 现金账户正金额为净收入。\n' +
 	'- 资本损益：Income 账户，盈利为负值，亏损为正值。\n' +
 	'- 持仓账户：-QUANTITY TICKER @@（@@ 后不写金额，beancount 自动计算成本）。\n' +
-	'- 如有手续费，单独一条 Expenses posting。\n\n' +
+	'- 如有手续费，单独一条 Expenses:Financial posting。\n\n' +
+	'【手续费】\n' +
+	'- 所有交易费用（券商佣金、印花税、外汇/货币转换费等）统一记入 Expenses:Financial。\n' +
+	'- Trading 212 订单截图常含『货币转换费 / Currency conversion fee / FX fee』' +
+	'（标的货币与账户货币不同时按比例收取，如买美股用 GBP 账户时的 0.15% 转换费）；' +
+	'务必逐项识别并合计记入 Expenses:Financial，不要遗漏。\n' +
+	'- 现金账户金额必须包含所有费用，使分录借贷平衡。\n\n' +
 	'【账户选择】\n' +
 	'- 同一券商可能有多个子账户（如 Trading212 的 Stocks ISA 和 Invest）。\n' +
 	'- 用户会在 caption 中用关键词指定账户类型（如 stocksisa、isa、invest、cfd）。\n' +
@@ -408,7 +414,7 @@ const INVEST_ORDER_SYSTEM_PROMPT =
 	'买入示例：\n' +
 	'2026-03-06 * "Trading 212" "Buy 15.5 GOOGL (Google)"\n' +
 	'  Assets:Broker:GOOGL      15.5 GOOGL @@ 3464.78 GBP  ; @ 297.75 USD\n' +
-	'  Expenses:Investments:Fee   5.20 GBP\n' +
+	'  Expenses:Financial         5.20 GBP\n' +
 	'  Assets:Broker:Cash       -3469.98 GBP\n' +
 	'\n' +
 	'卖出示例（收益 266.98 GBP，净收入 2406.54 GBP）：\n' +
