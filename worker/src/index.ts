@@ -1022,7 +1022,7 @@ async function runRecheckWithReason(
 
 // --- Callback query handler ---
 
-async function handleCallbackQuery(
+export async function handleCallbackQuery(
 	query: {
 		id: string;
 		data?: string;
@@ -1060,7 +1060,10 @@ async function handleCallbackQuery(
 		return;
 	}
 
-	if (messageId !== undefined) await editMessageReplyMarkup(env, chatId, messageId);
+	// For 'approve' we defer stripping the inline buttons until AFTER a successful
+	// GitHub download, so a transient download failure leaves the draft (and its
+	// buttons) intact for retry. All other actions strip the buttons up front.
+	if (action !== 'approve' && messageId !== undefined) await editMessageReplyMarkup(env, chatId, messageId);
 
 	if (action === 'discard') {
 		await Promise.all([
@@ -1085,6 +1088,9 @@ async function handleCallbackQuery(
 			getTimezoneForChat(env, chatId),
 			githubDownloadFile(env),
 		]);
+		// Download FIRST. On failure, leave the pending entry AND its inline buttons
+		// intact (do not delete from KV, do not strip the markup) so the user can retry
+		// instead of losing a validated draft.
 		if (!f) {
 			await Promise.all([
 				answerCallbackQuery(env, callbackId, 'Failed'),
@@ -1092,6 +1098,9 @@ async function handleCallbackQuery(
 			]);
 			return;
 		}
+
+		// Download succeeded: now claim the draft by stripping the inline buttons.
+		if (messageId !== undefined) await editMessageReplyMarkup(env, chatId, messageId);
 
 		const { datetimeStr } = formatInTimezone(tz);
 		const entryText = ensureDatetimeMetadata(pending.entryText, datetimeStr);
@@ -1183,7 +1192,7 @@ async function handlePhotoMessage(
 
 // --- Text message handler ---
 
-async function handleMessage(
+export async function handleMessage(
 	message: { chat: { id: number }; text: string },
 	env: Env,
 ): Promise<void> {
@@ -1207,15 +1216,11 @@ async function handleMessage(
 	let { dateStr, datetimeStr, timeStr } = formatInTimezone(tz);
 	let customDate = false;
 
-	// Custom date prefix
-	if (/^\d{4}-\d{2}-\d{2}/.test(text.trim())) {
-		const lines = text.trim().split('\n');
-		dateStr = lines[0].trim();
-		text = lines.slice(1).join('\n').trim();
-		customDate = true;
-	}
-
-	// Check for pending decline reason (user is providing feedback for a recheck)
+	// Check for pending decline reason (user is providing feedback for a recheck).
+	// This must run on the RAW message text, BEFORE any date-prefix stripping, so a
+	// reason that begins with a date keyword/token (e.g. "昨天买的，不是今天" or
+	// "2026-04-17 这个不对") reaches the recheck path intact instead of being
+	// mangled/emptied by date parsing.
 	if (waitingPendingId) {
 		const reasonText = text.trim();
 		if (!reasonText || reasonText.startsWith('/')) {
@@ -1226,6 +1231,22 @@ async function handleMessage(
 		await runRecheckWithReason(env, chatId, waitingPendingId, accounts, currencies, reasonText, comments, timeStr);
 		return;
 	}
+
+	// Custom date prefix. The regex guarantees a leading YYYY-MM-DD, so extract only
+	// the 10-char date token; the rest of the first line is dropped (matching Python's
+	// ISO-date layer), while the remaining lines stay as the input text.
+	if (/^\d{4}-\d{2}-\d{2}/.test(text.trim())) {
+		const lines = text.trim().split('\n');
+		dateStr = lines[0].trim().slice(0, 10);
+		text = lines.slice(1).join('\n').trim();
+		customDate = true;
+	}
+
+	// Recompute the directive dispatch word AFTER date stripping so e.g. a date-prefixed
+	// "open ..." still routes to the open handler. The four directive branches below use
+	// EXACT equality (case-insensitive) on this word so natural language like
+	// "opened a beer 5 CNY" is NOT hijacked into a directive handler.
+	const dispatchWord = text.trim().split(/\s+/)[0]?.toLowerCase() ?? '';
 
 	let commitMessage = 'Add entry by Telegram Bot\n\n';
 	let appendix = '';
@@ -1267,6 +1288,13 @@ async function handleMessage(
 			if (!padAccount) { await reply(`No matching account found for suffix: ${parts[1]}`); return; }
 
 			const amount = parts[2];
+			// The Worker has no beancount-parser backstop, so a non-numeric amount would
+			// commit a corrupt balance directive. Validate with a strict beancount-number
+			// regex (also rejects hex/underscore/inf forms) and mirror Python's message.
+			if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(amount)) {
+				await reply(`Invalid amount: ${amount}. Must be a valid number.`);
+				return;
+			}
 			const currency = parts[3];
 			const tomorrowStr = addDays(dateStr, 1);
 
@@ -1286,7 +1314,7 @@ async function handleMessage(
 	}
 
 	// --- open ---
-	else if (text.toLowerCase().startsWith('open')) {
+	else if (dispatchWord === 'open') {
 		const m = /\S+\s+(\S+)\s+(\S+)/.exec(text);
 		if (!m) { await reply('Invalid open command format.'); return; }
 		const account = m[1];
@@ -1305,7 +1333,7 @@ async function handleMessage(
 	}
 
 	// --- close ---
-	else if (text.toLowerCase().startsWith('close')) {
+	else if (dispatchWord === 'close') {
 		const m = /\S+\s+(\S+)/.exec(text);
 		if (!m) { await reply('Invalid close command format. Use: close [account]'); return; }
 		const account = matchAccount(m[1], accounts);
@@ -1316,7 +1344,7 @@ async function handleMessage(
 	}
 
 	// --- balance ---
-	else if (text.toLowerCase().startsWith('balance')) {
+	else if (dispatchWord === 'balance') {
 		const m = /\S+\s+(\S+)\s+(\S+)\s+(\S+)/.exec(text);
 		if (!m) { await reply('Invalid balance command format.'); return; }
 		const account = matchAccount(m[1], accounts);
@@ -1327,7 +1355,7 @@ async function handleMessage(
 	}
 
 	// --- pad ---
-	else if (text.toLowerCase().startsWith('pad')) {
+	else if (dispatchWord === 'pad') {
 		const m = /\S+\s+(\S+)\s+(\S+)/.exec(text);
 		if (!m) { await reply('Invalid pad command format.'); return; }
 		const account = matchAccount(m[1], accounts);

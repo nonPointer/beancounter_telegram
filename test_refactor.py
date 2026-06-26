@@ -1346,5 +1346,186 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
                     self.assertIn("validation failed", str(cm.exception).lower())
 
 
+class TestDeclineReasonReadBeforeDateParsing(unittest.TestCase):
+    """P1 — a pending decline/feedback reason is read from the RAW message text
+    BEFORE date parsing, so a reason starting with a date keyword survives intact.
+    """
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_reason_with_date_keyword_reaches_recheck_intact(self):
+        chat_id = 42
+        self.bot.pending_decline_reasons[chat_id] = "pid1"
+        captured = {}
+
+        def fake_recheck(c, pid, decline_reason=None):
+            captured["chat_id"] = c
+            captured["pid"] = pid
+            captured["reason"] = decline_reason
+
+        with patch.object(self.bot, "run_recheck", side_effect=fake_recheck), \
+             patch.object(self.bot, "send_message"):
+            self.bot.handle_message(
+                {"message": {"text": "昨天买的，不是今天", "chat": {"id": chat_id}}}
+            )
+
+        # The full raw reason must reach run_recheck — NOT stripped/emptied by
+        # parse_natural_date (which would otherwise consume the leading "昨天").
+        self.assertEqual(captured.get("reason"), "昨天买的，不是今天")
+        self.assertEqual(captured.get("pid"), "pid1")
+        # The pending decline reason binding is consumed exactly once.
+        self.assertNotIn(chat_id, self.bot.pending_decline_reasons)
+
+
+class TestDirectiveDispatchExactEquality(unittest.TestCase):
+    """P2 — open/close/balance/pad branches match on EXACT equality of the
+    post-date first word, so natural language is not hijacked into a directive.
+    """
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+        self.bot.llm_enabled = True
+
+    def test_opened_natural_language_not_hijacked_to_open_handler(self):
+        with patch.object(self.bot, "parse_accounts",
+                          return_value=["Expenses:Food (CNY)", "Assets:Cash (CNY)"]), \
+             patch.object(self.bot, "call_openai_compatible",
+                          return_value='2026-06-26 * "x" "y"\n  Expenses:Food 5 CNY\n  Assets:Cash') as mock_llm, \
+             patch.object(self.bot, "insert_prompt_metadata", side_effect=lambda a, t: a), \
+             patch.object(self.bot, "send_draft_for_review"), \
+             patch.object(self.bot, "github_upload_file") as mock_upload, \
+             patch.object(self.bot, "send_message"):
+            self.bot.handle_message(
+                {"message": {"text": "opened a beer 5 CNY", "chat": {"id": 42}}}
+            )
+
+        # Routed to the LLM/transaction path, NOT the open directive handler.
+        mock_llm.assert_called_once()
+        mock_upload.assert_not_called()
+
+    def test_real_open_command_still_hits_open_handler(self):
+        with patch.object(self.bot, "call_openai_compatible") as mock_llm, \
+             patch.object(self.bot, "github_download_file",
+                          return_value={"content": "", "sha": ""}), \
+             patch.object(self.bot, "github_upload_file", return_value=True) as mock_upload, \
+             patch.object(self.bot, "send_message"):
+            self.bot.handle_message(
+                {"message": {"text": "open Assets:Cash:Wallet CNY", "chat": {"id": 42}}}
+            )
+
+        # The open handler ran (committed an open directive); LLM not consulted.
+        mock_llm.assert_not_called()
+        mock_upload.assert_called_once()
+        uploaded = mock_upload.call_args[0][0]
+        self.assertIn("open Assets:Cash:Wallet", uploaded)
+
+    def test_date_prefixed_open_command_still_hits_open_handler(self):
+        # "昨天open Assets:X CNY" — the date is stripped, the dispatch word is
+        # recomputed AFTER parsing, so it still routes to the open handler.
+        with patch.object(self.bot, "call_openai_compatible") as mock_llm, \
+             patch.object(self.bot, "github_download_file",
+                          return_value={"content": "", "sha": ""}), \
+             patch.object(self.bot, "github_upload_file", return_value=True) as mock_upload, \
+             patch.object(self.bot, "send_message"):
+            self.bot.handle_message(
+                {"message": {"text": "昨天open Assets:Cash:Wallet CNY", "chat": {"id": 42}}}
+            )
+
+        mock_llm.assert_not_called()
+        mock_upload.assert_called_once()
+        uploaded = mock_upload.call_args[0][0]
+        self.assertIn("open Assets:Cash:Wallet", uploaded)
+
+
+class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
+    """P3 — on approve, a transient GitHub download failure must NOT lose the
+    validated draft: the pending entry and its inline buttons stay intact.
+    """
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def _appendix(self):
+        return '2026-06-26 * "x" "y"\n  Expenses:Food 5 CNY\n  Assets:Cash'
+
+    def _update(self, pending_id, chat_id, message_id):
+        return {"callback_query": {
+            "id": "cb",
+            "data": f"approve:{pending_id}",
+            "message": {"chat": {"id": chat_id}, "message_id": message_id},
+        }}
+
+    def test_download_failure_keeps_pending_and_buttons(self):
+        pending_id, chat_id = "pX", 42
+        self.bot.pending_llm_entries[pending_id] = self.bot._make_pending_entry(
+            chat_id, self._appendix(), "cm", "inp", "2026-06-26"
+        )
+
+        with patch.object(self.bot, "github_download_file", return_value=None), \
+             patch.object(self.bot, "edit_message_reply_markup") as mock_edit, \
+             patch.object(self.bot, "github_upload_file") as mock_upload, \
+             patch.object(self.bot, "answer_callback_query"), \
+             patch.object(self.bot, "send_message") as mock_send:
+            self.bot.handle_callback_query(self._update(pending_id, chat_id, 99))
+
+        # Draft still present; buttons NOT stripped; no upload attempted.
+        self.assertIn(pending_id, self.bot.pending_llm_entries)
+        mock_edit.assert_not_called()
+        mock_upload.assert_not_called()
+        msgs = [c[0][1] for c in mock_send.call_args_list]
+        self.assertTrue(any("Failed to download from GitHub." in m for m in msgs))
+
+    def test_successful_approve_pops_and_strips_buttons(self):
+        pending_id, chat_id = "pY", 42
+        self.bot.pending_llm_entries[pending_id] = self.bot._make_pending_entry(
+            chat_id, self._appendix(), "cm", "inp", "2026-06-26"
+        )
+
+        with patch.object(self.bot, "github_download_file",
+                          return_value={"content": "old", "sha": "s"}), \
+             patch.object(self.bot, "edit_message_reply_markup") as mock_edit, \
+             patch.object(self.bot, "github_upload_file", return_value=True) as mock_upload, \
+             patch.object(self.bot, "answer_callback_query"), \
+             patch.object(self.bot, "send_message"):
+            self.bot.handle_callback_query(self._update(pending_id, chat_id, 100))
+
+        # Happy path still works: entry claimed, buttons stripped, upload done.
+        self.assertNotIn(pending_id, self.bot.pending_llm_entries)
+        mock_edit.assert_called_once()
+        mock_upload.assert_called_once()
+
+
+class TestRelativeDayCountBounded(unittest.TestCase):
+    """M-EXTRA — absurd Chinese N天前/N天后 values must not raise OverflowError."""
+
+    def setUp(self):
+        self.now = datetime(2026, 3, 26, 12, 0, 0)
+
+    def _parse(self, text):
+        return main.parse_natural_date(text, self.now)
+
+    def test_huge_n_days_ago_does_not_raise(self):
+        # Must return gracefully (no exception); treated as no-date / fall-through.
+        date, custom, remaining = self._parse("9999999999天前 coffee")
+        self.assertFalse(custom)
+        self.assertEqual(remaining, "9999999999天前 coffee")
+
+    def test_huge_n_days_later_does_not_raise(self):
+        date, custom, remaining = self._parse("9999999999天后 coffee")
+        self.assertFalse(custom)
+        self.assertEqual(remaining, "9999999999天后 coffee")
+
+    def test_within_bound_still_parses(self):
+        # A reasonable value is still parsed as a custom date.
+        date, custom, remaining = self._parse("3天前 晚饭")
+        self.assertTrue(custom)
+        self.assertEqual(date, "2026-03-23")
+        self.assertEqual(remaining, "晚饭")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

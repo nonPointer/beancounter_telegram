@@ -195,7 +195,10 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     # Check for "N天前" / "N天后" pattern
     _chinese_ago_re = re.match(r'^(\d+)\s*天前\s*(.*)', first_line, re.DOTALL)
     _chinese_later_re = re.match(r'^(\d+)\s*天后\s*(.*)', first_line, re.DOTALL)
-    if _chinese_ago_re:
+    # Bound the day count to avoid OverflowError (timedelta/date out of range)
+    # crashing the bare daemon thread that runs handle_message. Absurd values
+    # like "9999999999天前" fall through to the later date layers / no-date path.
+    if _chinese_ago_re and int(_chinese_ago_re.group(1)) <= 100000:
         days = int(_chinese_ago_re.group(1))
         rest_of_first = _chinese_ago_re.group(2).strip()
         d = now - timedelta(days=days)
@@ -203,7 +206,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         remaining = _join_remaining(rest_of_first, lines)
         log(f"Custom date detected (Chinese N天前): {date_str}")
         return date_str, True, remaining
-    if _chinese_later_re:
+    if _chinese_later_re and int(_chinese_later_re.group(1)) <= 100000:
         days = int(_chinese_later_re.group(1))
         rest_of_first = _chinese_later_re.group(2).strip()
         d = now + timedelta(days=days)
@@ -1244,7 +1247,7 @@ class Bot:
                 self.answer_callback_query(callback_id, "Not allowed")
                 return
 
-            if action in ("discard", "approve", "undo_confirm", "undo_cancel"):
+            if action in ("discard", "undo_confirm", "undo_cancel"):
                 # Claim the entry now; prevents any concurrent thread from also processing it.
                 pending = self.pending_llm_entries.pop(pending_id, None)
                 if not pending:
@@ -1252,8 +1255,13 @@ class Bot:
                     return
             elif action == "decline_reason":
                 self.pending_decline_reasons[chat_id] = pending_id
+            # NOTE: "approve" is intentionally NOT claimed here. It defers the pop
+            # (and stripping of the inline buttons) until AFTER a successful GitHub
+            # download, so a transient download failure leaves the validated draft
+            # and its buttons intact for the user to retry.
 
-        self.edit_message_reply_markup(chat_id, message_id)
+        if action != "approve":
+            self.edit_message_reply_markup(chat_id, message_id)
 
         if action == "decline_reason":
             log(f"User requested recheck for pending {pending_id}")
@@ -1299,16 +1307,29 @@ class Bot:
             return
 
         log(f"User approved pending {pending_id}")
+        # Download FIRST. On failure, the pending entry and its inline buttons are
+        # still intact (we have not popped or edited the message yet), so the user
+        # can retry instead of losing a validated draft.
         f = self.github_download_file()
         if not f:
             self.answer_callback_query(callback_id, "Failed")
             self.send_message(chat_id, "Failed to download from GitHub.")
             return
 
-        appendix = pending["appendix"]
+        # The download succeeded — now claim the entry. If a concurrent approve
+        # already claimed it, bail out without double-committing.
+        claimed = self._pop_pending(pending_id)
+        if claimed is None:
+            self.answer_callback_query(callback_id, "This request is expired or already handled")
+            return
+
+        # Claimed: strip the inline buttons now, then upload.
+        self.edit_message_reply_markup(chat_id, message_id)
+
+        appendix = claimed["appendix"]
         approve_datetime_str = datetime.now(self.timezone).isoformat(timespec='seconds')
         appendix = self.ensure_datetime_metadata(appendix, approve_datetime_str)
-        commit_message = pending["commit_message"]
+        commit_message = claimed["commit_message"]
         ok = self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip())
 
         if ok:
@@ -1388,18 +1409,11 @@ class Bot:
         time_str = dt.strftime('%H:%M')
         datetime_str = dt.isoformat(timespec='seconds')
 
-        # Detect beancount directive commands from raw text BEFORE natural
-        # language date parsing.  parsedatetime can false-positive on numbers
-        # embedded in command args (e.g. "balance acc -41.1 GBP" → year 2042),
-        # consuming the entire line and breaking command dispatch.
-        _directive_commands = {'open', 'close', 'balance', 'pad'}
-        _first_word = text.strip().split()[0].lower() if text.strip() else ''
-        if _first_word in _directive_commands:
-            date_str = dt.strftime('%Y-%m-%d')
-            custom_date = False
-        else:
-            date_str, custom_date, text = parse_natural_date(text, dt)
-
+        # Read a pending decline/feedback reason from the RAW incoming message
+        # text BEFORE any date parsing or directive detection. A reason that
+        # begins with a recognised date keyword (e.g. "昨天买的，不是今天")
+        # would otherwise be stripped/mangled by parse_natural_date before the
+        # recheck handler sees it, corrupting (or emptying) the reason.
         with self._pending_lock:
             pending_reason_id = self.pending_decline_reasons.get(chat_id)
         if pending_reason_id is not None:
@@ -1413,6 +1427,24 @@ class Bot:
             log(f"Decline reason received: {reason_text}")
             self.run_recheck(chat_id, pending_reason_id, decline_reason=reason_text)
             return
+
+        # Detect beancount directive commands from raw text BEFORE natural
+        # language date parsing.  parsedatetime can false-positive on numbers
+        # embedded in command args (e.g. "balance acc -41.1 GBP" → year 2042),
+        # consuming the entire line and breaking command dispatch.
+        _directive_commands = {'open', 'close', 'balance', 'pad'}
+        _first_word = text.strip().split()[0].lower() if text.strip() else ''
+        if _first_word in _directive_commands:
+            date_str = dt.strftime('%Y-%m-%d')
+            custom_date = False
+        else:
+            date_str, custom_date, text = parse_natural_date(text, dt)
+
+        # Recompute the dispatch word AFTER date parsing has stripped any leading
+        # date line (so "昨天open Assets:X CNY" still routes to the open handler)
+        # and match the directive branches below on EXACT equality, so natural
+        # language like "opened a beer 5 CNY" is not hijacked into a directive.
+        dispatch_word = text.strip().split()[0].lower() if text.strip() else ""
 
         commit_message = 'Add entry by Telegram Bot\n\n'
         appendix = ""
@@ -1498,7 +1530,7 @@ class Bot:
                 reply(f"Unknown command: {command}")
                 return
 
-        elif text.lower().startswith("open"):
+        elif dispatch_word == "open":
             log("/open command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
             if not matches or len(matches[0]) < 2:
@@ -1518,7 +1550,7 @@ class Bot:
                 date=date_str, account=account, currency=currency, datetime=datetime_str
             )
 
-        elif text.lower().startswith("close"):
+        elif dispatch_word == "close":
             log("/close command detected")
             matches = re.findall(r'.*?\s+([^\s]+)', text, re.IGNORECASE)
             if not matches:
@@ -1535,7 +1567,7 @@ class Bot:
                 date=date_str, account=account, datetime=datetime_str
             )
 
-        elif text.lower().startswith("balance"):
+        elif dispatch_word == "balance":
             log("/balance command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
             if not matches or len(matches[0]) < 3:
@@ -1555,7 +1587,7 @@ class Bot:
                 date=balance_date_str, account=account, amount=amount, currency=currency, datetime=datetime_str
             )
 
-        elif text.lower().startswith("pad"):
+        elif dispatch_word == "pad":
             log("/pad command detected")
             matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
             if not matches or len(matches[0]) < 2:

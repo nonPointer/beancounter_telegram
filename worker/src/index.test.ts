@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	accountsForPrompt,
 	addDays,
@@ -8,6 +8,8 @@ import {
 	escapeHtml,
 	extractNonPnlAccounts,
 	getLLMBackends,
+	handleCallbackQuery,
+	handleMessage,
 	matchAccount,
 	normalizeAndValidateLLMEntry,
 	preferCurrentAccount,
@@ -410,5 +412,318 @@ describe('normalizeAndValidateLLMEntry', () => {
 			'  Expenses:Food  45 USD';
 		const result = normalizeAndValidateLLMEntry(entry, accounts);
 		expect(result).toContain('Expenses:Food');
+	});
+});
+
+// ===========================================================================
+// Handler-level regression tests (P1, P2, P3, W-EXTRA-1, W-EXTRA-2)
+// These exercise handleMessage / handleCallbackQuery with a fake KV and a
+// stubbed global fetch so we can assert routing/ordering behavior.
+// ===========================================================================
+
+// Minimal in-memory KVNamespace stand-in
+class FakeKV {
+	store = new Map<string, string>();
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	async get(key: string, type?: 'json' | 'text'): Promise<any> {
+		const v = this.store.get(key);
+		if (v === undefined) return null;
+		return type === 'json' ? JSON.parse(v) : v;
+	}
+	async put(key: string, value: string): Promise<void> {
+		this.store.set(key, value);
+	}
+	async delete(key: string): Promise<void> {
+		this.store.delete(key);
+	}
+}
+
+interface RecordedCall {
+	url: string;
+	method: string;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	body: any;
+}
+
+const VALID_LLM_ENTRY = '2026-06-25 * "店" "咖啡"\n  Expenses:Food  35 CNY\n  Assets:Cash  -35 CNY';
+
+function jsonResponse(obj: unknown, status = 200): Response {
+	return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+function setupFetch(opts: { llmContent?: string; githubDownload?: 'ok' | 'fail' } = {}): {
+	calls: RecordedCall[];
+} {
+	const calls: RecordedCall[] = [];
+	const mock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+		const method = (init?.method ?? 'GET').toUpperCase();
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		let body: any;
+		if (typeof init?.body === 'string') {
+			try {
+				body = JSON.parse(init.body);
+			} catch {
+				body = init.body;
+			}
+		}
+		calls.push({ url, method, body });
+
+		if (url.includes('/sendMessage')) return jsonResponse({ ok: true, result: { message_id: 1 } });
+		if (url.includes('/editMessageReplyMarkup') || url.includes('/answerCallbackQuery')) return jsonResponse({ ok: true });
+		if (url.includes('/chat/completions')) return jsonResponse({ choices: [{ message: { content: opts.llmContent ?? '' } }] });
+		if (url.includes('api.github.com') && url.includes('/contents/')) {
+			if (method === 'PUT') return new Response('', { status: 200 });
+			if (opts.githubDownload === 'fail') return new Response('boom', { status: 500 });
+			return jsonResponse({ content: btoa('; existing ledger\n'), sha: 'sha123' });
+		}
+		return jsonResponse({});
+	});
+	vi.stubGlobal('fetch', mock as unknown as typeof fetch);
+	return { calls };
+}
+
+function seedAccounts(kv: FakeKV): void {
+	kv.store.set(
+		'accounts_cache',
+		JSON.stringify({
+			accounts: ['Expenses:Food', 'Assets:Cash', 'Assets:WeChat:Current', 'Equity:Opening-Balances'],
+			currencies: { 'Assets:Cash': 'CNY' },
+			comments: {},
+			timestamp: Date.now(),
+		}),
+	);
+}
+
+function makeEnv(kv: FakeKV): Record<string, unknown> {
+	return {
+		TELEGRAM_BOT_TOKEN: 'test-token',
+		GITHUB_TOKEN: 'gh-token',
+		REPO_OWNER: 'owner',
+		REPO_NAME: 'repo',
+		BRANCH_NAME: 'main',
+		FILE_PATH: 'main.bean',
+		TIMEZONE: 'UTC',
+		LLM_BACKENDS: JSON.stringify([{ LLM_API_BASE_URL: 'https://llm.example.com/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }]),
+		KV: kv,
+	};
+}
+
+const CHAT_ID = 4242;
+
+function sentMessages(calls: RecordedCall[]): string[] {
+	return calls.filter((c) => c.url.includes('/sendMessage')).map((c) => String(c.body?.text ?? ''));
+}
+
+function llmCalls(calls: RecordedCall[]): RecordedCall[] {
+	return calls.filter((c) => c.url.includes('/chat/completions'));
+}
+
+function githubPuts(calls: RecordedCall[]): RecordedCall[] {
+	return calls.filter((c) => c.url.includes('api.github.com') && c.url.includes('/contents/') && c.method === 'PUT');
+}
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+	vi.restoreAllMocks();
+});
+
+// --- P1: decline reason is read BEFORE date parsing ---
+
+describe('P1: decline reason read before date parsing', () => {
+	function seedPending(kv: FakeKV, pendingId: string): void {
+		kv.store.set(`decline_state:${CHAT_ID}`, pendingId);
+		kv.store.set(
+			`pending:${pendingId}`,
+			JSON.stringify({
+				chatId: CHAT_ID,
+				entryText: VALID_LLM_ENTRY,
+				commitMessage: 'Add entry by Telegram Bot\n\n',
+				userInput: '咖啡 35',
+				dateStr: '2026-06-25',
+				createdAt: Date.now(),
+			}),
+		);
+	}
+
+	it('passes a date-keyword-leading reason to recheck intact', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		seedPending(kv, 'pid-1');
+		const { calls } = setupFetch({ llmContent: VALID_LLM_ENTRY });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: '昨天买的，不是今天' }, makeEnv(kv) as never);
+
+		const llm = llmCalls(calls);
+		expect(llm).toHaveLength(1);
+		expect(JSON.stringify(llm[0].body)).toContain('昨天买的，不是今天');
+		// Reason was not reduced/emptied into the guard message
+		expect(sentMessages(calls).some((t) => t.startsWith('Please send a non-command reason text'))).toBe(false);
+		// decline state consumed
+		expect(kv.store.has(`decline_state:${CHAT_ID}`)).toBe(false);
+	});
+
+	it('passes an ISO-date-leading reason to recheck intact (worker-specific bug)', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		seedPending(kv, 'pid-2');
+		const { calls } = setupFetch({ llmContent: VALID_LLM_ENTRY });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: '2026-04-17 这个金额不对' }, makeEnv(kv) as never);
+
+		const llm = llmCalls(calls);
+		expect(llm).toHaveLength(1);
+		// Full raw reason (including the leading date token) reaches the LLM, not emptied
+		expect(JSON.stringify(llm[0].body)).toContain('2026-04-17 这个金额不对');
+		expect(sentMessages(calls).some((t) => t.startsWith('Please send a non-command reason text'))).toBe(false);
+	});
+});
+
+// --- P2: directive dispatch uses EXACT equality on post-date first word ---
+
+describe('P2: directive dispatch exact equality', () => {
+	it('"opened a beer 5 CNY" routes to the LLM path, not the open handler', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		const { calls } = setupFetch({ llmContent: VALID_LLM_ENTRY });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: 'opened a beer 5 CNY' }, makeEnv(kv) as never);
+
+		// Routed to LLM (transaction path), so the LLM was called...
+		expect(llmCalls(calls)).toHaveLength(1);
+		// ...and the open-handler validation error was NOT emitted
+		expect(sentMessages(calls).some((t) => t.includes('Invalid account name'))).toBe(false);
+	});
+
+	it('a real "open Assets:Cash:Wallet CNY" still hits the open handler', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		const { calls } = setupFetch({ githubDownload: 'ok' });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: 'open Assets:Cash:Wallet CNY' }, makeEnv(kv) as never);
+
+		// Open handler does a direct commit, never an LLM call
+		expect(llmCalls(calls)).toHaveLength(0);
+		expect(githubPuts(calls)).toHaveLength(1);
+		expect(sentMessages(calls).some((t) => t.includes('open Assets:Cash:Wallet CNY'))).toBe(true);
+	});
+});
+
+// --- P3: approve must not lose a validated draft on download failure ---
+
+describe('P3: approve preserves draft when GitHub download fails', () => {
+	function seedDraft(kv: FakeKV, pendingId: string): void {
+		kv.store.set(
+			`pending:${pendingId}`,
+			JSON.stringify({
+				chatId: CHAT_ID,
+				entryText: VALID_LLM_ENTRY,
+				commitMessage: 'Add entry by Telegram Bot\n\n',
+				userInput: '咖啡 35',
+				dateStr: '2026-06-25',
+				createdAt: Date.now(),
+			}),
+		);
+	}
+
+	it('keeps the pending entry and buttons intact on download failure', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		seedDraft(kv, 'pid-approve');
+		const { calls } = setupFetch({ githubDownload: 'fail' });
+
+		await handleCallbackQuery(
+			{ id: 'cb1', data: 'approve:pid-approve', message: { message_id: 99, chat: { id: CHAT_ID } } },
+			makeEnv(kv) as never,
+		);
+
+		// Draft still present (not claimed)
+		expect(kv.store.has('pending:pid-approve')).toBe(true);
+		// Buttons NOT stripped
+		expect(calls.some((c) => c.url.includes('/editMessageReplyMarkup'))).toBe(false);
+		// No upload attempted
+		expect(githubPuts(calls)).toHaveLength(0);
+		// User told about the failure
+		expect(sentMessages(calls)).toContain('Failed to download from GitHub.');
+	});
+
+	it('commits and strips buttons when download succeeds (control)', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		seedDraft(kv, 'pid-ok');
+		const { calls } = setupFetch({ githubDownload: 'ok' });
+
+		await handleCallbackQuery(
+			{ id: 'cb2', data: 'approve:pid-ok', message: { message_id: 100, chat: { id: CHAT_ID } } },
+			makeEnv(kv) as never,
+		);
+
+		expect(kv.store.has('pending:pid-ok')).toBe(false);
+		expect(calls.some((c) => c.url.includes('/editMessageReplyMarkup'))).toBe(true);
+		expect(githubPuts(calls)).toHaveLength(1);
+		expect(sentMessages(calls).some((t) => t.startsWith('Created entry:'))).toBe(true);
+	});
+});
+
+// --- W-EXTRA-1: /update validates the amount before committing ---
+
+describe('W-EXTRA-1: /update amount validation', () => {
+	it('rejects a non-numeric amount with Python-parity message and no commit', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		const { calls } = setupFetch({ githubDownload: 'ok' });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: '/update Cash Opening-Balances notanumber CNY' }, makeEnv(kv) as never);
+
+		expect(sentMessages(calls)).toContain('Invalid amount: notanumber. Must be a valid number.');
+		expect(githubPuts(calls)).toHaveLength(0);
+	});
+
+	it('accepts a valid numeric amount and commits a balance directive', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		const { calls } = setupFetch({ githubDownload: 'ok' });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: '/update Cash Opening-Balances 500 CNY' }, makeEnv(kv) as never);
+
+		expect(githubPuts(calls)).toHaveLength(1);
+		expect(sentMessages(calls).some((t) => t.includes('balance Assets:Cash 500 CNY'))).toBe(true);
+	});
+});
+
+// --- W-EXTRA-2: custom-date single-line parsing extracts only the date token ---
+
+describe('W-EXTRA-2: custom-date single-line extracts only the date token', () => {
+	// Per the spec, the first-line remainder after the date is dropped (matching
+	// Python's ISO-date layer), so text is empty here; the regression guard is that
+	// dateStr is the clean 10-char token, NOT the garbage whole-line.
+	it('"2026-04-17 买咖啡" yields a clean 10-char ISO dateStr, not a garbage string', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		const { calls } = setupFetch({ llmContent: VALID_LLM_ENTRY });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: '2026-04-17 买咖啡' }, makeEnv(kv) as never);
+
+		const llm = llmCalls(calls);
+		expect(llm).toHaveLength(1);
+		const promptBlob = JSON.stringify(llm[0].body);
+		// Clean 10-char ISO date used as the transaction date
+		expect(promptBlob).toContain('Transaction date is 2026-04-17. Use this exact date');
+		// The buggy "date + trailing text" whole-line form must NOT appear
+		expect(promptBlob).not.toContain('Transaction date is 2026-04-17 买咖啡');
+	});
+
+	it('a multi-line date-prefixed message keeps the subsequent lines as input', async () => {
+		const kv = new FakeKV();
+		seedAccounts(kv);
+		const { calls } = setupFetch({ llmContent: VALID_LLM_ENTRY });
+
+		await handleMessage({ chat: { id: CHAT_ID }, text: '2026-04-17 买咖啡\nExpenses:Food 35 CNY' }, makeEnv(kv) as never);
+
+		const llm = llmCalls(calls);
+		expect(llm).toHaveLength(1);
+		const promptBlob = JSON.stringify(llm[0].body);
+		expect(promptBlob).toContain('Transaction date is 2026-04-17. Use this exact date');
+		// First-line remainder dropped, but subsequent lines preserved as input
+		expect(promptBlob).toContain('Expenses:Food 35 CNY');
 	});
 });
