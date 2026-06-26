@@ -115,6 +115,10 @@ _pdt_consts.DOWParseStyle = -1  # "Monday" → today or the *last* Monday
 _pdt_calendar = pdt.Calendar(_pdt_consts, version=pdt.VERSION_CONTEXT_STYLE)
 
 
+def _join_remaining(rest_of_first: str, lines: list) -> str:
+    return "\n".join(([rest_of_first] if rest_of_first else []) + lines[1:]).strip()
+
+
 def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     """Parse a natural-language date from the first line of *text*.
 
@@ -159,9 +163,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
             d = now + _delta
             date_str = d.strftime('%Y-%m-%d')
             rest_of_first = first_line[len(_kw):].strip()
-            remaining_lines = [rest_of_first] if rest_of_first else []
-            remaining_lines.extend(lines[1:])
-            remaining = '\n'.join(remaining_lines).strip()
+            remaining = _join_remaining(rest_of_first, lines)
             log(f"Custom date detected (Chinese keyword): {date_str}")
             return date_str, True, remaining
     _chinese_weekday_re = re.match(
@@ -187,9 +189,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
             d = now + timedelta(days=delta)
         date_str = d.strftime('%Y-%m-%d')
         rest_of_first = rest_of_first.strip()
-        remaining_lines = [rest_of_first] if rest_of_first else []
-        remaining_lines.extend(lines[1:])
-        remaining = '\n'.join(remaining_lines).strip()
+        remaining = _join_remaining(rest_of_first, lines)
         log(f"Custom date detected (Chinese weekday): {date_str}")
         return date_str, True, remaining
     # Check for "N天前" / "N天后" pattern
@@ -200,9 +200,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         rest_of_first = _chinese_ago_re.group(2).strip()
         d = now - timedelta(days=days)
         date_str = d.strftime('%Y-%m-%d')
-        remaining_lines = [rest_of_first] if rest_of_first else []
-        remaining_lines.extend(lines[1:])
-        remaining = '\n'.join(remaining_lines).strip()
+        remaining = _join_remaining(rest_of_first, lines)
         log(f"Custom date detected (Chinese N天前): {date_str}")
         return date_str, True, remaining
     if _chinese_later_re:
@@ -210,9 +208,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         rest_of_first = _chinese_later_re.group(2).strip()
         d = now + timedelta(days=days)
         date_str = d.strftime('%Y-%m-%d')
-        remaining_lines = [rest_of_first] if rest_of_first else []
-        remaining_lines.extend(lines[1:])
-        remaining = '\n'.join(remaining_lines).strip()
+        remaining = _join_remaining(rest_of_first, lines)
         log(f"Custom date detected (Chinese N天后): {date_str}")
         return date_str, True, remaining
 
@@ -303,6 +299,16 @@ GITHUB_HEADERS = {
 }
 
 _DIRECTIVE_HEADER_RE = re.compile(r'^\d{4}-\d{2}-\d{2} ')
+
+_TXN_HEADER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+(?:[*!]|txn)\s+")
+
+
+def _is_txn_header(line: str) -> bool:
+    return bool(_TXN_HEADER_RE.match(line.strip()))
+
+
+def _code_block(text: str) -> str:
+    return f"<pre><code>{html.escape(text)}</code></pre>"
 
 
 def extract_all_directive_blocks(content: str) -> list[tuple[str, str]]:
@@ -717,7 +723,7 @@ class Bot:
         # Insert datetime after the transaction header, even when leading comment lines exist.
         header_idx = None
         for idx, line in enumerate(lines):
-            if re.match(r'^\d{4}-\d{2}-\d{2}\s+[*!]\s+', line.strip()) or re.match(r'^\d{4}-\d{2}-\d{2}\s+txn\s+', line.strip()):
+            if _is_txn_header(line):
                 header_idx = idx
                 break
 
@@ -740,7 +746,7 @@ class Bot:
 
         header_idx = None
         for idx, line in enumerate(lines):
-            if re.match(r'^\d{4}-\d{2}-\d{2}\s+[*!]\s+', line.strip()) or re.match(r'^\d{4}-\d{2}-\d{2}\s+txn\s+', line.strip()):
+            if _is_txn_header(line):
                 header_idx = idx
                 break
 
@@ -967,14 +973,7 @@ class Bot:
                 )
 
             log(f"{draft_label}:\n" + appendix)
-            self.send_message(
-                chat_id,
-                f"{draft_label}:\n"
-                f"<pre><code>{html.escape(appendix)}</code></pre>\n"
-                "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
-                reply_markup=self.build_review_buttons(pending_id),
-                parse_mode="HTML",
-            )
+            self.send_draft_for_review(chat_id, f"{draft_label}:", appendix, pending_id)
         except Exception as e:
             log(f"Photo processing failed: {e}")
             reply(f"Failed to process screenshot: {e}")
@@ -1011,7 +1010,7 @@ class Bot:
             }
         self.send_message(
             chat_id,
-            f"撤回最后一条指令？\n<pre><code>{html.escape(directive_text)}</code></pre>",
+            f"撤回最后一条指令？\n{_code_block(directive_text)}",
             reply_markup=self.build_undo_buttons(pending_id),
             parse_mode="HTML",
         )
@@ -1032,7 +1031,7 @@ class Bot:
         if len(text) > 4000:
             text = text[:4000]
             truncated = True
-        msg = f"最近 {len(last_blocks)} 条记录：\n<pre><code>{html.escape(text)}</code></pre>"
+        msg = f"最近 {len(last_blocks)} 条记录：\n{_code_block(text)}"
         if truncated:
             msg += "\n（内容过长，已截断显示）"
         self.send_message(
@@ -1055,7 +1054,7 @@ class Bot:
         text = "\n\n".join(block_text for _, block_text in today_blocks)
         self.send_message(
             chat_id,
-            f"今天（{today}）共 {len(today_blocks)} 条记录：\n<pre><code>{html.escape(text)}</code></pre>",
+            f"今天（{today}）共 {len(today_blocks)} 条记录：\n{_code_block(text)}",
             parse_mode="HTML",
         )
 
@@ -1105,11 +1104,14 @@ class Bot:
         with self._pending_lock:
             return self.pending_llm_entries.pop(pending_id, None)
 
+    def _remove_decline_reason_bindings_locked(self, pending_id):
+        for k, v in list(self.pending_decline_reasons.items()):
+            if v == pending_id:
+                self.pending_decline_reasons.pop(k, None)
+
     def remove_decline_reason_bindings(self, pending_id: str):
         with self._pending_lock:
-            for reason_chat_id, reason_pending_id in list(self.pending_decline_reasons.items()):
-                if reason_pending_id == pending_id:
-                    self.pending_decline_reasons.pop(reason_chat_id, None)
+            self._remove_decline_reason_bindings_locked(pending_id)
 
     def add_non_pnl_accounts_to_commit_message(self, commit_message: str, entry_text: str) -> str:
         for account in self.extract_accounts_from_entry(entry_text):
@@ -1130,9 +1132,7 @@ class Bot:
             ]
             expired_entries = {pid: self.pending_llm_entries.pop(pid) for pid in expired_ids}
             for pid in expired_ids:
-                for reason_chat_id, reason_pending_id in list(self.pending_decline_reasons.items()):
-                    if reason_pending_id == pid:
-                        self.pending_decline_reasons.pop(reason_chat_id, None)
+                self._remove_decline_reason_bindings_locked(pid)
 
         for pending_id, pending in expired_entries.items():
             chat_id = pending.get("chat_id")
@@ -1147,6 +1147,9 @@ class Bot:
                 {"text": "❌", "callback_data": f"discard:{pending_id}"},
             ]]
         }
+
+    def send_draft_for_review(self, chat_id, header, appendix, pending_id):
+        self.send_message(chat_id, f"{header}\n{_code_block(appendix)}\nUse ✅ to save, 🔧 to provide feedback, or ❌ to discard.", reply_markup=self.build_review_buttons(pending_id), parse_mode="HTML")
 
     def build_undo_buttons(self, pending_id: str):
         return {
@@ -1198,14 +1201,7 @@ class Bot:
                 self.pending_llm_entries.pop(pending_id, None)
 
             log("LLM rechecked draft:\n" + new_appendix)
-            self.send_message(
-                chat_id,
-                "LLM rechecked draft:\n"
-                f"<pre><code>{html.escape(new_appendix)}</code></pre>\n"
-                "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
-                reply_markup=self.build_review_buttons(new_pending_id),
-                parse_mode="HTML",
-            )
+            self.send_draft_for_review(chat_id, "LLM rechecked draft:", new_appendix, new_pending_id)
         except Exception as e:
             self._pop_pending(pending_id)
             log(f"LLM recheck failed: {e}")
@@ -1239,9 +1235,7 @@ class Bot:
 
             if self.is_pending_expired(pending):
                 self.pending_llm_entries.pop(pending_id, None)
-                for rc, rp in list(self.pending_decline_reasons.items()):
-                    if rp == pending_id:
-                        self.pending_decline_reasons.pop(rc, None)
+                self._remove_decline_reason_bindings_locked(pending_id)
                 self.answer_callback_query(callback_id, "Expired")
                 self.send_message(chat_id, f"Draft expired after {DRAFT_TTL_SECONDS} seconds and was discarded.")
                 return
@@ -1291,7 +1285,7 @@ class Bot:
                 self.answer_callback_query(callback_id, "已撤回")
                 self.send_message(
                     chat_id,
-                    f"已撤回以下指令：\n<pre><code>{html.escape(pending['transaction_text'])}</code></pre>",
+                    f"已撤回以下指令：\n{_code_block(pending['transaction_text'])}",
                     parse_mode="HTML",
                 )
                 log("Undo committed. Removed:\n" + pending["transaction_text"])
@@ -1319,7 +1313,7 @@ class Bot:
 
         if ok:
             self.answer_callback_query(callback_id, "Approved")
-            self.send_message(chat_id, f"Created entry:\n<pre><code>{html.escape(appendix)}</code></pre>", parse_mode="HTML")
+            self.send_message(chat_id, f"Created entry:\n{_code_block(appendix)}", parse_mode="HTML")
             log("Logged entry:\n" + appendix)
         else:
             self.answer_callback_query(callback_id, "Failed")
@@ -1601,14 +1595,7 @@ class Bot:
                     )
 
                 log("LLM draft:\n" + appendix)
-                self.send_message(
-                    chat_id,
-                    "LLM draft (checked padding):\n"
-                    f"<pre><code>{html.escape(appendix)}</code></pre>\n"
-                    "Use ✅ to save, 🔧 to provide feedback, or ❌ to discard.",
-                    reply_markup=self.build_review_buttons(pending_id),
-                    parse_mode="HTML",
-                )
+                self.send_draft_for_review(chat_id, "LLM draft (checked padding):", appendix, pending_id)
                 return
             except Exception as e:
                 log(f"LLM generation failed: {e}")
@@ -1711,7 +1698,7 @@ class Bot:
         if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip(), target_file_path):
             self.send_message(
                 chat_id,
-                f"Created entry:\n<pre><code>{html.escape(appendix)}</code></pre>" if appendix else "Created entry",
+                f"Created entry:\n{_code_block(appendix)}" if appendix else "Created entry",
                 parse_mode="HTML",
             )
             log("Logged entry:\n" + appendix)
@@ -1745,17 +1732,17 @@ class Bot:
         if self.debug:
             log(updates)
 
+        if updates["result"]:
+            self.update_id = max(u["update_id"] for u in updates["result"])
+
         for message in edited_messages:
-            self.update_id = message["update_id"]
             log(message)
 
         for callback in callback_queries:
-            self.update_id = callback["update_id"]
             hd = threading.Thread(target=self.handle_callback_query, args=(callback,), daemon=True)
             hd.start()
 
         for message in messages:
-            self.update_id = message["update_id"]
             chat = message["message"]["chat"]
             chat_id = chat["id"]
             first_name = chat.get("first_name", "")

@@ -2,6 +2,7 @@ interface LLMBackend {
 	LLM_API_BASE_URL: string;
 	LLM_API_KEY: string;
 	LLM_MODEL: string;
+	LLM_VISION_MODEL?: string;
 }
 
 interface Env {
@@ -237,13 +238,15 @@ async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string
 		}
 	}
 
+	const githubFileHeaders = {
+		Authorization: `token ${env.GITHUB_TOKEN}`,
+		Accept: 'application/vnd.github+json',
+		'X-GitHub-Api-Version': '2022-11-28',
+	};
+
 	const url = `https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/accounts?ref=${env.BRANCH_NAME}`;
 	const response = await fetch(url, {
-		headers: {
-			Authorization: `token ${env.GITHUB_TOKEN}`,
-			Accept: 'application/vnd.github+json',
-			'X-GitHub-Api-Version': '2022-11-28',
-		},
+		headers: githubFileHeaders,
 	});
 
 	if (!response.ok) {
@@ -253,12 +256,6 @@ async function parseAccountsWithCurrencies(env: Env): Promise<{ accounts: string
 
 	const files = (await response.json()) as Array<{ name: string; url: string }>;
 	const beanFiles = files.filter((f) => f.name.endsWith('.bean'));
-
-	const githubFileHeaders = {
-		Authorization: `token ${env.GITHUB_TOKEN}`,
-		Accept: 'application/vnd.github+json',
-		'X-GitHub-Api-Version': '2022-11-28',
-	};
 
 	const fileContents = await Promise.all(
 		beanFiles.map(async (file) => {
@@ -449,7 +446,7 @@ export function buildUserPrompt(
 const EXPENSE_SCREENSHOT_SYSTEM_PROMPT =
 	'你是一个 Beancount 消费截图助手，分析消费通知截图（银行推送、信用卡提醒、支付确认）生成一条 beancount 交易。\n' +
 	'只使用提供的账户列表中的账户，禁止自创账户。\n\n' +
-	'从截图中提取：商家名称、金额和货币、支付来源（银行/���名）。\n' +
+	'从截图中提取：商家名称、金额和货币、支付来源（银行/卡名）。\n' +
 	'将支付来源映射到账户列表中最匹配的 Liabilities（信用卡）或 Assets（借记卡/银行）账户。\n' +
 	'选择最匹配商家类型的 Expenses 账户。\n\n' +
 	'narration：如果用户附带了 caption 消息，用 caption 作为 narration；' +
@@ -504,7 +501,7 @@ export function getLLMBackends(env: Env): LLMBackend[] {
 	return [];
 }
 
-async function callLLMRaw(env: Env, messages: unknown[], temperature: number): Promise<string> {
+async function callLLMRaw(env: Env, messages: unknown[], temperature: number, vision = false): Promise<string> {
 	const backends = getLLMBackends(env);
 	if (backends.length === 0) {
 		throw new Error('LLM is not configured. Please set LLM_BACKENDS.');
@@ -520,7 +517,7 @@ async function callLLMRaw(env: Env, messages: unknown[], temperature: number): P
 					Authorization: `Bearer ${backend.LLM_API_KEY}`,
 					'Content-Type': 'application/json',
 				},
-				body: JSON.stringify({ model: backend.LLM_MODEL, temperature, messages }),
+				body: JSON.stringify({ model: vision ? (backend.LLM_VISION_MODEL || backend.LLM_MODEL) : backend.LLM_MODEL, temperature, messages }),
 			});
 
 			if (!response.ok) {
@@ -781,7 +778,7 @@ async function callLLMVisionGeneric(
 			],
 		},
 	];
-	const rawText = await callLLMRaw(env, messages, temperature);
+	const rawText = await callLLMRaw(env, messages, temperature, true);
 	try {
 		return normalizeAndValidateLLMEntry(rawText, accounts);
 	} catch (e) {
@@ -1141,7 +1138,7 @@ async function handlePhotoMessage(
 		getTimezoneForChat(env, chatId),
 		parseAccountsWithCurrencies(env),
 	]);
-	const { dateStr, timeStr, datetimeStr } = formatInTimezone(tz);
+	const { dateStr, datetimeStr } = formatInTimezone(tz);
 
 	if (accounts.length === 0) {
 		await reply('No accounts available. Please check GitHub account parsing first.');
@@ -1174,8 +1171,8 @@ async function handlePhotoMessage(
 		} else {
 			const entry = await callLLMVisionExpense(env, imageBuffer, accounts, currencies, dateStr, caption, comments, datetimeStr);
 			const entryWithComment = caption ? insertPromptMetadata(entry, caption) : entry;
-			const cm = buildCommitMessage('Add expense entry by Telegram Bot\n\n', entryWithComment);
-			await sendDraftForReview(env, chatId, 'Expense draft', entryWithComment, caption || '(expense screenshot)', cm, dateStr);
+			const cm = buildCommitMessage('Add entry by Telegram Bot\n\n', entryWithComment);
+			await sendDraftForReview(env, chatId, 'Expense screenshot draft', entryWithComment, caption || '(expense screenshot)', cm, dateStr);
 		}
 	} catch (e) {
 		const errMsg = e instanceof Error ? e.message : String(e);
