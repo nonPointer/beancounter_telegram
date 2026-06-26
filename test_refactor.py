@@ -1,4 +1,5 @@
 """Tests for 1.1 / 1.3 / 1.4 / 5.6 refactoring in main.py."""
+import base64
 import json
 import sys
 import time
@@ -1525,6 +1526,172 @@ class TestRelativeDayCountBounded(unittest.TestCase):
         self.assertTrue(custom)
         self.assertEqual(date, "2026-03-23")
         self.assertEqual(remaining, "晚饭")
+
+
+class TestParseAccountsConditionalRefresh(unittest.TestCase):
+    """M1 — conditional re-parse: skip per-file fetch when the dir sha map is unchanged."""
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    @staticmethod
+    def _dir_resp(items):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = items
+        return resp
+
+    @staticmethod
+    def _file_resp(content_text):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "content": base64.b64encode(content_text.encode("utf-8")).decode("ascii")
+        }
+        return resp
+
+    def _make_get(self, dir_items, file_contents, counter):
+        def fake_get(url, **kwargs):
+            if "contents/accounts" in url:
+                counter["dir"] += 1
+                return self._dir_resp(dir_items)
+            counter["file"] += 1
+            return self._file_resp(file_contents[url])
+        return fake_get
+
+    def test_unchanged_map_skips_reparse(self):
+        dir_items = [
+            {"name": "assets.bean", "sha": "sha-a", "url": "http://files/assets"},
+            {"name": "expenses.bean", "sha": "sha-e", "url": "http://files/expenses"},
+        ]
+        file_contents = {
+            "http://files/assets": "2024-01-01 open Assets:Cash CNY\n",
+            "http://files/expenses": "2024-01-01 open Expenses:Food CNY\n",
+        }
+        counter = {"dir": 0, "file": 0}
+        with patch.object(main.HTTP, "get", side_effect=self._make_get(dir_items, file_contents, counter)):
+            first = self.bot.parse_accounts()
+            self.assertEqual(first, ["Assets:Cash", "Expenses:Food"])
+            self.assertEqual(counter["file"], 2)
+
+            # Force TTL expiry so the next call goes down the refresh path.
+            self.bot._accounts_cache["ts"] = 0
+            second = self.bot.parse_accounts()
+
+        # Directory listing fetched again, but per-file fetch NOT repeated.
+        self.assertEqual(counter["dir"], 2)
+        self.assertEqual(counter["file"], 2)
+        # Output byte-identical (same cached object reused) when nothing changed.
+        self.assertEqual(second, ["Assets:Cash", "Expenses:Food"])
+        self.assertIs(second, first)
+
+    def test_changed_map_triggers_reparse(self):
+        dir_items = [
+            {"name": "assets.bean", "sha": "sha-a", "url": "http://files/assets"},
+            {"name": "expenses.bean", "sha": "sha-e", "url": "http://files/expenses"},
+        ]
+        file_contents = {
+            "http://files/assets": "2024-01-01 open Assets:Cash CNY\n",
+            "http://files/expenses": "2024-01-01 open Expenses:Food CNY\n",
+        }
+        counter = {"dir": 0, "file": 0}
+        with patch.object(main.HTTP, "get", side_effect=self._make_get(dir_items, file_contents, counter)):
+            first = self.bot.parse_accounts()
+            self.assertEqual(first, ["Assets:Cash", "Expenses:Food"])
+            self.assertEqual(counter["file"], 2)
+
+            # Remove a file from the directory listing -> full map changes.
+            dir_items.pop()  # drop expenses.bean
+            self.bot._accounts_cache["ts"] = 0
+            second = self.bot.parse_accounts()
+
+        # Map changed -> reparse: at least one more per-file fetch happened.
+        self.assertEqual(counter["dir"], 2)
+        self.assertEqual(counter["file"], 3)
+        # Deleted account is gone (full-map equality detects deletions, no stale data).
+        self.assertEqual(second, ["Assets:Cash"])
+
+    def test_partial_fetch_failure_not_cached(self):
+        dir_items = [
+            {"name": "assets.bean", "sha": "sha-a", "url": "http://files/assets"},
+            {"name": "expenses.bean", "sha": "sha-e", "url": "http://files/expenses"},
+        ]
+        ok_content = "2024-01-01 open Assets:Cash CNY\n"
+
+        def fake_get(url, **kwargs):
+            if "contents/accounts" in url:
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = dir_items
+                return resp
+            if url.endswith("/expenses"):
+                resp = MagicMock()
+                resp.status_code = 500
+                resp.text = "boom"
+                return resp
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "content": base64.b64encode(ok_content.encode("utf-8")).decode("ascii")
+            }
+            return resp
+
+        with patch.object(main.HTTP, "get", side_effect=fake_get):
+            self.bot.parse_accounts()
+
+        # A partial fetch must NOT lock a sha map in for the whole TTL.
+        self.assertIsNone(self.bot._accounts_cache.get("sha_map"))
+
+
+class TestVisionRetryDropsImage(unittest.TestCase):
+    """M2 — vision retry sends text-only (no re-embedded screenshot) but keeps the prompt."""
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_retry_omits_image_keeps_prompt(self):
+        captured_payloads = []
+
+        def fake_backends(payload, *args, **kwargs):
+            captured_payloads.append(payload)
+            return "RAW"
+
+        # Syntax validation fails on the first attempt, passes on the second.
+        validation_results = ["some syntax error", None]
+
+        def fake_syntax(entry):
+            return validation_results.pop(0)
+
+        base_prompt = "ACCOUNT LIST AND INSTRUCTIONS"
+        self.bot.llm_enabled = True
+        with patch.object(self.bot, "_call_llm_backends", side_effect=fake_backends), \
+             patch.object(self.bot, "normalize_and_validate_llm_entry", return_value="ENTRY"), \
+             patch.object(self.bot, "validate_beancount_syntax", side_effect=fake_syntax), \
+             patch.object(self.bot, "validate_accounts_exist", return_value=None):
+            result = self.bot._call_vision_with_retry(
+                b"\x00\x01imagebytes", ["Assets:Cash"],
+                system_prompt="SYS", base_prompt=base_prompt,
+                temperature=0.1, log_label="vision",
+            )
+
+        self.assertEqual(result, "ENTRY")
+        self.assertEqual(len(captured_payloads), 2)
+
+        # Attempt 0: image present, prompt text present.
+        attempt0_content = captured_payloads[0]["messages"][1]["content"]
+        types0 = [block["type"] for block in attempt0_content]
+        self.assertIn("image_url", types0)
+        text0 = next(b["text"] for b in attempt0_content if b["type"] == "text")
+        self.assertIn(base_prompt, text0)
+
+        # Attempt 1: NO image, but the full prompt text is retained.
+        attempt1_content = captured_payloads[1]["messages"][1]["content"]
+        types1 = [block["type"] for block in attempt1_content]
+        self.assertNotIn("image_url", types1)
+        text1 = next(b["text"] for b in attempt1_content if b["type"] == "text")
+        self.assertIn(base_prompt, text1)
 
 
 if __name__ == "__main__":

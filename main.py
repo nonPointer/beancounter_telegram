@@ -398,7 +398,7 @@ class Bot:
         self.pending_llm_id = 0
         self.pending_decline_reasons = {}
         self._pending_lock = threading.Lock()
-        self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0}
+        self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0, "sha_map": None}
         self._accounts_cache_lock = threading.Lock()
         self._file_etag_cache = {}  # file_path -> {"etag": str, "content": str, "sha": str}
         self.llm_enabled = LLM_ENABLED
@@ -438,10 +438,22 @@ class Bot:
             return []
         bean_items = [item for item in r.json() if item["name"].endswith(".bean")]
 
+        # Conditional refresh: the cheap directory listing already tells us the
+        # sha of every account file. If the full name->sha map is byte-for-byte
+        # identical to what we last parsed, the cached parsed accounts are still
+        # valid, so we skip the per-file downloads + reparse. Full-dict equality
+        # (not per-file sha matching) is required so that file additions AND
+        # deletions both invalidate the cache and we never serve stale accounts.
+        new_map = {item["name"]: item["sha"] for item in bean_items}
+        with self._accounts_cache_lock:
+            if self._accounts_cache["accounts"] is not None and self._accounts_cache.get("sha_map") == new_map:
+                self._accounts_cache["ts"] = now
+                return self._accounts_cache["accounts"]
+
         def fetch_account_file(item):
             file_r = HTTP.get(item["url"], headers=list_headers, timeout=30)
             if file_r.status_code != 200:
-                return {}, []
+                return {}, [], False
             content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
             opened = {}
             closed = []
@@ -460,14 +472,17 @@ class Bot:
                     opened[account] = (currency, comment)
                 elif directive == 'close':
                     closed.append(account)
-            return opened, closed
+            return opened, closed, True
 
         all_opened = {}
         all_closed = set()
+        fetch_ok = True
         with ThreadPoolExecutor(max_workers=min(8, len(bean_items) or 1)) as pool:
             futures = {pool.submit(fetch_account_file, item): item for item in bean_items}
             for future in as_completed(futures):
-                opened, closed = future.result()
+                opened, closed, ok = future.result()
+                if not ok:
+                    fetch_ok = False
                 all_opened.update(opened)
                 all_closed.update(closed)
 
@@ -478,6 +493,9 @@ class Bot:
             self._accounts_cache["accounts"] = accounts
             self._accounts_cache["currencies"] = currencies
             self._accounts_cache["comments"] = comments
+            # Only lock in the sha map when every file fetched cleanly; caching a
+            # partial parse's map would serve incomplete accounts for the whole TTL.
+            self._accounts_cache["sha_map"] = new_map if fetch_ok else None
             self._accounts_cache["ts"] = now
         return accounts
 
@@ -870,17 +888,27 @@ class Bot:
                     "Fix the errors and regenerate."
                 )
 
+            if attempt == 0:
+                user_content = [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    {"type": "text", "text": prompt_text},
+                ]
+            else:
+                # Retries are driven only by textual validation errors
+                # (syntax / account-exists), which the pixels rarely help fix.
+                # Drop the image on retry to avoid re-billing up to 3x image
+                # tokens; the full prompt text (incl. account list) is kept so
+                # account-exists corrections still work.
+                log(f"Retry attempt {attempt}: dropping screenshot, sending text-only correction")
+                user_content = [
+                    {"type": "text", "text": prompt_text},
+                ]
+
             payload = {
                 "temperature": temperature,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                            {"type": "text", "text": prompt_text},
-                        ],
-                    },
+                    {"role": "user", "content": user_content},
                 ],
             }
 

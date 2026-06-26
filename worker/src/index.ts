@@ -37,6 +37,16 @@ interface StoredPendingEntry {
 	createdAt: number;
 }
 
+interface StoredUndoEntry {
+	kind: 'undo';
+	chatId: number;
+	transactionText: string;
+	newContent: string;
+	fileSha: string;
+	commitMessage: string;
+	createdAt: number;
+}
+
 // --- Constants ---
 
 const ACCOUNTS_CACHE_TTL = 300; // 5 minutes
@@ -55,6 +65,93 @@ const ACCOUNT_TYPE_MAP: Record<string, string> = {
 
 export function escapeHtml(text: string): string {
 	return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+export function codeBlock(text: string): string {
+	return `<pre><code>${escapeHtml(text)}</code></pre>`;
+}
+
+// --- Directive block extraction (parity with Python extract_*_directive_block) ---
+
+const DIRECTIVE_HEADER_RE = /^\d{4}-\d{2}-\d{2} /;
+
+/** Mirror Python str.splitlines(): split on line boundaries, drop a single trailing empty element. */
+export function splitLines(s: string): string[] {
+	if (s === '') return [];
+	const parts = s.split(/\r\n|\r|\n/);
+	if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
+	return parts;
+}
+
+/**
+ * Returns [dateStr, blockText] for every directive, in file order. Each block includes any
+ * leading ';' comment lines immediately before the directive header. Mirrors Python
+ * extract_all_directive_blocks exactly.
+ */
+export function extractAllDirectiveBlocks(content: string): Array<[string, string]> {
+	const lines = splitLines(content);
+	const blocks: Array<[string, string]> = [];
+	let i = 0;
+	while (i < lines.length) {
+		if (DIRECTIVE_HEADER_RE.test(lines[i])) {
+			const dateStr = lines[i].slice(0, 10);
+			// Look backward for leading ';' comment lines
+			let commentStart = i;
+			while (commentStart > 0 && lines[commentStart - 1].startsWith(';')) commentStart -= 1;
+			// Find block end: continuation lines are indented or blank
+			let blockEnd = i + 1;
+			while (blockEnd < lines.length) {
+				const line = lines[blockEnd];
+				if (line.trim() === '') blockEnd += 1;
+				else if (line[0] === ' ' || line[0] === '\t') blockEnd += 1;
+				else break;
+			}
+			// Trim trailing blank lines from block
+			while (blockEnd > i + 1 && lines[blockEnd - 1].trim() === '') blockEnd -= 1;
+			blocks.push([dateStr, lines.slice(commentStart, blockEnd).join('\n')]);
+			i = blockEnd;
+		} else {
+			i += 1;
+		}
+	}
+	return blocks;
+}
+
+/**
+ * Returns { directiveText, newContent } for the last directive (with its leading ';' comment
+ * lines and leading blank separator removed from newContent), or null when none is found.
+ * Mirrors Python extract_last_directive_block exactly.
+ */
+export function extractLastDirectiveBlock(content: string): { directiveText: string; newContent: string } | null {
+	const lines = splitLines(content);
+	let lastIdx = -1;
+	for (let i = lines.length - 1; i >= 0; i--) {
+		if (DIRECTIVE_HEADER_RE.test(lines[i])) {
+			lastIdx = i;
+			break;
+		}
+	}
+	if (lastIdx === -1) return null;
+	// Look backward for leading ';' comment lines
+	let commentStart = lastIdx;
+	while (commentStart > 0 && lines[commentStart - 1].startsWith(';')) commentStart -= 1;
+	// Find block end: stop at next col-0 non-blank line
+	let blockEnd = lastIdx + 1;
+	while (blockEnd < lines.length) {
+		const line = lines[blockEnd];
+		if (line.trim() === '') blockEnd += 1;
+		else if (line[0] !== ' ' && line[0] !== '\t') break;
+		else blockEnd += 1;
+	}
+	// Trim trailing blank lines from block
+	while (blockEnd > lastIdx + 1 && lines[blockEnd - 1].trim() === '') blockEnd -= 1;
+	const directiveText = lines.slice(commentStart, blockEnd).join('\n');
+	// Remove block + its leading blank separator
+	let removeStart = commentStart;
+	if (removeStart > 0 && lines[removeStart - 1].trim() === '') removeStart -= 1;
+	const newLines = [...lines.slice(0, removeStart), ...lines.slice(blockEnd)];
+	const newContent = newLines.join('\n').replace(/\n+$/, '') + '\n';
+	return { directiveText, newContent };
 }
 
 // --- Base64 (UTF-8 safe) ---
@@ -949,6 +1046,21 @@ function buildReviewButtons(pendingId: string): object {
 	};
 }
 
+function buildUndoButtons(pendingId: string): object {
+	return {
+		inline_keyboard: [
+			[
+				{ text: '✅ 确认撤回', callback_data: `undo_confirm:${pendingId}` },
+				{ text: '❌ 取消', callback_data: `undo_cancel:${pendingId}` },
+			],
+		],
+	};
+}
+
+async function savePendingUndo(env: Env, pendingId: string, entry: StoredUndoEntry): Promise<void> {
+	await env.KV.put(`pending:${pendingId}`, JSON.stringify(entry), { expirationTtl: DRAFT_TTL_SECONDS });
+}
+
 async function savePendingEntry(env: Env, pendingId: string, entry: StoredPendingEntry): Promise<void> {
 	await env.KV.put(`pending:${pendingId}`, JSON.stringify(entry), { expirationTtl: DRAFT_TTL_SECONDS });
 }
@@ -1074,6 +1186,33 @@ export async function handleCallbackQuery(
 		return;
 	}
 
+	if (action === 'undo_cancel') {
+		await Promise.all([
+			deletePendingEntry(env, pendingId),
+			answerCallbackQuery(env, callbackId, '已取消'),
+			sendMessage(env, chatId, '已取消，未作任何更改。'),
+		]);
+		return;
+	}
+
+	if (action === 'undo_confirm') {
+		const undo = pending as unknown as StoredUndoEntry;
+		const ok = await githubUploadFile(env, undo.newContent, undo.fileSha, undo.commitMessage);
+		await deletePendingEntry(env, pendingId);
+		if (ok) {
+			await Promise.all([
+				answerCallbackQuery(env, callbackId, '已撤回'),
+				sendMessage(env, chatId, `已撤回以下指令：\n${codeBlock(undo.transactionText)}`, { parseMode: 'HTML' }),
+			]);
+		} else {
+			await Promise.all([
+				answerCallbackQuery(env, callbackId, '失败'),
+				sendMessage(env, chatId, 'Failed to upload to GitHub.'),
+			]);
+		}
+		return;
+	}
+
 	if (action === 'decline_reason') {
 		await Promise.all([
 			answerCallbackQuery(env, callbackId, 'Please send reason'),
@@ -1188,6 +1327,92 @@ async function handlePhotoMessage(
 		const label = isInvest ? 'investment order' : 'expense screenshot';
 		await reply(`Failed to process ${label}: ${errMsg}`);
 	}
+}
+
+// --- /undo, /last, /today (parity with Python handle_undo/handle_last/handle_today) ---
+
+async function handleUndo(env: Env, chatId: number): Promise<void> {
+	const f = await githubDownloadFile(env);
+	if (!f) {
+		await sendMessage(env, chatId, 'Failed to download main.bean from GitHub.');
+		return;
+	}
+	const result = extractLastDirectiveBlock(f.content);
+	if (result === null) {
+		await sendMessage(env, chatId, 'main.bean 中没有找到任何指令。');
+		return;
+	}
+	const { directiveText, newContent } = result;
+	const headerLine = directiveText.split('\n')[0];
+	const quoted = [...headerLine.matchAll(/"((?:\\.|[^"\\])*)"/g)].map((m) => m[1]);
+	let description: string;
+	if (quoted.length >= 2) {
+		description = `${quoted[0]} ${quoted[1]}`;
+	} else if (quoted.length === 1) {
+		description = quoted[0];
+	} else {
+		description = headerLine;
+	}
+	const commitMessage = `Revert: ${description}`;
+	const pendingId = crypto.randomUUID();
+	await savePendingUndo(env, pendingId, {
+		kind: 'undo',
+		chatId,
+		transactionText: directiveText,
+		newContent,
+		fileSha: f.sha,
+		commitMessage,
+		createdAt: Date.now(),
+	});
+	await sendMessage(env, chatId, `撤回最后一条指令？\n${codeBlock(directiveText)}`, {
+		parseMode: 'HTML',
+		replyMarkup: buildUndoButtons(pendingId),
+	});
+}
+
+async function handleLast(env: Env, chatId: number, count: number): Promise<void> {
+	count = Math.min(count, 50);
+	const f = await githubDownloadFile(env);
+	if (!f) {
+		await sendMessage(env, chatId, 'Failed to download main.bean from GitHub.');
+		return;
+	}
+	const blocks = extractAllDirectiveBlocks(f.content);
+	if (blocks.length === 0) {
+		await sendMessage(env, chatId, 'main.bean 中没有找到任何记录。');
+		return;
+	}
+	const lastBlocks = blocks.slice(Math.max(0, blocks.length - count));
+	let text = lastBlocks.map(([, blockText]) => blockText).join('\n\n');
+	let truncated = false;
+	if (text.length > 4000) {
+		text = text.slice(0, 4000);
+		truncated = true;
+	}
+	let msg = `最近 ${lastBlocks.length} 条记录：\n${codeBlock(text)}`;
+	if (truncated) {
+		msg += '\n（内容过长，已截断显示）';
+	}
+	await sendMessage(env, chatId, msg, { parseMode: 'HTML' });
+}
+
+async function handleToday(env: Env, chatId: number, tz: string): Promise<void> {
+	const f = await githubDownloadFile(env);
+	if (!f) {
+		await sendMessage(env, chatId, 'Failed to download main.bean from GitHub.');
+		return;
+	}
+	const { dateStr: today } = formatInTimezone(tz);
+	const blocks = extractAllDirectiveBlocks(f.content);
+	const todayBlocks = blocks.filter(([d]) => d === today);
+	if (todayBlocks.length === 0) {
+		await sendMessage(env, chatId, `今天（${today}）没有记录。`);
+		return;
+	}
+	const text = todayBlocks.map(([, blockText]) => blockText).join('\n\n');
+	await sendMessage(env, chatId, `今天（${today}）共 ${todayBlocks.length} 条记录：\n${codeBlock(text)}`, {
+		parseMode: 'HTML',
+	});
 }
 
 // --- Text message handler ---
@@ -1307,6 +1532,25 @@ export async function handleMessage(
 				await reply(`Failed to trigger the report workflow: ${result.error}`);
 			}
 			return;
+		} else if (command === 'undo') {
+			await handleUndo(env, chatId);
+			return;
+		} else if (command === 'last') {
+			let count = 5;
+			if (payload) {
+				// Mirror Python int(payload): strict integer only; otherwise show usage.
+				if (/^[+-]?\d+$/.test(payload)) {
+					count = Math.min(Math.max(1, Number.parseInt(payload, 10)), 50);
+				} else {
+					await reply('用法：/last [数量]，默认 5，最大 50');
+					return;
+				}
+			}
+			await handleLast(env, chatId, count);
+			return;
+		} else if (command === 'today') {
+			await handleToday(env, chatId, tz);
+			return;
 		} else {
 			await reply(`Unknown command: ${command}`);
 			return;
@@ -1365,97 +1609,13 @@ export async function handleMessage(
 		appendix = renderPad(dateStr, account, padAccount, datetimeStr);
 	}
 
-	// --- Transaction (structured or LLM) ---
+	// --- Transaction (structured) or single-line LLM ---
 	else {
-		const lines = text.split('\n');
-
-		// Try structured format (multi-line with payee + narration + postings)
-		if (lines.length >= 4) {
-			const payee = lines[0].trim();
-			const narration = lines[1].trim();
-
-			let tag: string | null = null;
-			let link: string | null = null;
-			let lineIdx = 2;
-
-			while (lineIdx < lines.length && lines[lineIdx].trim()) {
-				if (lines[lineIdx].startsWith('#')) {
-					tag = lines[lineIdx].substring(1).trim();
-					lineIdx++;
-				} else if (lines[lineIdx].startsWith('^')) {
-					link = lines[lineIdx].substring(1).trim();
-					lineIdx++;
-				} else {
-					break;
-				}
-			}
-
-			const postingLines = lines.slice(lineIdx);
-			if (postingLines.filter((l) => l.trim()).length >= 2) {
-				const postings: Posting[] = [];
-				const rPosting = /^(\S+)\s*(-?\d+\.?\d*)\s*(\S+)\s*(.*?)\s*$/;
-				let structuredValid = true;
-
-				for (const raw of postingLines) {
-					const trimmed = raw.trim();
-					if (!trimmed) continue;
-
-					const semiIdx = trimmed.indexOf(';');
-					const [postingStr, comment] =
-						semiIdx >= 0
-							? [trimmed.substring(0, semiIdx), trimmed.substring(semiIdx + 1).trim()]
-							: [trimmed, ''];
-
-					const pm = rPosting.exec(postingStr);
-					if (!pm) { structuredValid = false; break; }
-
-					const account = matchAccount(pm[1], accounts);
-					if (!account) { structuredValid = false; break; }
-
-					if (!account.startsWith('Expenses') && !account.startsWith('Income')) {
-						commitMessage += `${account}\n`;
-					}
-
-					const currency = pm[3];
-					if (!/^[A-Z0-9][A-Z0-9'._-]*$/.test(currency) || !/[A-Z]/.test(currency)) {
-						structuredValid = false;
-						break;
-					}
-
-					postings.push({ account, amount: pm[2], currency, rest: pm[4] || '', comment });
-				}
-
-				if (structuredValid && postings.length >= 2) {
-					if (postings.length === 2) {
-						const a0 = parseFloat(postings[0].amount);
-						const a1 = parseFloat(postings[1].amount);
-						const c0 = postings[0].currency;
-						const c1 = postings[1].currency;
-
-						if (a0 * a1 >= 0) {
-							await reply('两条 posting 必须一正一负。');
-							return;
-						}
-						if (c0 === c1 && Math.abs(a0 + a1) > 0.0001) {
-							await reply(`同币种 ${c0} 的两条 posting 金额不平衡：${a0} + ${a1} != 0`);
-							return;
-						}
-						if (c0 !== c1) {
-							const r0 = postings[0].rest;
-							const r1 = postings[1].rest;
-							if (!r0.includes('@') && !r0.includes('{') && !r1.includes('@') && !r1.includes('{')) {
-								await reply(`不同币种 (${c0}/${c1}) 的交易需要标记成本 {} 或价格 @。`);
-								return;
-							}
-						}
-					}
-					appendix = renderTransaction(dateStr, payee, narration, postings, tag, link, datetimeStr);
-				}
-			}
-		}
-
-		// LLM path (single-line, or structured parsing failed)
-		if (!appendix) {
+		// Python rule: a GENUINELY single-line note (trimmed text non-empty, no embedded
+		// newline, not a slash-command) goes to the LLM. Use trim()-based newline detection,
+		// NOT lines.length, so a trailing newline does not misclassify a single-line note.
+		const trimmedText = text.trim();
+		if (trimmedText && !trimmedText.includes('\n') && !trimmedText.startsWith('/')) {
 			try {
 				const entry = await callLLMText(env, text, accounts, currencies, dateStr, undefined, undefined, comments, customDate ? undefined : timeStr);
 				const entryWithComment = insertPromptMetadata(entry, text);
@@ -1468,6 +1628,99 @@ export async function handleMessage(
 				return;
 			}
 		}
+
+		// Multi-line (or empty) input: structured transaction parser. On ANY failure reply the
+		// SPECIFIC error and return — do NOT fall through to the LLM (Python parity).
+		const lines = splitLines(text);
+
+		if (lines.length < 4) {
+			await reply('Invalid transaction format. Please provide payee, narration and two postings.');
+			return;
+		}
+
+		const payee = lines.shift()!.trim();
+		const narration = lines.shift()!.trim();
+
+		let tag: string | null = null;
+		let link: string | null = null;
+		while (lines.length > 0 && lines[0].trim()) {
+			if (lines[0].startsWith('#')) {
+				tag = lines.shift()!.substring(1).trim();
+			} else if (lines[0].startsWith('^')) {
+				link = lines.shift()!.substring(1).trim();
+			} else {
+				break;
+			}
+		}
+
+		// Python checks the "at least two postings" floor AFTER tag/link parsing.
+		if (lines.length < 2) {
+			await reply('A transaction must have at least two postings.');
+			return;
+		}
+
+		const postings: Posting[] = [];
+		const rPosting = /^(\S+)\s*(-?\d+\.?\d*)\s*(\S+)\s*(.*?)\s*$/;
+		let failureReason: string | null = null;
+
+		for (const raw of lines) {
+			const trimmed = raw.trim();
+			if (!trimmed) continue;
+
+			const semiIdx = trimmed.indexOf(';');
+			const [postingStr, comment] =
+				semiIdx >= 0
+					? [trimmed.substring(0, semiIdx), trimmed.substring(semiIdx + 1).trim()]
+					: [trimmed, ''];
+
+			const pm = rPosting.exec(postingStr);
+			if (!pm) { failureReason = `Invalid posting format: ${postingStr}`; break; }
+
+			const account = matchAccount(pm[1], accounts);
+			if (!account) { failureReason = `No matching account found for suffix: ${pm[1]}`; break; }
+
+			if (!account.startsWith('Expenses') && !account.startsWith('Income')) {
+				commitMessage += `${account}\n`;
+			}
+
+			const currency = pm[3];
+			if (!/^[A-Z0-9][A-Z0-9'._-]*$/.test(currency) || !/[A-Z]/.test(currency)) {
+				failureReason = `货币符号 '${currency}' 无效：必须全部大写，可包含数字，例如 USD、CNY、3NVD。`;
+				break;
+			}
+
+			postings.push({ account, amount: pm[2], currency, rest: pm[4] || '', comment });
+		}
+
+		if (failureReason) { await reply(failureReason); return; }
+
+		if (postings.length === 2) {
+			const a0 = parseFloat(postings[0].amount);
+			const a1 = parseFloat(postings[1].amount);
+			const c0 = postings[0].currency;
+			const c1 = postings[1].currency;
+			const r0 = postings[0].rest;
+			const r1 = postings[1].rest;
+
+			if (a0 * a1 >= 0) {
+				await reply('两条 posting 必须一正一负。');
+				return;
+			}
+			if (c0 === c1) {
+				if (Math.abs(a0 + a1) > 0.0001) {
+					await reply(`同币种 ${c0} 的两条 posting 金额不平衡：${a0} + ${a1} != 0`);
+					return;
+				}
+			} else {
+				const hasCostOrPrice = r0.includes('@') || r0.includes('{') || r1.includes('@') || r1.includes('{');
+				if (!hasCostOrPrice) {
+					await reply(`不同币种 (${c0}/${c1}) 的交易需要标记成本 {} 或价格 @。`);
+					return;
+				}
+			}
+		}
+
+		appendix = renderTransaction(dateStr, payee, narration, postings, tag, link, datetimeStr);
 	}
 
 	// Direct commit (non-LLM paths: open, close, balance, pad, /update, structured transaction)
