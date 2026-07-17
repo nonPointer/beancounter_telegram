@@ -1,4 +1,9 @@
 """Tests for 1.1 / 1.3 / 1.4 / 5.6 refactoring in main.py."""
+# Run from anywhere: put the repo root on the path so `import main` resolves.
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import base64
 import json
 import sys
@@ -7,29 +12,10 @@ import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-# Stub beancount (requires C extension that may not be compiled locally).
-import re as _re
-import types as _types
-
-def _fake_parse_string(text):
-    """Minimal beancount parser stub: recognises valid txn headers and ** as syntax error."""
-    class _Err:
-        def __init__(self, msg): self.message = msg
-    if _re.search(r'^\d{4}-\d{2}-\d{2}\s+\*\*', text, _re.MULTILINE):
-        return ([], [_Err('unexpected token **')], {})
-    if _re.search(r'^\d{4}-\d{2}-\d{2}\s+[*!]\s+', text, _re.MULTILINE):
-        return ([object()], [], {})
-    return ([], [], {})
-
-_bc = _types.ModuleType('beancount')
-_bc_parser = _types.ModuleType('beancount.parser')
-_bc_parser_parser = _types.ModuleType('beancount.parser.parser')
-_bc_parser_parser.parse_string = _fake_parse_string
-_bc_parser.parser = _bc_parser_parser
-_bc.parser = _bc_parser
-sys.modules.setdefault('beancount', _bc)
-sys.modules.setdefault('beancount.parser', _bc_parser)
-sys.modules.setdefault('beancount.parser.parser', _bc_parser_parser)
+# beancount is a hard dependency in requirements.txt and its C extension ships as a
+# wheel, so the real parser is used here — stubbing it meant the syntax-validation
+# gate (the thing that decides whether an entry reaches the ledger) was only ever
+# tested against a regex that approximated it.
 
 # Stub config.json so main.py can be imported without the real file.
 FAKE_CONFIG = {
@@ -40,6 +26,7 @@ FAKE_CONFIG = {
     "FILE_PATH": "main.bean",
     "TIMEZONE": "UTC",
     "TELEGRAM_BOT_TOKEN": "bot:tok",
+    "CHAT_ID": "1,42,99",
 }
 
 with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
@@ -1411,7 +1398,7 @@ class TestDirectiveDispatchExactEquality(unittest.TestCase):
         with patch.object(self.bot, "call_openai_compatible") as mock_llm, \
              patch.object(self.bot, "github_download_file",
                           return_value={"content": "", "sha": ""}), \
-             patch.object(self.bot, "github_upload_file", return_value=True) as mock_upload, \
+             patch.object(self.bot, "_github_put_file", return_value=(True, 200)) as mock_upload, \
              patch.object(self.bot, "send_message"):
             self.bot.handle_message(
                 {"message": {"text": "open Assets:Cash:Wallet CNY", "chat": {"id": 42}}}
@@ -1429,7 +1416,7 @@ class TestDirectiveDispatchExactEquality(unittest.TestCase):
         with patch.object(self.bot, "call_openai_compatible") as mock_llm, \
              patch.object(self.bot, "github_download_file",
                           return_value={"content": "", "sha": ""}), \
-             patch.object(self.bot, "github_upload_file", return_value=True) as mock_upload, \
+             patch.object(self.bot, "_github_put_file", return_value=(True, 200)) as mock_upload, \
              patch.object(self.bot, "send_message"):
             self.bot.handle_message(
                 {"message": {"text": "昨天open Assets:Cash:Wallet CNY", "chat": {"id": 42}}}
@@ -1489,7 +1476,7 @@ class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
         with patch.object(self.bot, "github_download_file",
                           return_value={"content": "old", "sha": "s"}), \
              patch.object(self.bot, "edit_message_reply_markup") as mock_edit, \
-             patch.object(self.bot, "github_upload_file", return_value=True) as mock_upload, \
+             patch.object(self.bot, "_github_put_file", return_value=(True, 200)) as mock_upload, \
              patch.object(self.bot, "answer_callback_query"), \
              patch.object(self.bot, "send_message"):
             self.bot.handle_callback_query(self._update(pending_id, chat_id, 100))

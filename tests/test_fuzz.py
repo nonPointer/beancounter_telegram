@@ -1,4 +1,9 @@
 """Fuzzing / edge-case tests for all parsing functions in main.py."""
+# Run from anywhere: put the repo root on the path so `import main` resolves.
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 import unittest
 from unittest.mock import patch
@@ -11,6 +16,7 @@ FAKE_CONFIG = {
     "FILE_PATH": "main.bean",
     "TIMEZONE": "UTC",
     "TELEGRAM_BOT_TOKEN": "bot:tok",
+    "CHAT_ID": "123",
 }
 
 with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):

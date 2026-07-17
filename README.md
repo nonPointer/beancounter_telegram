@@ -2,18 +2,7 @@
 
 追加记账记录到特定 GitHub 仓库的特定文件，随时随地用 Telegram 也可以记录生活消费，且不影响现有的 Beancount 工作流。
 
-## 部署方式
-
-本项目支持两种部署方式，功能相同：
-
-| | Python Bot | Cloudflare Worker |
-|---|---|---|
-| 目录 | 根目录 | `worker/` |
-| 运行方式 | 长轮询（polling） | Webhook（无服务器） |
-| 状态存储 | 内存 | Cloudflare KV |
-| LLM 配置 | `config.json` 中 `LLM_BACKENDS` 数组 | `wrangler secret` 单后端 |
-
-## Quick Start（Python Bot）
+## Quick Start
 
 - 依赖
 
@@ -40,19 +29,6 @@
   python main.py
   ```
 
-## Quick Start（Cloudflare Worker）
-
-详见 [`worker/README.md`](worker/README.md)。简要步骤：
-
-1. 配置 `worker/wrangler.toml` 中的基本变量（`REPO_OWNER`、`REPO_NAME` 等）
-2. 设置 secrets：`TELEGRAM_BOT_TOKEN`、`GITHUB_TOKEN`、`WEBHOOK_SECRET`、`LLM_API_KEY`、`LLM_API_BASE_URL`、`LLM_MODEL`
-3. 创建 KV 命名空间：`wrangler kv namespace create KV`，将 ID 填入 `wrangler.toml`
-4. 部署：`cd worker && npm install && wrangler deploy`
-5. 注册 Webhook：
-   ```bash
-   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<worker-url>.workers.dev&secret_token=<WEBHOOK_SECRET>"
-   ```
-
 ## 功能
 
 - [x] `open`、`close`、`balance`、`pad` 指令
@@ -60,6 +36,7 @@
 - [x] 手动记账，根据后缀自动匹配对应账户（账户列表自动从仓库 `/accounts/*.bean` 中解析 `open` 指令获取）
 - [x] `/tz <timezone>` 设置时区
 - [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
+- [x] **自然语言查询（LLM + BQL）**：直接提问即可检索账本，无需命令前缀。如「列出最近 10 条 chase 记录」「这个月吃饭花了多少」「各账户余额」。只读，不产生草稿
 - [x] `/view` 触发当月 Sankey 图生成（调用账本仓库的 `monthly-report.yml` workflow）
 - [x] `/undo` 撤回 `main.bean` 中的最后一条指令（支持 transaction、balance、pad、open、close 等任意顶层指令）
 - [x] `/last [N]` 查看 `main.bean` 中最近 N 条记录（默认 5 条）

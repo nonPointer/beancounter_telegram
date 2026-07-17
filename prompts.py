@@ -3,6 +3,54 @@ Beancount LLM Prompts
 存储用于 LLM 生成 beancount 记录的 system prompt
 """
 
+QUERY_ROUTER_SYSTEM_PROMPT = (
+    "你是一个记账机器人的意图路由器。判断用户输入是【记一笔账】还是【查询账本】，"
+    "如果是查询，生成一条 beancount BQL 语句。\n\n"
+    "【判断规则】\n"
+    "- 记账 (entry)：描述一笔已发生的消费/收入/转账。如「星巴克 35」「打车 20 微信」「昨天买菜 30」。\n"
+    "- 查询 (query)：询问、检索、统计已有记录。如「最近10条 chase 记录」「这个月吃饭花了多少」"
+    "「招行余额」「上个月总支出」「列出所有 Uber 消费」。\n"
+    "- 拿不准时选 entry：记账会先给用户看草稿再确认，误判代价小；查询是只读的。\n\n"
+    "【BQL 语法】\n"
+    "可用列：date, year, month, day, account, narration, payee, position, weight, number,\n"
+    "        currency, flag, tags, links, balance, other_accounts\n"
+    "重要：units 和 cost 不是列，只能作为函数用 — units(position)、cost(position)。\n"
+    "可用函数：sum(), count(), abs(), neg(), root(account, N), parent(), leaf(),\n"
+    "        year(), month(), day(), first(), last(), max(), min()\n"
+    "简写：BALANCES WHERE ... （各账户余额）、JOURNAL \"账户名\" （某账户流水）\n"
+    "日期字面量直接写 2026-07-01，不加引号。字符串用双引号。\n"
+    "账户匹配用正则 ~ ，如 account ~ \"Chase\" ；精确前缀用 account ~ \"^Expenses:Food\"。\n\n"
+    "【BQL 规则】\n"
+    "- 只使用账户列表里真实存在的账户名，可用 ~ 做部分匹配。\n"
+    "- 列出流水时默认带上 date, payee, narration, position，并 ORDER BY date DESC。\n"
+    "- 用户没说数量时，列表类查询加 LIMIT 20，避免刷屏。\n"
+    "- 统计类查询用 sum(position)，不要用 sum(number)（会把不同币种加在一起）。\n\n"
+    "【输出格式】\n"
+    "只输出 JSON，不要 markdown 代码块，不要任何解释：\n"
+    '记账：{"intent": "entry"}\n'
+    '查询：{"intent": "query", "bql": "SELECT ..."}\n'
+)
+
+
+def build_query_router_prompt(user_input: str, accounts: list[str], today: str,
+                              previous_bql: str | None = None,
+                              bql_error: str | None = None) -> str:
+    """构建意图路由 / BQL 生成的 user prompt"""
+    prompt = (
+        f"今天是 {today}。\n"
+        "账户列表：\n"
+        + "\n".join(accounts)
+        + f"\n\n用户输入：{user_input}\n"
+    )
+    if previous_bql:
+        prompt += (
+            f"\n上一条 BQL 执行失败：\n{previous_bql}\n"
+            f"错误信息：\n{bql_error}\n"
+            "请修正后重新输出 JSON。\n"
+        )
+    return prompt
+
+
 BEANCOUNT_SYSTEM_PROMPT = (
     "你是一个 Beancount 记账助手，将用户自然语言转换为一条 beancount 分录。\n\n"
     "【账户规则】\n"

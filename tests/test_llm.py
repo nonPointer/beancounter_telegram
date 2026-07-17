@@ -4,6 +4,11 @@ Interactive LLM Beancount Generator Test Tool
 用于测试 LLM 生成 beancount 记录的交互式工具
 """
 
+# Run from anywhere: put the repo root on the path so `import main` resolves.
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import importlib
 import json
 import re

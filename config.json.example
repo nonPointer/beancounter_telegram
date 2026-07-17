@@ -6,7 +6,7 @@
     "BRANCH_NAME": "main",
     "FILE_PATH": "journals/telegram.bean",
     "TIMEZONE": "Asia/Shanghai",
-    "CHAT_ID": "",
+    "CHAT_ID": "123456789",
     "LLM_BACKENDS": [
         {
             "LLM_API_BASE_URL": "https://api.openai.com/v1",

@@ -1,12 +1,15 @@
 import base64
 import html
 import json
+import os
 import re
 import sys
 import threading
 import time
+import traceback
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date as date_cls, datetime, timedelta
 from pprint import pformat
 
 import parsedatetime as pdt
@@ -14,16 +17,27 @@ import pytz
 from dateutil.parser import parse as dateutil_parse
 import requests
 from requests.adapters import HTTPAdapter
+from beancount import loader as beancount_loader
 from beancount.parser import parser as beancount_parser
+from beancount.query import query as beancount_query
 from jinja2 import Environment, FileSystemLoader
 
 from prompts import (
     BEANCOUNT_SYSTEM_PROMPT, build_user_prompt,
+    QUERY_ROUTER_SYSTEM_PROMPT, build_query_router_prompt,
     INVEST_ORDER_SYSTEM_PROMPT, build_invest_order_prompt,
     EXPENSE_SCREENSHOT_SYSTEM_PROMPT, build_expense_screenshot_prompt,
 )
 
 MAX_BEANCOUNT_RETRIES = 3
+
+# Re-reads to attempt when GitHub rejects a write because the file moved under us.
+GITHUB_CONFLICT_RETRIES = 3
+
+# Polling backoff: a failing getUpdates returns immediately instead of blocking for the
+# long-poll timeout, so without this the loop spins and hammers the API.
+POLL_BACKOFF_BASE = 1.0
+POLL_BACKOFF_MAX = 60.0
 
 
 def _build_http_session() -> requests.Session:
@@ -64,7 +78,13 @@ REPO_OWNER = config["REPO_OWNER"]
 REPO_NAME = config["REPO_NAME"]
 BRANCH_NAME = config["BRANCH_NAME"]
 FILE_PATH = config["FILE_PATH"]
-CHAT_ID = config.get("CHAT_ID", None)
+# A single id, or a comma-separated whitelist. Empty means nobody — Bot.__init__ refuses
+# to start rather than serving whoever finds the bot.
+ALLOWED_CHATS = {s.strip() for s in str(config.get("CHAT_ID") or "").split(",") if s.strip()}
+
+
+def is_authorized(chat_id) -> bool:
+    return str(chat_id) in ALLOWED_CHATS
 
 
 def _parse_llm_backends() -> list[dict]:
@@ -89,7 +109,10 @@ LLM_BACKENDS = _parse_llm_backends()
 LLM_ENABLED = len(LLM_BACKENDS) > 0
 LLM_MISSING_CONFIG_KEYS = [] if LLM_ENABLED else ["LLM_BACKENDS"]
 
-jinja2 = Environment(loader=FileSystemLoader(searchpath="./templates"))
+# Absolute so the bot and tests work regardless of the working directory (systemd, cron,
+# `python tests/…`) rather than only when launched from the repo root.
+_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+jinja2 = Environment(loader=FileSystemLoader(searchpath=_TEMPLATES_DIR))
 
 
 _C_GREEN = '\033[92m'
@@ -271,14 +294,22 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
     )
     if _try_pdt:
         now_naive = now.replace(tzinfo=None) if now.tzinfo else now
-        result, context = _pdt_calendar.parseDT(first_line, sourceTime=now_naive)
-        if context.hasDate:
+        # nlp() reports the matched span, unlike parseDT which only returns the date and
+        # forced the caller to drop the whole first line — "2026-03-20 星巴克咖啡" reached
+        # the LLM as an empty prompt with the description silently lost. Keeping the
+        # non-date part is what the Chinese layers above already do via _join_remaining.
+        # VERSION_CONTEXT_STYLE (see _pdt_calendar) makes the second field a pdtContext,
+        # so filter on .hasDate — a bare "3pm" carries a time but no date.
+        matches = _pdt_calendar.nlp(first_line, sourceTime=now_naive) or []
+        date_match = next((m for m in matches if m[1].hasDate), None)
+        if date_match:
+            result, _ctx, start, end, _matched = date_match
             if (result - now_naive).days > 28:
                 result = result.replace(year=result.year - 1)
             date_str = result.strftime('%Y-%m-%d')
-            remaining = '\n'.join(lines[1:]).strip()
+            rest_of_first = (first_line[:start] + first_line[end:]).strip()
             log(f"Custom date detected (parsedatetime): {date_str}")
-            return date_str, True, remaining
+            return date_str, True, _join_remaining(rest_of_first, lines)
 
     return now.strftime('%Y-%m-%d'), False, text
 
@@ -312,6 +343,112 @@ def _is_txn_header(line: str) -> bool:
 
 def _code_block(text: str) -> str:
     return f"<pre><code>{html.escape(text)}</code></pre>"
+
+
+# Telegram caps a message at 4096 chars; leave room for the <pre> wrapper and a notice.
+QUERY_RESULT_MAX_CHARS = 3500
+
+
+def extract_json_object(text: str) -> dict | None:
+    """Pull the first JSON object out of an LLM reply, tolerating code fences and prose.
+
+    Scans for a balanced {...} while respecting string literals, so a brace inside a
+    BQL string (e.g. a regex) does not end the object early. Returns None if there is
+    no parseable object — callers treat that as "router gave up".
+    """
+    if not text:
+        return None
+
+    cleaned = text.strip()
+    fence = re.match(r'^```[a-zA-Z]*[ \t]*\n(.*?)\n?```$', cleaned, re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+
+    start = cleaned.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(cleaned)):
+        c = cleaned[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == '\\':
+                escaped = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(cleaned[start:i + 1])
+                except ValueError:
+                    return None
+                return obj if isinstance(obj, dict) else None
+    return None
+
+
+def display_width(text: str) -> int:
+    """Width in monospace cells. CJK and fullwidth characters take two.
+
+    beancount's own query_render measures in characters, which renders Chinese
+    narrations misaligned in Telegram's <pre> block.
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
+
+
+def _format_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, date_cls) and not isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (set, frozenset)):
+        return ",".join(sorted(str(v) for v in value))
+    return str(value)
+
+
+def format_query_result(rtypes, rrows, max_chars: int = QUERY_RESULT_MAX_CHARS) -> str:
+    """Render BQL rows as a width-aware fixed-column table, truncated to fit Telegram."""
+    if not rrows:
+        return "(no results)"
+
+    headers = [name for name, _ in rtypes]
+    rows = [[_format_cell(v) for v in row] for row in rrows]
+
+    widths = []
+    for i, header in enumerate(headers):
+        widths.append(max([display_width(header)] + [display_width(r[i]) for r in rows]))
+
+    def render(cells):
+        return "  ".join(
+            cell + " " * max(0, widths[i] - display_width(cell))
+            for i, cell in enumerate(cells)
+        ).rstrip()
+
+    head = [render(headers), "  ".join("-" * w for w in widths)]
+    body = [render(r) for r in rows]
+
+    out = "\n".join(head + body)
+    if len(out) <= max_chars:
+        return out
+
+    kept = []
+    size = len("\n".join(head))
+    for line in body:
+        if size + len(line) + 1 > max_chars - 60:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    dropped = len(body) - len(kept)
+    return "\n".join(head + kept + [f"... ({dropped} more rows omitted)"])
 
 
 def extract_all_directive_blocks(content: str) -> list[tuple[str, str]]:
@@ -389,9 +526,16 @@ def extract_last_directive_block(content: str) -> tuple[str, str] | None:
 
 class Bot:
     def __init__(self, debug: bool = False):
+        if not ALLOWED_CHATS:
+            raise ValueError(
+                "CHAT_ID is required: an empty value would let anyone who finds the bot read "
+                "the ledger and commit to the repo. Set it in config.json (comma-separated for "
+                "multiple chats). Find yours via https://api.telegram.org/bot<TOKEN>/getUpdates"
+            )
         self.update_id = 0
         self.debug = debug
         self.stop = threading.Event()
+        self._poll_failures = 0
         self.timezone = pytz.timezone(config["TIMEZONE"])
         self.api_base = "https://api.telegram.org/bot{}".format(config["TELEGRAM_BOT_TOKEN"])
         self.pending_llm_entries = {}
@@ -776,6 +920,109 @@ class Bot:
 
         return "\n".join(lines[:header_idx + 1] + [metadata_line] + lines[header_idx + 1:])
 
+    def load_ledger(self) -> tuple[list, dict] | None:
+        """Fetch the journal plus its account definitions and parse them into entries.
+
+        beancount's loader wants a path on disk and resolves `include` relative to it,
+        but the ledger lives in GitHub. The account files hold only open/close directives,
+        so concatenating them with the journal gives the loader everything it needs;
+        entries are date-sorted at load time, so concatenation order does not matter.
+        Downloads go through github_download_file and therefore hit the ETag cache.
+        """
+        paths = list(dict.fromkeys(list(ACCOUNT_TYPE_MAP.values()) + [FILE_PATH]))
+        texts = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
+            futures = {pool.submit(self.github_download_file, p): p for p in paths}
+            for future in as_completed(futures):
+                f = future.result()
+                if f:
+                    texts[futures[future]] = f["content"]
+
+        if FILE_PATH not in texts:
+            return None
+
+        combined = "\n".join(texts.get(p, "") for p in paths)
+        entries, errors, options_map = beancount_loader.load_string(combined)
+        if errors:
+            log(f"Ledger parsed with {len(errors)} error(s); first: {errors[0]}")
+        return entries, options_map
+
+    def run_bql(self, bql: str) -> tuple[list, list]:
+        """Execute a BQL query. Raises on a bad query; the caller feeds that back to the LLM."""
+        loaded = self.load_ledger()
+        if loaded is None:
+            raise ValueError("Failed to download the ledger from GitHub.")
+        entries, options_map = loaded
+        return beancount_query.run_query(entries, options_map, bql)
+
+    def route_intent(self, user_input: str, today: str) -> dict:
+        """Classify the input as entry-vs-query and, for a query, produce a BQL.
+
+        Returns {"intent": "entry"} or {"intent": "query", "bql": "..."}. Falls back to
+        entry on any failure: a misrouted entry costs the user one tap on ❌, while a
+        misrouted query would just be a confusing draft — both recoverable, unlike
+        blocking the bot's primary purpose because the router hiccuped.
+        """
+        payload = {
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": QUERY_ROUTER_SYSTEM_PROMPT},
+                {"role": "user", "content": build_query_router_prompt(
+                    user_input, self._accounts_for_prompt(), today)},
+            ],
+        }
+        try:
+            raw = self._call_llm_backends(payload, " router")
+        except Exception as e:
+            log(f"Intent router failed ({e}); treating input as an entry.")
+            return {"intent": "entry"}
+
+        parsed = extract_json_object(raw)
+        if not parsed or parsed.get("intent") not in ("entry", "query"):
+            log(f"Intent router returned unusable output {raw!r}; treating input as an entry.")
+            return {"intent": "entry"}
+        if parsed["intent"] == "query" and not parsed.get("bql"):
+            log("Intent router said query but gave no BQL; treating input as an entry.")
+            return {"intent": "entry"}
+        return parsed
+
+    def answer_query(self, user_input: str, bql: str, today: str) -> tuple[str, str]:
+        """Run the BQL, re-asking the LLM to fix it if beancount rejects it.
+
+        Mirrors the beancount-syntax retry loop used for entries. Returns (bql, rendered).
+        """
+        accounts = self._accounts_for_prompt()
+        error = None
+        for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
+            try:
+                rtypes, rrows = self.run_bql(bql)
+                log(f"BQL ok ({len(rrows)} rows): {bql}")
+                return bql, format_query_result(rtypes, rrows)
+            except ValueError:
+                raise  # ledger download failure — not something the LLM can fix
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+                log(f"BQL failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {error}")
+
+            if attempt == MAX_BEANCOUNT_RETRIES:
+                break
+
+            payload = {
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": QUERY_ROUTER_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_query_router_prompt(
+                        user_input, accounts, today, previous_bql=bql, bql_error=error)},
+                ],
+            }
+            raw = self._call_llm_backends(payload, " bql-retry")
+            parsed = extract_json_object(raw)
+            if not parsed or not parsed.get("bql"):
+                break
+            bql = parsed["bql"]
+
+        raise ValueError(f"Could not build a working query. Last error:\n{error}")
+
     def _call_llm_backends(self, payload: dict, log_prefix: str = "", vision: bool = False) -> str:
         last_error: Exception | None = None
         for backend in LLM_BACKENDS:
@@ -786,6 +1033,7 @@ class Bot:
                     "Authorization": f"Bearer {backend['api_key']}",
                     "Content-Type": "application/json",
                 }
+                started = time.monotonic()
                 response = HTTP.post(url, headers=headers, json={**payload, "model": model}, timeout=60)
                 response.raise_for_status()
                 data = response.json()
@@ -795,6 +1043,8 @@ class Bot:
                     raise ValueError(f"Malformed LLM response: {data}") from e
                 if content is None:
                     raise ValueError(f"LLM returned null content: {data}")
+                elapsed = time.monotonic() - started
+                log(f"LLM{log_prefix} answered by {_C_BLUE}[{model}]{_C_RESET} @ {backend['base_url']} ({elapsed:.1f}s)")
                 return content.strip()
             except Exception as e:
                 log(f"LLM backend '{model}'{log_prefix} failed: {e}, trying next...")
@@ -949,9 +1199,8 @@ class Bot:
         def reply(text: str):
             self.send_message(chat_id, text)
 
-        if CHAT_ID and str(chat_id) != CHAT_ID:
-            log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
-            reply("How dare you?")
+        if not is_authorized(chat_id):
+            log(f"Ignoring photo from unauthorized chat_id {chat_id}.")
             return
 
         if not self.llm_enabled:
@@ -1135,6 +1384,15 @@ class Bot:
         with self._pending_lock:
             return self.pending_llm_entries.pop(pending_id, None)
 
+    def _restore_pending(self, pending_id: str, pending: dict) -> dict:
+        """Put a claimed entry back after a failed commit, so the user's reviewed draft
+        is not lost to a transient GitHub error. The TTL clock restarts: they only just
+        interacted with it, and expiring it immediately would defeat the retry."""
+        pending = dict(pending, created_at=time.time())
+        with self._pending_lock:
+            self.pending_llm_entries[pending_id] = pending
+        return pending
+
     def _remove_decline_reason_bindings_locked(self, pending_id):
         for k, v in list(self.pending_decline_reasons.items()):
             if v == pending_id:
@@ -1250,6 +1508,10 @@ class Bot:
         chat_id = message.get("chat", {}).get("id")
         message_id = message.get("message_id")
 
+        if not is_authorized(chat_id):
+            log(f"Ignoring callback from unauthorized chat_id {chat_id}.")
+            return
+
         try:
             action, pending_id = data.split(":", 1)
         except ValueError:
@@ -1316,7 +1578,10 @@ class Bot:
 
         if action == "undo_confirm":
             log(f"User confirmed undo for pending {pending_id}")
-            ok = self.github_upload_file(pending["new_content"], pending["file_sha"], pending["commit_message"])
+            # An undo rewrites the whole file, so unlike an append it cannot be retried
+            # against a moved sha — a conflict means the precomputed content is stale.
+            ok, status = self._github_put_file(
+                pending["new_content"], pending["file_sha"], pending["commit_message"])
             if ok:
                 self.answer_callback_query(callback_id, "已撤回")
                 self.send_message(
@@ -1325,9 +1590,13 @@ class Bot:
                     parse_mode="HTML",
                 )
                 log("Undo committed. Removed:\n" + pending["transaction_text"])
+            elif status in (409, 422):
+                self.answer_callback_query(callback_id, "已过期")
+                self.send_message(chat_id, "账本在此期间已变更，撤回已作废。请重新执行 /undo。")
             else:
+                self._restore_pending(pending_id, pending)
                 self.answer_callback_query(callback_id, "失败")
-                self.send_message(chat_id, "Failed to upload to GitHub.")
+                self.send_message(chat_id, "Failed to upload to GitHub. 草稿仍在，可再次点击确认重试。")
             return
 
         if action != "approve":
@@ -1351,22 +1620,25 @@ class Bot:
             self.answer_callback_query(callback_id, "This request is expired or already handled")
             return
 
-        # Claimed: strip the inline buttons now, then upload.
-        self.edit_message_reply_markup(chat_id, message_id)
-
         appendix = claimed["appendix"]
         approve_datetime_str = datetime.now(self.timezone).isoformat(timespec='seconds')
         appendix = self.ensure_datetime_metadata(appendix, approve_datetime_str)
-        commit_message = claimed["commit_message"]
-        ok = self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip())
+        # Reuse the file we just downloaded; a concurrent commit makes the sha stale and
+        # append_to_file re-reads on its own.
+        ok, err = self.append_to_file(appendix, claimed["commit_message"].strip(), downloaded=f)
 
         if ok:
+            # Strip the buttons only now. Double-taps are already prevented by the pop
+            # above, so leaving them until the write lands means a failed commit can be
+            # retried with a tap instead of forcing a retype.
+            self.edit_message_reply_markup(chat_id, message_id)
             self.answer_callback_query(callback_id, "Approved")
             self.send_message(chat_id, f"Created entry:\n{_code_block(appendix)}", parse_mode="HTML")
             log("Logged entry:\n" + appendix)
         else:
+            self._restore_pending(pending_id, claimed)
             self.answer_callback_query(callback_id, "Failed")
-            self.send_message(chat_id, "Failed to upload to GitHub.")
+            self.send_message(chat_id, f"{err} 草稿仍在，可再次点击 ✅ 重试。")
 
     def github_download_file(self, file_path: str = FILE_PATH) -> dict | None:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{file_path}?ref={BRANCH_NAME}"
@@ -1392,7 +1664,10 @@ class Bot:
             log(f"Error: {r.status_code}")
             return None
 
-    def github_upload_file(self, content: str, sha: str, commit_message: str, file_path: str = FILE_PATH) -> bool:
+    def _github_put_file(self, content: str, sha: str, commit_message: str,
+                         file_path: str = FILE_PATH) -> tuple[bool, int]:
+        """PUT a file and report the HTTP status, so callers can tell a stale-sha
+        conflict (retryable) from a real failure (not)."""
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{file_path}"
         data = {
             "message": commit_message,
@@ -1404,11 +1679,50 @@ class Bot:
         r = HTTP.put(url=url, headers=GITHUB_HEADERS, json=data, timeout=30)
         if r.status_code in [200, 201]:
             self._file_etag_cache.pop(file_path, None)
-            return True
-        else:
-            log(f"Error uploading file: {r.status_code}")
-            log(r.text)
-            return False
+            return True, r.status_code
+        log(f"Error uploading file: {r.status_code}")
+        log(r.text)
+        return False, r.status_code
+
+    def github_upload_file(self, content: str, sha: str, commit_message: str, file_path: str = FILE_PATH) -> bool:
+        ok, _ = self._github_put_file(content, sha, commit_message, file_path)
+        return ok
+
+    def append_to_file(self, appendix: str, commit_message: str, file_path: str = FILE_PATH,
+                       downloaded: dict | None = None) -> tuple[bool, str]:
+        """Append to a file, retrying when it changed underneath us.
+
+        GitHub rejects a PUT carrying a stale sha (409, or 422 for the same reason),
+        which is exactly what happens when two entries are approved close together.
+        Re-reading and re-appending is always safe here because appends commute; the
+        alternative is telling the user their reviewed entry failed for no good reason.
+
+        `downloaded` lets a caller that already fetched the file (to validate before
+        claiming a draft) hand it over instead of paying for a second round trip.
+        Returns (ok, error_message_for_user).
+        """
+        f = downloaded
+        for attempt in range(1, GITHUB_CONFLICT_RETRIES + 1):
+            if f is None:
+                f = self.github_download_file(file_path)
+                if not f:
+                    return False, "Failed to download from GitHub."
+
+            ok, status = self._github_put_file(
+                f["content"] + '\n' + appendix + '\n', f["sha"], commit_message, file_path)
+            if ok:
+                return True, ""
+            if status not in (409, 422):
+                return False, "Failed to upload to GitHub."
+
+            # Someone else committed between our read and write. Drop the cached ETag
+            # so the next read is guaranteed fresh, then rebuild the append.
+            self._file_etag_cache.pop(file_path, None)
+            f = None
+            log(f"{file_path} changed under us (HTTP {status}); "
+                f"re-reading and retrying ({attempt}/{GITHUB_CONFLICT_RETRIES})")
+
+        return False, "The ledger is being updated by something else. Please try again."
 
     def github_trigger_workflow(self, workflow_file: str, inputs: dict) -> tuple[bool, str]:
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{workflow_file}/dispatches"
@@ -1428,9 +1742,8 @@ class Bot:
         def reply(text: str):
             self.send_message(chat_id, text)
 
-        if CHAT_ID and str(chat_id) != CHAT_ID:
-            log(f"Ignoring message from chat_id {chat_id}, only responding to {CHAT_ID}.")
-            reply("How dare you?")
+        if not is_authorized(chat_id):
+            log(f"Ignoring message from unauthorized chat_id {chat_id}.")
             return
 
         dt = datetime.now(self.timezone)
@@ -1643,6 +1956,22 @@ class Bot:
             if not accounts:
                 reply("No accounts available. Please check GitHub account parsing first.")
                 return
+
+            route = self.route_intent(text, date_str)
+            if route["intent"] == "query":
+                try:
+                    bql, rendered = self.answer_query(text, route["bql"], date_str)
+                except Exception as e:
+                    log(f"Query failed: {e}")
+                    reply(f"Query failed: {e}")
+                    return
+                self.send_message(
+                    chat_id,
+                    f"{_code_block(rendered)}\n<code>{html.escape(bql)}</code>",
+                    parse_mode="HTML",
+                )
+                return
+
             try:
                 appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str)
                 appendix = self.insert_prompt_metadata(appendix, text)
@@ -1751,11 +2080,8 @@ class Bot:
                 postings=postings, tag=tag, link=link, datetime=datetime_str,
             )
 
-        f = self.github_download_file(target_file_path)
-        if not f:
-            reply("Failed to download from GitHub.")
-            return
-        if self.github_upload_file(f["content"] + '\n' + appendix + '\n', f["sha"], commit_message.strip(), target_file_path):
+        ok, err = self.append_to_file(appendix, commit_message.strip(), target_file_path)
+        if ok:
             self.send_message(
                 chat_id,
                 f"Created entry:\n{_code_block(appendix)}" if appendix else "Created entry",
@@ -1763,24 +2089,73 @@ class Bot:
             )
             log("Logged entry:\n" + appendix)
         else:
-            reply("Failed to upload to GitHub.")
+            reply(err)
+
+    def _backoff(self, reason: str, retry_after: float | None = None):
+        """Wait before polling again. Waits on `stop` so Ctrl-C interrupts the delay."""
+        self._poll_failures += 1
+        if retry_after is None:
+            retry_after = min(POLL_BACKOFF_MAX, POLL_BACKOFF_BASE * 2 ** (self._poll_failures - 1))
+        log(f"{reason}; retrying in {retry_after:.1f}s")
+        self.stop.wait(retry_after)
 
     def get_updates(self):
         params = {"offset": self.update_id + 1, "timeout": 30}
         try:
             response = HTTP.get(self.api_base + "/getUpdates", params=params, timeout=params["timeout"] + 1)
-            if response.status_code != 200:
-                log(f"Error: {response.status_code}")
-                return {"result": []}
         except KeyboardInterrupt:
             log("Got KeyboardInterrupt in Bot thread.")
             self.stop.set()
             exit(0)
         except Exception as e:
-            log(e)
-            log("Timeout or Connection Error")
+            self._backoff(f"getUpdates failed: {e}")
             return {"result": []}
-        return response.json()
+
+        if response.status_code != 200:
+            # A failing call returns at once instead of long-polling for 30s, so without
+            # a delay the loop spins. 429 tells us exactly how long to wait.
+            retry_after = None
+            if response.status_code == 429:
+                try:
+                    retry_after = float(response.json()["parameters"]["retry_after"])
+                except Exception:
+                    pass
+            self._backoff(f"getUpdates HTTP {response.status_code}", retry_after)
+            return {"result": []}
+
+        try:
+            data = response.json()
+        except ValueError:
+            self._backoff("getUpdates returned non-JSON")
+            return {"result": []}
+
+        if not isinstance(data.get("result"), list):
+            # Telegram error payloads have no "result"; indexing it would kill the loop.
+            self._backoff(f"getUpdates payload has no 'result' list: {str(data)[:120]}")
+            return {"result": []}
+
+        self._poll_failures = 0
+        return data
+
+    def _spawn_handler(self, fn, update, chat_id):
+        """Run a handler in a daemon thread with a top-level guard, so a crash reports
+        back to the user instead of dying silently in a thread nobody is watching."""
+        # Resolve the name up front: nothing inside the except block may itself raise.
+        name = getattr(fn, "__name__", type(fn).__name__)
+
+        def guarded():
+            try:
+                fn(update)
+            except Exception:
+                log(f"{name} crashed for chat {chat_id}:\n{traceback.format_exc()}")
+                # Only ever reply to authorized chats — a crash must not become an oracle.
+                if is_authorized(chat_id):
+                    try:
+                        self.send_message(chat_id, "Something went wrong handling that. Please try again.")
+                    except Exception:
+                        log(f"Could not notify chat {chat_id}:\n{traceback.format_exc()}")
+
+        threading.Thread(target=guarded, daemon=True).start()
 
     def process_updates(self):
         self.cleanup_expired_drafts()
@@ -1799,8 +2174,8 @@ class Bot:
             log(message)
 
         for callback in callback_queries:
-            hd = threading.Thread(target=self.handle_callback_query, args=(callback,), daemon=True)
-            hd.start()
+            cb_chat_id = callback.get("callback_query", {}).get("message", {}).get("chat", {}).get("id")
+            self._spawn_handler(self.handle_callback_query, callback, cb_chat_id)
 
         for message in messages:
             chat = message["message"]["chat"]
@@ -1813,23 +2188,28 @@ class Bot:
             fmt = f"{_C_BLUE}[{chat_id}]{_C_RESET} {first_name} {last_name} (@{username}):"
             photo = message["message"].get("photo")
             if text:
-                hd = threading.Thread(target=self.handle_message, args=(message,), daemon=True)
-                hd.start()
+                self._spawn_handler(self.handle_message, message, chat_id)
                 if len(text.splitlines()) > 1:
                     log(f"{fmt} \n{text}")
                 else:
                     log(f"{fmt} {text}")
             elif photo:
                 log(f"{fmt} [photo]")
-                hd = threading.Thread(target=self.handle_photo_message, args=(message,), daemon=True)
-                hd.start()
+                self._spawn_handler(self.handle_photo_message, message, chat_id)
             else:
                 obj = {k: v for k, v in message['message'].items() if k not in ['chat', 'date', 'from', 'message_id']}
                 log(f"{fmt} {obj}")
 
     def start(self):
         while not self.stop.is_set():
-            self.process_updates()
+            try:
+                self.process_updates()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                # One bad update or a network blip must not terminate the bot.
+                log(f"Poll cycle crashed:\n{traceback.format_exc()}")
+                self._backoff("Poll cycle crashed")
 
 
 if __name__ == "__main__":

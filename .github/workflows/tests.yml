@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # No pytest: each file is a unittest main() and exits non-zero on failure.
+      # config.json is gitignored — the suites patch builtins.open to import main.
+      - name: test_refactor
+        run: python tests/test_refactor.py
+
+      - name: test_bot
+        run: python tests/test_bot.py
+
+      - name: test_fuzz
+        run: python tests/test_fuzz.py
