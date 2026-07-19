@@ -780,18 +780,27 @@ LEDGER_JOURNAL = '''
 '''
 
 
+# The main file pulls accounts in via an include glob, like the real ledger — load_ledger
+# must mirror every file to disk and let beancount resolve the include, not concatenate.
+LEDGER_MAIN = 'include "accounts/*.bean"\n' + LEDGER_JOURNAL
+LEDGER_TREE = ["test.bean", "accounts/assets.bean", "accounts/empty.bean"]
+
+
 def _ledger_download(file_path="test.bean"):
+    if file_path == "accounts/assets.bean":
+        return {"content": LEDGER_ACCOUNTS, "sha": "s"}
     if file_path.startswith("accounts/"):
-        keep = file_path.endswith(("expenses.bean", "assets.bean", "liabilities.bean"))
-        return {"content": LEDGER_ACCOUNTS if keep else "", "sha": "s"}
-    return {"content": LEDGER_JOURNAL, "sha": "s"}
+        return {"content": "", "sha": "s"}
+    return {"content": LEDGER_MAIN, "sha": "s"}
 
 
 class TestLedgerQuery(unittest.TestCase):
-    """load_ledger concatenates account files with the journal for beancount's loader."""
+    """load_ledger mirrors the repo to a temp dir and load_file()s it, so include
+    directives (globs included) resolve — concatenation could not do that."""
 
     def setUp(self):
         self.bot = make_bot()
+        self.bot._list_bean_files = lambda: list(LEDGER_TREE)
         self.bot.github_download_file = _ledger_download
 
     def test_load_ledger_parses(self):
@@ -799,8 +808,19 @@ class TestLedgerQuery(unittest.TestCase):
         self.assertTrue(entries)
         self.assertIn("dcontext", options_map)
 
+    def test_include_glob_is_resolved(self):
+        # The account opens live in an included file; without resolving the include the
+        # journal's postings would be against undeclared accounts and error out.
+        _, rrows = self.bot.run_bql('SELECT count(date) WHERE account ~ "Chase"')
+        self.assertEqual(list(rrows[0])[0], 2)
+
+    def test_falls_back_when_tree_unavailable(self):
+        self.bot._list_bean_files = lambda: None
+        entries, options_map = self.bot.load_ledger()
+        self.assertTrue(entries)
+
     def test_load_ledger_returns_none_without_journal(self):
-        self.bot.github_download_file = lambda p="x": None
+        self.bot.github_download_file = lambda p="x": {"content": "", "sha": ""}
         self.assertIsNone(self.bot.load_ledger())
 
     def test_run_bql_filters(self):
@@ -852,6 +872,7 @@ class TestAnswerQueryRetry(unittest.TestCase):
 
     def _bot(self, *replies):
         b = make_bot()
+        b._list_bean_files = lambda: list(LEDGER_TREE)
         b.github_download_file = _ledger_download
         b._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]
         b._call_llm_backends = MagicMock(side_effect=list(replies))
@@ -888,6 +909,7 @@ class TestQueryEndToEnd(unittest.TestCase):
         self.bot = make_bot()
         self.bot.llm_enabled = True
         self.bot.send_message = MagicMock()
+        self.bot._list_bean_files = lambda: list(LEDGER_TREE)
         self.bot.github_download_file = _ledger_download
         self.bot.parse_accounts = lambda: ["Expenses:Food", "Liabilities:CreditCard:Chase"]
         self.bot._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]

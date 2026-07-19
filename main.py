@@ -2,6 +2,8 @@ import base64
 import html
 import json
 import os
+import shutil
+import tempfile
 import re
 import sys
 import threading
@@ -920,16 +922,42 @@ class Bot:
 
         return "\n".join(lines[:header_idx + 1] + [metadata_line] + lines[header_idx + 1:])
 
-    def load_ledger(self) -> tuple[list, dict] | None:
-        """Fetch the journal plus its account definitions and parse them into entries.
+    def _list_bean_files(self) -> list[str] | None:
+        """List every .bean/.beancount path in the repo via the git trees API.
 
-        beancount's loader wants a path on disk and resolves `include` relative to it,
-        but the ledger lives in GitHub. The account files hold only open/close directives,
-        so concatenating them with the journal gives the loader everything it needs;
-        entries are date-sorted at load time, so concatenation order does not matter.
-        Downloads go through github_download_file and therefore hit the ETag cache.
+        Returns None on failure so the caller can fall back. This is what lets the
+        loader resolve `include` globs (e.g. `include "config/*.bean"`): every file the
+        glob could match is fetched, not just the accounts/ files we know by name.
         """
-        paths = list(dict.fromkeys(list(ACCOUNT_TYPE_MAP.values()) + [FILE_PATH]))
+        url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/{BRANCH_NAME}?recursive=1"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}",
+                   "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28"}
+        r = HTTP.get(url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            log(f"Could not list repo tree: HTTP {r.status_code}")
+            return None
+        data = r.json()
+        if data.get("truncated"):
+            log("Repo tree is truncated; some ledger files may be missing.")
+        return [t["path"] for t in data.get("tree", [])
+                if t.get("type") == "blob" and t["path"].endswith((".bean", ".beancount"))]
+
+    def load_ledger(self) -> tuple[list, dict] | None:
+        """Fetch the whole ledger and parse it with beancount's file loader.
+
+        beancount's loader wants a path on disk and resolves `include` (including globs)
+        relative to it, but the ledger lives in GitHub. So we mirror every .bean file into
+        a temp dir preserving its path, then load_file(FILE_PATH) — this is the only way to
+        honor arbitrary include directives. Downloads reuse github_download_file (ETag cache).
+        """
+        paths = self._list_bean_files()
+        if paths is None:
+            # Fallback when the trees API is unavailable: at least the files we know by name.
+            paths = list(ACCOUNT_TYPE_MAP.values())
+        if FILE_PATH not in paths:
+            paths = paths + [FILE_PATH]
+
         texts = {}
         with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
             futures = {pool.submit(self.github_download_file, p): p for p in paths}
@@ -938,14 +966,24 @@ class Bot:
                 if f:
                     texts[futures[future]] = f["content"]
 
-        if FILE_PATH not in texts:
+        if not texts.get(FILE_PATH):
+            log("Ledger main file is empty or missing; cannot query.")
             return None
 
-        combined = "\n".join(texts.get(p, "") for p in paths)
-        entries, errors, options_map = beancount_loader.load_string(combined)
-        if errors:
-            log(f"Ledger parsed with {len(errors)} error(s); first: {errors[0]}")
-        return entries, options_map
+        tmpdir = tempfile.mkdtemp(prefix="ledger_")
+        try:
+            for rel, content in texts.items():
+                dest = os.path.join(tmpdir, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            entries, errors, options_map = beancount_loader.load_file(
+                os.path.join(tmpdir, FILE_PATH))
+            if errors:
+                log(f"Ledger parsed with {len(errors)} error(s); first: {errors[0]}")
+            return entries, options_map
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def run_bql(self, bql: str) -> tuple[list, list]:
         """Execute a BQL query. Raises on a bad query; the caller feeds that back to the LLM."""
