@@ -794,13 +794,39 @@ def _ledger_download(file_path="test.bean"):
     return {"content": LEDGER_MAIN, "sha": "s"}
 
 
+class TestListBeanFiles(unittest.TestCase):
+    """_list_bean_files parses the trees API into (tree_sha, paths). Mocks the HTTP
+    response, not the method, so the real return shape is exercised — a tuple/list
+    mismatch would crash load_ledger's unpack in production while method-mocking
+    tests stayed green."""
+
+    def setUp(self):
+        self.bot = make_bot()
+
+    def test_returns_sha_and_bean_paths_only(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"sha": "tree123", "truncated": False, "tree": [
+            {"type": "blob", "path": "test.bean"},
+            {"type": "blob", "path": "accounts/assets.bean"},
+            {"type": "blob", "path": "README.md"},
+            {"type": "tree", "path": "accounts"},
+        ]}
+        with patch.object(main.HTTP, "get", return_value=resp):
+            result = self.bot._list_bean_files()
+        self.assertEqual(result, ("tree123", ["test.bean", "accounts/assets.bean"]))
+
+    def test_none_on_http_error(self):
+        with patch.object(main.HTTP, "get", return_value=MagicMock(status_code=500)):
+            self.assertIsNone(self.bot._list_bean_files())
+
+
 class TestLedgerQuery(unittest.TestCase):
     """load_ledger mirrors the repo to a temp dir and load_file()s it, so include
     directives (globs included) resolve — concatenation could not do that."""
 
     def setUp(self):
         self.bot = make_bot()
-        self.bot._list_bean_files = lambda: list(LEDGER_TREE)
+        self.bot._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
         self.bot.github_download_file = _ledger_download
 
     def test_load_ledger_parses(self):
@@ -822,6 +848,36 @@ class TestLedgerQuery(unittest.TestCase):
     def test_load_ledger_returns_none_without_journal(self):
         self.bot.github_download_file = lambda p="x": {"content": "", "sha": ""}
         self.assertIsNone(self.bot.load_ledger())
+
+    def test_same_tree_sha_is_served_from_cache(self):
+        # First load pays for downloads; a second load with the same tree sha must not.
+        dl = MagicMock(side_effect=_ledger_download)
+        self.bot.github_download_file = dl
+        self.bot.load_ledger()
+        first = dl.call_count
+        self.assertGreater(first, 0)
+        self.bot.load_ledger()
+        self.assertEqual(dl.call_count, first)  # no new downloads
+
+    def test_changed_tree_sha_reloads(self):
+        dl = MagicMock(side_effect=_ledger_download)
+        self.bot.github_download_file = dl
+        self.bot._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
+        self.bot.load_ledger()
+        first = dl.call_count
+        self.bot._list_bean_files = lambda: ("sha2", list(LEDGER_TREE))  # ledger changed
+        self.bot.load_ledger()
+        self.assertGreater(dl.call_count, first)  # re-downloaded on new sha
+
+    def test_fallback_path_is_never_cached(self):
+        # No tree sha (trees API down) → must not serve stale data from cache.
+        self.bot._list_bean_files = lambda: None
+        dl = MagicMock(side_effect=_ledger_download)
+        self.bot.github_download_file = dl
+        self.bot.load_ledger()
+        first = dl.call_count
+        self.bot.load_ledger()
+        self.assertGreater(dl.call_count, first)
 
     def test_run_bql_filters(self):
         _, rrows = self.bot.run_bql('SELECT date WHERE account ~ "Chase" ORDER BY date DESC')
@@ -872,7 +928,7 @@ class TestAnswerQueryRetry(unittest.TestCase):
 
     def _bot(self, *replies):
         b = make_bot()
-        b._list_bean_files = lambda: list(LEDGER_TREE)
+        b._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
         b.github_download_file = _ledger_download
         b._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]
         b._call_llm_backends = MagicMock(side_effect=list(replies))
@@ -909,7 +965,7 @@ class TestQueryEndToEnd(unittest.TestCase):
         self.bot = make_bot()
         self.bot.llm_enabled = True
         self.bot.send_message = MagicMock()
-        self.bot._list_bean_files = lambda: list(LEDGER_TREE)
+        self.bot._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
         self.bot.github_download_file = _ledger_download
         self.bot.parse_accounts = lambda: ["Expenses:Food", "Liabilities:CreditCard:Chase"]
         self.bot._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]

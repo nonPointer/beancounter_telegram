@@ -547,6 +547,9 @@ class Bot:
         self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0, "sha_map": None}
         self._accounts_cache_lock = threading.Lock()
         self._file_etag_cache = {}  # file_path -> {"etag": str, "content": str, "sha": str}
+        # Parsed ledger cached by repo tree sha; reused until any .bean file changes.
+        self._ledger_cache = {"tree_sha": None, "entries": None, "options_map": None}
+        self._ledger_cache_lock = threading.Lock()
         self.llm_enabled = LLM_ENABLED
 
         if not self.llm_enabled:
@@ -922,12 +925,14 @@ class Bot:
 
         return "\n".join(lines[:header_idx + 1] + [metadata_line] + lines[header_idx + 1:])
 
-    def _list_bean_files(self) -> list[str] | None:
+    def _list_bean_files(self) -> tuple[str, list[str]] | None:
         """List every .bean/.beancount path in the repo via the git trees API.
 
-        Returns None on failure so the caller can fall back. This is what lets the
-        loader resolve `include` globs (e.g. `include "config/*.bean"`): every file the
-        glob could match is fetched, not just the accounts/ files we know by name.
+        Returns (tree_sha, paths), or None on failure so the caller can fall back. The
+        tree sha changes iff any file changes, so load_ledger uses it as a cache key.
+        This is also what lets the loader resolve `include` globs (e.g.
+        `include "config/*.bean"`): every file the glob could match is fetched, not just
+        the accounts/ files we know by name.
         """
         url = f"{GITHUB_URL_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/git/trees/{BRANCH_NAME}?recursive=1"
         headers = {"Authorization": f"token {GITHUB_TOKEN}",
@@ -940,8 +945,9 @@ class Bot:
         data = r.json()
         if data.get("truncated"):
             log("Repo tree is truncated; some ledger files may be missing.")
-        return [t["path"] for t in data.get("tree", [])
-                if t.get("type") == "blob" and t["path"].endswith((".bean", ".beancount"))]
+        paths = [t["path"] for t in data.get("tree", [])
+                 if t.get("type") == "blob" and t["path"].endswith((".bean", ".beancount"))]
+        return data.get("sha"), paths
 
     def load_ledger(self) -> tuple[list, dict] | None:
         """Fetch the whole ledger and parse it with beancount's file loader.
@@ -951,12 +957,20 @@ class Bot:
         a temp dir preserving its path, then load_file(FILE_PATH) — this is the only way to
         honor arbitrary include directives. Downloads reuse github_download_file (ETag cache).
         """
-        paths = self._list_bean_files()
-        if paths is None:
-            # Fallback when the trees API is unavailable: at least the files we know by name.
-            paths = list(ACCOUNT_TYPE_MAP.values())
+        listed = self._list_bean_files()
+        if listed is None:
+            # Fallback when the trees API is unavailable: at least the files we know by
+            # name. No tree sha, so this path is never served from cache.
+            tree_sha, paths = None, list(ACCOUNT_TYPE_MAP.values())
+        else:
+            tree_sha, paths = listed
         if FILE_PATH not in paths:
             paths = paths + [FILE_PATH]
+
+        if tree_sha is not None:
+            with self._ledger_cache_lock:
+                if self._ledger_cache["tree_sha"] == tree_sha:
+                    return self._ledger_cache["entries"], self._ledger_cache["options_map"]
 
         texts = {}
         with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
@@ -981,6 +995,10 @@ class Bot:
                 os.path.join(tmpdir, FILE_PATH))
             if errors:
                 log(f"Ledger parsed with {len(errors)} error(s); first: {errors[0]}")
+            if tree_sha is not None:
+                with self._ledger_cache_lock:
+                    self._ledger_cache = {"tree_sha": tree_sha, "entries": entries,
+                                          "options_map": options_map}
             return entries, options_map
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1022,6 +1040,8 @@ class Bot:
         if parsed["intent"] == "query" and not parsed.get("bql"):
             log("Intent router said query but gave no BQL; treating input as an entry.")
             return {"intent": "entry"}
+        if parsed["intent"] == "query":
+            log(f"Query BQL from LLM: {parsed['bql']}")
         return parsed
 
     def answer_query(self, user_input: str, bql: str, today: str) -> tuple[str, str]:
