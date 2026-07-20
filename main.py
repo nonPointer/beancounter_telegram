@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import unicodedata
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta
 from pprint import pformat
@@ -407,22 +408,52 @@ def display_width(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
 
 
+# BQL column names (and common AS aliases) → labels shown to the user, so the reply
+# reads as a table of "商家/摘要/金额" rather than "payee/narration/sum_position".
+_COLUMN_LABELS = {
+    "date": "日期", "year": "年", "month": "月", "day": "日",
+    "account": "账户", "payee": "商家", "narration": "摘要",
+    "position": "金额", "number": "金额", "currency": "币种",
+    "balance": "余额", "flag": "标记", "tags": "标签", "links": "链接",
+    "total": "总额", "monthly_avg": "月均", "average": "平均", "avg": "平均",
+}
+
+
+def _friendly_header(name: str) -> str:
+    if name in _COLUMN_LABELS:
+        return _COLUMN_LABELS[name]
+    low = name.lower()
+    if low.startswith("count"):
+        return "笔数"
+    if low.startswith("sum"):
+        return "合计"
+    if low.startswith(("first", "last", "min", "max")):
+        return _COLUMN_LABELS.get(low.split("_", 1)[-1], name)
+    return name  # an LLM-chosen alias is usually already readable
+
+
 def _format_cell(value) -> str:
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return str(value)
     if isinstance(value, date_cls) and not isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, (set, frozenset)):
         return ",".join(sorted(str(v) for v in value))
+    if isinstance(value, Decimal):
+        # Amounts, averages, ratios: round to 2 dp with thousands separators so a
+        # monthly average shows 21.67, not 21.66666666666666666666666667.
+        return f"{value:,.2f}"
     return str(value)
 
 
 def format_query_result(rtypes, rrows, max_chars: int = QUERY_RESULT_MAX_CHARS) -> str:
     """Render BQL rows as a width-aware fixed-column table, truncated to fit Telegram."""
     if not rrows:
-        return "(no results)"
+        return "没有找到匹配的记录。"
 
-    headers = [name for name, _ in rtypes]
+    headers = [_friendly_header(name) for name, _ in rtypes]
     rows = [[_format_cell(v) for v in row] for row in rrows]
 
     widths = []
@@ -2021,13 +2052,11 @@ class Bot:
                     bql, rendered = self.answer_query(text, route["bql"], date_str)
                 except Exception as e:
                     log(f"Query failed: {e}")
-                    reply(f"Query failed: {e}")
+                    reply("查询没能完成，换个说法再试试？")
                     return
-                self.send_message(
-                    chat_id,
-                    f"{_code_block(rendered)}\n<code>{html.escape(bql)}</code>",
-                    parse_mode="HTML",
-                )
+                # Send only the formatted result. The BQL stays in the console log
+                # (Query BQL from LLM / BQL ok) — it's noise to the person asking.
+                self.send_message(chat_id, _code_block(rendered), parse_mode="HTML")
                 return
 
             try:

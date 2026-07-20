@@ -738,14 +738,43 @@ class TestQueryRendering(unittest.TestCase):
         self.assertEqual(main.display_width("a咖"), 3)
 
     def test_empty_result(self):
-        self.assertEqual(main.format_query_result([("date", str)], []), "(no results)")
+        self.assertIn("没有找到", main.format_query_result([("date", str)], []))
 
     def test_columns_sized_by_display_width(self):
+        # date -> 日期 (width 4), narration -> 摘要 (width 4); data widens them.
         rtypes = [("date", str), ("narration", str)]
         rows = [("2026-07-02", "买菜和日用品"), ("2026-07-01", "咖啡")]
         lines = main.format_query_result(rtypes, rows).splitlines()
         widths = [len(s) for s in lines[1].split("  ")]
         self.assertEqual(widths, [10, 12])  # 12 = display width of 买菜和日用品, not 6
+
+    def test_headers_are_localized(self):
+        rtypes = [("date", str), ("payee", str), ("narration", str), ("position", str)]
+        header = main.format_query_result(rtypes, [("d", "p", "n", "x")]).splitlines()[0]
+        self.assertIn("日期", header)
+        self.assertIn("商家", header)
+        self.assertIn("摘要", header)
+        self.assertIn("金额", header)
+        for raw in ("date", "payee", "narration", "position"):
+            self.assertNotIn(raw, header)
+
+    def test_aggregate_headers_localized(self):
+        # sum_* / count_* have no AS alias from the LLM.
+        self.assertEqual(main._friendly_header("sum_position"), "合计")
+        self.assertEqual(main._friendly_header("sum_number"), "合计")
+        self.assertEqual(main._friendly_header("count_position"), "笔数")
+        self.assertEqual(main._friendly_header("month"), "月")
+        self.assertEqual(main._friendly_header("monthly_avg"), "月均")
+        self.assertEqual(main._friendly_header("some_alias"), "some_alias")  # unknown kept
+
+    def test_decimal_rounded_and_grouped(self):
+        from decimal import Decimal
+        out = main.format_query_result(
+            [("total", str), ("monthly_avg", str)],
+            [(Decimal("1234.5"), Decimal("21.66666666666666666666666667"))])
+        self.assertIn("1,234.50", out)
+        self.assertIn("21.67", out)
+        self.assertNotIn("21.6666", out)
 
     def test_no_trailing_whitespace(self):
         out = main.format_query_result([("a", str), ("b", str)], [("x", "yyy"), ("zz", "w")])
@@ -976,8 +1005,8 @@ class TestQueryEndToEnd(unittest.TestCase):
             'WHERE account ~ \\"Chase\\" ORDER BY date DESC LIMIT 10"}'))
         self.bot.handle_message({"message": {"text": "列出最近的 chase 记录", "chat": {"id": 123}}})
         sent = "\n".join(str(c) for c in self.bot.send_message.call_args_list)
-        self.assertIn("Tesco", sent)
-        self.assertIn("SELECT", sent)
+        self.assertIn("Tesco", sent)          # the result reaches the user
+        self.assertNotIn("SELECT", sent)      # the raw BQL does not
         self.assertEqual(len(self.bot.pending_llm_entries), 0)
 
     def test_entry_still_creates_a_draft(self):
