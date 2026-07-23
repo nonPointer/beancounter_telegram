@@ -10,7 +10,9 @@ QUERY_ROUTER_SYSTEM_PROMPT = (
     "- 记账 (entry)：描述一笔已发生的消费/收入/转账。如「星巴克 35」「打车 20 微信」「昨天买菜 30」。\n"
     "- 查询 (query)：询问、检索、统计已有记录。如「最近10条 chase 记录」「这个月吃饭花了多少」"
     "「招行余额」「上个月总支出」「列出所有 Uber 消费」。\n"
-    "- 拿不准时选 entry：记账会先给用户看草稿再确认，误判代价小；查询是只读的。\n\n"
+    "- 拿不准时选 entry：记账会先给用户看草稿再确认，误判代价小；查询是只读的。\n"
+    "- 判为 entry 时，顺便提取 payee（商家/服务对象，不是支付渠道）：「星巴克 35」→「星巴克」，"
+    "「微信充值原神 100」→「原神」；没有明确商家（如「打车 20」「买菜 30」）时 payee 留空字符串。\n\n"
     "【BQL 语法】\n"
     "只用一种结构：SELECT <列/函数> WHERE <条件> [GROUP BY ...] [ORDER BY ...] [LIMIT n]。\n"
     "绝对不要写 FROM 子句，也不要用 JOURNAL、BALANCES、PRINT 这些关键字——它们不能和 "
@@ -42,7 +44,7 @@ QUERY_ROUTER_SYSTEM_PROMPT = (
     "- 统计类查询用 sum(position)，不要用 sum(number)（会把不同币种加在一起）。\n\n"
     "【输出格式】\n"
     "只输出 JSON，不要 markdown 代码块，不要任何解释：\n"
-    '记账：{"intent": "entry"}\n'
+    '记账：{"intent": "entry", "payee": "商家名，无则空字符串"}\n'
     '查询：{"intent": "query", "bql": "SELECT ..."}\n'
 )
 
@@ -232,6 +234,7 @@ def build_user_prompt(
     previous_draft: str | None = None,
     decline_reason: str | None = None,
     current_time: str = "",
+    examples: str | None = None,
 ) -> str:
     """构建用户 prompt"""
     time_info = f" (current time: {current_time})" if current_time else ""
@@ -242,6 +245,14 @@ def build_user_prompt(
         + "\n\n"
         f"User input: {user_input}\n"
     )
+
+    if examples:
+        prompt += (
+            "\n参考：用户过去给同一商家记的账（仅参照其账户选择、narration 风格和币种，"
+            "不要照抄金额或日期）：\n"
+            + examples
+            + "\n"
+        )
 
     if previous_draft:
         prompt += f"Previous declined draft:\n{previous_draft}\n\n"

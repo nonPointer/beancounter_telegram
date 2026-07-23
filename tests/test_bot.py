@@ -206,6 +206,121 @@ class TestNextPendingId(unittest.TestCase):
         self.assertEqual(len(results), len(set(results)), "Duplicate pending IDs generated")
 
 
+class TestExamplesForPayee(unittest.TestCase):
+    """Route A: past same-payee entries injected into the draft prompt."""
+
+    LEDGER = (
+        "2026-01-01 open Expenses:Food:Coffee\n"
+        "2026-01-01 open Assets:WeChat:Current\n"
+        "2026-01-01 open Assets:Cash\n\n"
+        '2026-03-10 * "瑞幸咖啡" "生椰拿铁"\n'
+        '  prompt: "瑞幸 18"\n'
+        "  Expenses:Food:Coffee   18.00 CNY\n"
+        "  Assets:WeChat:Current\n\n"
+        '2026-05-02 * "星巴克" "美式"\n'
+        "  Expenses:Food:Coffee   30.00 CNY\n"
+        "  Assets:Cash\n\n"
+        '2026-06-20 * "瑞幸" "拿铁"\n'
+        "  Expenses:Food:Coffee   16.00 CNY\n"
+        "  Assets:WeChat:Current\n"
+    )
+
+    def setUp(self):
+        self.bot = make_bot()
+        from beancount import loader
+        entries, _errors, opts = loader.load_string(self.LEDGER)
+        self.bot.load_ledger = lambda: (entries, opts)
+
+    def test_loose_substring_match(self):
+        # "瑞幸" matches both "瑞幸" and "瑞幸咖啡"; "星巴克" is excluded.
+        out = self.bot.examples_for_payee("瑞幸")
+        self.assertIn('"瑞幸咖啡"', out)
+        self.assertIn('"瑞幸"', out)
+        self.assertNotIn("星巴克", out)
+
+    def test_sorted_ascending_and_limited(self):
+        out = self.bot.examples_for_payee("瑞幸")
+        self.assertLess(out.index("2026-03-10"), out.index("2026-06-20"))
+        self.assertEqual(self.bot.examples_for_payee("瑞幸", limit=1).count("Expenses:Food:Coffee"), 1)
+
+    def test_metadata_stripped(self):
+        # The prompt/datetime metadata this pipeline injects must not leak into examples.
+        self.assertNotIn("prompt:", self.bot.examples_for_payee("瑞幸"))
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(self.bot.examples_for_payee("麦当劳"))
+
+    def test_empty_payee_returns_none(self):
+        self.assertIsNone(self.bot.examples_for_payee(""))
+        self.assertIsNone(self.bot.examples_for_payee("   "))
+
+    def test_ledger_unavailable_returns_none(self):
+        self.bot.load_ledger = lambda: None
+        self.assertIsNone(self.bot.examples_for_payee("瑞幸"))
+
+    def test_limit_boundary(self):
+        # 11 matching entries, default limit keeps the 10 most recent (drops the oldest).
+        from beancount import loader
+        lines = ["2026-01-01 open Expenses:X\n", "2026-01-01 open Assets:Cash\n\n"]
+        for d in range(1, 12):
+            lines.append(f'2026-02-{d:02d} * "Foo" "n{d}"\n  Expenses:X  1 CNY\n  Assets:Cash\n\n')
+        entries, _e, opts = loader.load_string("".join(lines))
+        self.bot.load_ledger = lambda: (entries, opts)
+        out = self.bot.examples_for_payee("Foo")
+        self.assertEqual(out.count('* "Foo"'), 10)
+        self.assertNotIn('"n1"', out)   # oldest dropped
+        self.assertIn('"n11"', out)     # newest kept
+
+    def test_cost_and_price_kept(self):
+        # Commodity/FX examples must stay balanced: cost {...} and price @ are rendered.
+        from beancount import loader
+        entries, _e, opts = loader.load_string(
+            "2026-01-01 open Assets:Broker\n2026-01-01 open Assets:Cash\n2026-01-01 open Assets:USD\n\n"
+            '2026-04-01 * "Broker" "buy"\n  Assets:Broker  10 AAPL {150.00 USD}\n  Assets:Cash  -1500.00 USD\n\n'
+            '2026-04-02 * "Broker" "fx"\n  Assets:USD  100 USD @ 7.10 CNY\n  Assets:Cash  -710.00 CNY\n')
+        self.bot.load_ledger = lambda: (entries, opts)
+        out = self.bot.examples_for_payee("Broker")
+        self.assertIn("{150.00 USD}", out)
+        self.assertIn("@ 7.10 CNY", out)
+
+    def test_quotes_escaped_stay_valid_beancount(self):
+        # A payee/narration containing double quotes must render as re-parseable beancount.
+        import beancount.parser.parser as parser
+        from beancount import loader
+        entries, _e, opts = loader.load_string(
+            "2026-01-01 open Expenses:Fun\n2026-01-01 open Assets:Cash\n\n"
+            '2026-04-01 * "Steam \\"Sale\\"" "bought \\"HL\\""\n  Expenses:Fun  50 CNY\n  Assets:Cash\n')
+        self.bot.load_ledger = lambda: (entries, opts)
+        out = self.bot.examples_for_payee("Steam")
+        self.assertIn('\\"Sale\\"', out)
+        _entries, errors, _opts = parser.parse_string(out)
+        self.assertEqual(errors, [])
+
+
+class TestBuildUserPromptExamples(unittest.TestCase):
+    """Route A: examples injected into the generation prompt, before the declined draft."""
+
+    def test_examples_injected(self):
+        from prompts import build_user_prompt
+        p = build_user_prompt("2026-07-21", ["Expenses:X"], "瑞幸 20",
+                              examples='2026-06-20 * "瑞幸" "拿铁"\n  Expenses:X  16 CNY')
+        self.assertIn("参考", p)
+        self.assertIn('"瑞幸"', p)
+
+    def test_no_examples_leaves_prompt_unchanged(self):
+        from prompts import build_user_prompt
+        self.assertNotIn("参考", build_user_prompt("2026-07-21", ["Expenses:X"], "打车 20"))
+        self.assertNotIn("参考", build_user_prompt("2026-07-21", ["Expenses:X"], "打车 20", examples=""))
+
+    def test_examples_precede_declined_draft(self):
+        # The 参考 block must come before the previous declined draft so the correction
+        # context is the last thing the model reads.
+        from prompts import build_user_prompt
+        p = build_user_prompt("2026-07-21", ["Expenses:X"], "瑞幸 20",
+                              previous_draft="OLD_DRAFT", examples="EXAMPLE_BLOCK")
+        self.assertLess(p.index("EXAMPLE_BLOCK"), p.index("OLD_DRAFT"))
+
+
 class TestNormalizeAndValidateLLMEntry(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()

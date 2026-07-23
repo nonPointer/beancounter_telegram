@@ -21,6 +21,7 @@ from dateutil.parser import parse as dateutil_parse
 import requests
 from requests.adapters import HTTPAdapter
 from beancount import loader as beancount_loader
+from beancount.core.data import Transaction
 from beancount.parser import parser as beancount_parser
 from beancount.query import query as beancount_query
 from jinja2 import Environment, FileSystemLoader
@@ -1042,6 +1043,56 @@ class Bot:
         entries, options_map = loaded
         return beancount_query.run_query(entries, options_map, bql)
 
+    @staticmethod
+    def _format_example_entry(txn) -> str:
+        """Render a parsed Transaction back to beancount text (header + postings only,
+        no metadata) so the LLM sees the user's own format without the noise of the
+        prompt/datetime metadata this pipeline injects separately. Cost {...} and price @
+        annotations are kept so commodity/FX examples stay balanced, and quotes in the
+        payee/narration are escaped so the reference text is valid beancount."""
+        def q(s: str | None) -> str:
+            return (s or "").replace('"', '\\"')
+
+        header = f'{txn.date.isoformat()} {txn.flag or "*"}'
+        if txn.payee:
+            header += f' "{q(txn.payee)}"'
+        header += f' "{q(txn.narration)}"'
+        lines = [header]
+        for p in txn.postings:
+            amount = ""
+            if p.units is not None:
+                amount = f"{p.units.number} {p.units.currency}"
+                if p.cost is not None and getattr(p.cost, "number", None) is not None:
+                    amount += f" {{{p.cost.number} {p.cost.currency}}}"
+                if p.price is not None:
+                    amount += f" @ {p.price.number} {p.price.currency}"
+            lines.append(f"  {p.account}  {amount}".rstrip())
+        return "\n".join(lines)
+
+    def examples_for_payee(self, payee: str, limit: int = 10) -> str | None:
+        """Return up to `limit` most recent past transactions whose payee matches,
+        rendered as beancount directives, to show the LLM this user's own format for
+        that merchant (route A in CLAUDE.md). Best-effort: returns None when the ledger
+        can't be loaded or nothing matches — it must never block entry generation.
+        Matching is loose (substring both ways, case-folded) because the payee is only
+        the router's guess and may not exactly equal the stored string."""
+        needle = payee.casefold().strip()
+        if not needle:
+            return None
+        loaded = self.load_ledger()
+        if loaded is None:
+            return None
+        entries, _ = loaded
+        matched = [
+            e for e in entries
+            if isinstance(e, Transaction) and e.payee
+            and (needle in e.payee.casefold() or e.payee.casefold() in needle)
+        ]
+        if not matched:
+            return None
+        matched.sort(key=lambda e: e.date)
+        return "\n\n".join(self._format_example_entry(e) for e in matched[-limit:])
+
     def route_intent(self, user_input: str, today: str) -> dict:
         """Classify the input as entry-vs-query and, for a query, produce a BQL.
 
@@ -1148,6 +1199,7 @@ class Bot:
         previous_draft: str | None = None,
         decline_reason: str | None = None,
         current_time: str = "",
+        examples: str | None = None,
     ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
@@ -1164,7 +1216,7 @@ class Bot:
                 prompt_draft = entry
                 prompt_reason = f"Previous draft validation error: {validation_error}"
 
-            user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time)
+            user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time, examples)
             payload = {
                 "temperature": 0.2,
                 "messages": [
@@ -2059,8 +2111,23 @@ class Bot:
                 self.send_message(chat_id, _code_block(rendered), parse_mode="HTML")
                 return
 
+            # Between the two LLM calls that a text entry already makes (router above,
+            # generator below), do a free local lookup: if the router named a payee,
+            # feed the user's own past entries for that merchant to the generator so it
+            # matches their account/narration conventions. Best-effort — never blocks.
+            examples = None
+            payee_raw = route.get("payee")
+            payee_hint = payee_raw.strip() if isinstance(payee_raw, str) else ""
+            if payee_hint:
+                try:
+                    examples = self.examples_for_payee(payee_hint)
+                    if examples:
+                        log(f"Injecting past entries for payee {payee_hint!r} into the draft prompt.")
+                except Exception as e:
+                    log(f"Payee-history lookup failed ({e}); generating without examples.")
+
             try:
-                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str)
+                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples)
                 appendix = self.insert_prompt_metadata(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
