@@ -235,6 +235,7 @@ def build_user_prompt(
     decline_reason: str | None = None,
     current_time: str = "",
     examples: str | None = None,
+    payees: list[str] | None = None,
 ) -> str:
     """构建用户 prompt"""
     time_info = f" (current time: {current_time})" if current_time else ""
@@ -245,6 +246,14 @@ def build_user_prompt(
         + "\n\n"
         f"User input: {user_input}\n"
     )
+
+    if payees:
+        prompt += (
+            "\n已知商家（历史 payee，按常用度排序）：若用户输入指向其中某个商家，"
+            "请沿用列表里的原名，避免生成拼写略有出入的新名称；无匹配时照常自行拟定 payee：\n"
+            + "、".join(payees)
+            + "\n"
+        )
 
     if examples:
         prompt += (

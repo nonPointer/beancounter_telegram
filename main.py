@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import unicodedata
+from collections import Counter
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_cls, datetime, timedelta
@@ -1093,6 +1094,39 @@ class Bot:
         matched.sort(key=lambda e: e.date)
         return "\n\n".join(self._format_example_entry(e) for e in matched[-limit:])
 
+    def frequent_payees(self, limit: int = 50) -> list[str]:
+        """Return up to `limit` payees ordered by how often they appear in the ledger.
+
+        Seeds the draft prompt so the LLM reuses the user's existing spelling of a
+        merchant instead of inventing a near-duplicate (「星巴克」vs「Starbucks」).
+        Best-effort: returns [] when the ledger can't be loaded — it must never block
+        entry generation. The O(n) count is cached alongside the parsed ledger (keyed by
+        tree sha), so it runs once per ledger change rather than once per draft."""
+        loaded = self.load_ledger()
+        if loaded is None:
+            return []
+        entries, _ = loaded
+        with self._ledger_cache_lock:
+            cached = self._ledger_cache.get("payees")
+            if cached is not None and self._ledger_cache["entries"] is entries:
+                return cached[:limit]
+        # Collapse interior whitespace so a payee that legally spans multiple lines in the
+        # ledger stays a single token here — otherwise a newline would break the one-line,
+        # 、-joined list we hand the LLM. Also merges names that differ only by whitespace.
+        counts = Counter(
+            norm for e in entries
+            if isinstance(e, Transaction) and e.payee
+            and (norm := re.sub(r"\s+", " ", e.payee).strip())
+        )
+        payees = [p for p, _ in counts.most_common()]
+        with self._ledger_cache_lock:
+            # Only stash against the ledger we actually counted; a concurrent reload may
+            # have swapped the cache. The full ranked list is kept so a larger limit can
+            # reuse it. The fallback (no tree sha) never caches entries, so it recomputes.
+            if self._ledger_cache["entries"] is entries:
+                self._ledger_cache["payees"] = payees
+        return payees[:limit]
+
     def route_intent(self, user_input: str, today: str) -> dict:
         """Classify the input as entry-vs-query and, for a query, produce a BQL.
 
@@ -1200,6 +1234,7 @@ class Bot:
         decline_reason: str | None = None,
         current_time: str = "",
         examples: str | None = None,
+        payees: list[str] | None = None,
     ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
@@ -1216,7 +1251,7 @@ class Bot:
                 prompt_draft = entry
                 prompt_reason = f"Previous draft validation error: {validation_error}"
 
-            user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time, examples)
+            user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time, examples, payees)
             payload = {
                 "temperature": 0.2,
                 "messages": [
@@ -2126,8 +2161,17 @@ class Bot:
                 except Exception as e:
                     log(f"Payee-history lookup failed ({e}); generating without examples.")
 
+            # Also hand the LLM the user's most-used merchant names so it snaps a fuzzy
+            # input onto an existing payee instead of coining a near-duplicate. Cached by
+            # ledger sha; best-effort — never blocks entry generation.
+            payees = None
             try:
-                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples)
+                payees = self.frequent_payees()
+            except Exception as e:
+                log(f"Frequent-payee lookup failed ({e}); generating without payee list.")
+
+            try:
+                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples, payees=payees)
                 appendix = self.insert_prompt_metadata(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
