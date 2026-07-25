@@ -451,6 +451,81 @@ class TestHandlePhotoMessage(unittest.TestCase):
                             for c in self.bot.send_message.call_args_list))
 
 
+class TestUndoConfirmCallback(unittest.TestCase):
+    """undo_confirm rewrites the whole file, so its commit branch handles 409/422 specially
+    (no retry — the precomputed content is stale) vs other errors (restore for one-tap retry)."""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.answer_callback_query = MagicMock()
+        self.bot.send_message = MagicMock()
+        self.bot.edit_message_reply_markup = MagicMock()
+        self.pid = self.bot.next_pending_id()
+        self.bot.pending_llm_entries[self.pid] = {
+            "kind": "undo",
+            "chat_id": 123,
+            "transaction_text": '2026-07-01 * "X" "y"',
+            "new_content": "; ledger\n",
+            "file_sha": "sha0",
+            "commit_message": "Revert: X y",
+            "created_at": time.time(),
+        }
+
+    def _fire(self):
+        self.bot.handle_callback_query({"callback_query": {
+            "id": "cb", "data": f"undo_confirm:{self.pid}",
+            "message": {"chat": {"id": 123}, "message_id": 7}}})
+
+    def test_success_commits_and_consumes_pending(self):
+        self.bot._github_put_file = MagicMock(return_value=(True, 200))
+        self._fire()
+        self.bot._github_put_file.assert_called_once()
+        self.assertNotIn(self.pid, self.bot.pending_llm_entries)
+        self.assertTrue(any("已撤回" in str(c.args) for c in self.bot.send_message.call_args_list))
+
+    def test_conflict_does_not_restore_and_tells_user_to_rerun(self):
+        self.bot._github_put_file = MagicMock(return_value=(False, 409))
+        self._fire()
+        # Stale precomputed content: the claimed entry stays gone, user must re-run /undo.
+        self.assertNotIn(self.pid, self.bot.pending_llm_entries)
+        self.assertTrue(any("/undo" in str(c.args) for c in self.bot.send_message.call_args_list))
+
+    def test_other_error_restores_for_retry(self):
+        self.bot._github_put_file = MagicMock(return_value=(False, 500))
+        self._fire()
+        # A transient failure keeps the draft (fresh) so one more tap retries.
+        self.assertIn(self.pid, self.bot.pending_llm_entries)
+
+
+class TestCallbackQueryBranches(unittest.TestCase):
+    """Non-happy-path routing in handle_callback_query."""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.answer_callback_query = MagicMock()
+        self.bot.send_message = MagicMock()
+        self.bot.edit_message_reply_markup = MagicMock()
+
+    def test_malformed_data_is_unknown_action(self):
+        # No colon → cannot split into (action, pending_id).
+        self.bot.pending_llm_entries["keep"] = {"chat_id": 123, "created_at": time.time()}
+        self.bot.handle_callback_query({"callback_query": {
+            "id": "cb", "data": "garbage",
+            "message": {"chat": {"id": 123}, "message_id": 1}}})
+        self.bot.answer_callback_query.assert_called_once_with("cb", "Unknown action")
+        self.assertIn("keep", self.bot.pending_llm_entries)  # untouched
+
+    def test_decline_reason_binds_chat_and_keeps_draft(self):
+        pid = self.bot.next_pending_id()
+        self.bot.pending_llm_entries[pid] = self.bot._make_pending_entry(123, "e", "m", "u", "2026-07-01")
+        self.bot.handle_callback_query({"callback_query": {
+            "id": "cb", "data": f"decline_reason:{pid}",
+            "message": {"chat": {"id": 123}, "message_id": 1}}})
+        # Recheck flow is armed: chat is bound to the pending id and the draft is NOT popped.
+        self.assertEqual(self.bot.pending_decline_reasons.get(123), pid)
+        self.assertIn(pid, self.bot.pending_llm_entries)
+
+
 class TestSendMessageHardening(unittest.TestCase):
     """R1/R2: over-limit plain text is truncated; a non-JSON error body can't raise."""
 
@@ -502,6 +577,118 @@ class TestScrub(unittest.TestCase):
 
     def test_non_str_coerced(self):
         self.assertEqual(main._scrub({"k": "v"}), str({"k": "v"}))
+
+
+class TestCappedCodeBlock(unittest.TestCase):
+    """R3: the HTML code block stays within budget even after escaping expands the text."""
+
+    def test_short_text_untouched(self):
+        block, truncated = main._capped_code_block("hello", 4096)
+        self.assertEqual(block, "<pre><code>hello</code></pre>")
+        self.assertFalse(truncated)
+
+    def test_escaping_expansion_respected(self):
+        # 3000 double-quotes each escape to &quot; (6x); the wrapped block must still fit.
+        block, truncated = main._capped_code_block('"' * 3000, 500)
+        self.assertLessEqual(len(block), 500)
+        self.assertTrue(truncated)
+
+    def test_empty_stays_empty_block(self):
+        block, truncated = main._capped_code_block("", 4096)
+        self.assertEqual(block, "<pre><code></code></pre>")
+        self.assertFalse(truncated)
+
+    def test_astral_emoji_counted_as_utf16(self):
+        # Telegram counts an astral emoji as 2 UTF-16 units; a budget measured in code points
+        # would let an all-emoji block slip over the real cap. The returned block must fit the
+        # budget in UTF-16 units, not code points.
+        block, truncated = main._capped_code_block("🎉" * 2000, 500)
+        self.assertLessEqual(main._utf16_len(block), 500)
+        self.assertTrue(truncated)
+
+
+class TestUtf16Len(unittest.TestCase):
+    def test_astral_and_bmp(self):
+        self.assertEqual(main._utf16_len("今"), 1)   # BMP CJK
+        self.assertEqual(main._utf16_len("🎉"), 2)   # astral emoji = surrogate pair
+        self.assertEqual(main._utf16_len("ab"), 2)
+
+
+class TestGetTelegramFileBytes(unittest.TestCase):
+    """R4: a 200 with a malformed body honours the None contract instead of raising."""
+
+    def setUp(self):
+        self.bot = make_bot()
+
+    def test_missing_result_key_returns_none(self):
+        r = MagicMock(); r.status_code = 200; r.json.return_value = {"ok": True}
+        with patch.object(main.HTTP, "get", return_value=r):
+            self.assertIsNone(self.bot.get_telegram_file_bytes("f1"))
+
+    def test_non_json_body_returns_none(self):
+        r = MagicMock(); r.status_code = 200; r.json.side_effect = ValueError("no json")
+        with patch.object(main.HTTP, "get", return_value=r):
+            self.assertIsNone(self.bot.get_telegram_file_bytes("f1"))
+
+
+class TestManualTransactionValidation(unittest.TestCase):
+    """S2: the hand-entered multi-line path escapes quotes and parses before committing."""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.send_message = MagicMock()
+        self.appended = {}
+        def fake_append(appendix, msg, path):
+            self.appended["appendix"] = appendix
+            return True, ""
+        self.bot.append_to_file = fake_append
+        self.bot.match_account = lambda suffix: {
+            "coffee": "Expenses:Food:Coffee", "cash": "Assets:Cash"}.get(suffix.lower())
+
+    def _send(self, text):
+        self.bot.handle_message({"message": {"text": text, "chat": {"id": 123}}})
+
+    def test_quote_in_payee_is_escaped_and_parses(self):
+        self._send('星巴克"VIP"\n咖啡\ncoffee 30 CNY\ncash -30 CNY')
+        appendix = self.appended.get("appendix", "")
+        self.assertIn('\\"VIP\\"', appendix)
+        import beancount.parser.parser as parser
+        _e, errors, _o = parser.parse_string(appendix)
+        self.assertEqual(errors, [])
+
+    def test_backslash_in_payee_round_trips(self):
+        # A literal backslash must be escaped so beancount stores it faithfully rather than
+        # interpreting \U / \n as an escape and silently mangling the payee.
+        self._send('C:\\Users\\me\n备注\ncoffee 30 CNY\ncash -30 CNY')
+        appendix = self.appended.get("appendix", "")
+        import beancount.parser.parser as parser
+        entries, errors, _o = parser.parse_string(appendix)
+        self.assertEqual(errors, [])
+        self.assertEqual(entries[0].payee, 'C:\\Users\\me')
+
+    def test_leading_digit_currency_rejected(self):
+        # "3NVD" parses as a number in beancount; reject it with a clear message up front.
+        self.bot.send_message.reset_mock()
+        self._send('店\n备注\ncoffee 30 3NVD\ncash -30 3NVD')
+        self.assertNotIn("appendix", self.appended)
+        self.assertTrue(any("货币符号" in str(c.args)
+                            for c in self.bot.send_message.call_args_list))
+
+    def test_single_letter_currency_rejected(self):
+        # beancount requires >= 2 chars; a single letter must be rejected up front rather
+        # than passing the regex and hitting an opaque parser error at commit.
+        self.bot.send_message.reset_mock()
+        self._send('店\n备注\ncoffee 30 X\ncash -30 X')
+        self.assertNotIn("appendix", self.appended)
+        self.assertTrue(any("货币符号" in str(c.args)
+                            for c in self.bot.send_message.call_args_list))
+
+    def test_letters_then_digits_currency_accepted(self):
+        self._send('店\n备注\ncoffee 30 NVD3\ncash -30 NVD3')
+        appendix = self.appended.get("appendix", "")
+        import beancount.parser.parser as parser
+        _e, errors, _o = parser.parse_string(appendix)
+        self.assertEqual(errors, [])
 
 
 class TestNormalizeAndValidateLLMEntry(unittest.TestCase):

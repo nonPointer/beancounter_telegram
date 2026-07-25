@@ -36,6 +36,9 @@ from prompts import (
 
 MAX_BEANCOUNT_RETRIES = 3
 
+# Rounding slack when checking that a transaction's postings sum to zero.
+BALANCE_TOLERANCE = 0.0001
+
 # Re-reads to attempt when GitHub rejects a write because the file moved under us.
 GITHUB_CONFLICT_RETRIES = 3
 
@@ -145,10 +148,36 @@ def _scrub(value) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
 
 
+def _is_account_error(message: str) -> bool:
+    """True when an LLM-generation error is really 'a needed account is missing', which the
+    user can fix — so we surface the guidance verbatim instead of a generic failure notice."""
+    return bool(message) and ("账户" in message or "account" in message.lower())
+
+
 _FAKE_YEAR = 9999
 _pdt_consts = pdt.Constants(usePyICU=False)
 _pdt_consts.DOWParseStyle = -1  # "Monday" → today or the *last* Monday
 _pdt_calendar = pdt.Calendar(_pdt_consts, version=pdt.VERSION_CONTEXT_STYLE)
+
+# Chinese relative-date keywords, matched by prefix against the first line of input. These
+# are constants, so build them once at import rather than on every inbound text message.
+_CHINESE_DATE_MAP = {
+    '大前天': timedelta(days=-3),
+    '前天': timedelta(days=-2),
+    '前晚': timedelta(days=-2),
+    '昨天': timedelta(days=-1),
+    '昨晚': timedelta(days=-1),
+    '昨早': timedelta(days=-1),
+    '今天': timedelta(days=0),
+    '今晚': timedelta(days=0),
+    '今早': timedelta(days=0),
+    '明天': timedelta(days=1),
+    '明早': timedelta(days=1),
+    '明晚': timedelta(days=1),
+    '后天': timedelta(days=2),
+}
+_CN_DAY_NAMES = {'一': 0, '二': 1, '三': 2, '四': 3,
+                 '五': 4, '六': 5, '日': 6, '天': 6}
 
 
 def _join_remaining(rest_of_first: str, lines: list) -> str:
@@ -177,24 +206,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         return now.strftime('%Y-%m-%d'), False, text
 
     # --- Layer 0: Chinese date keywords (prefix matching) ---
-    _chinese_date_map = {
-        '大前天': timedelta(days=-3),
-        '前天': timedelta(days=-2),
-        '前晚': timedelta(days=-2),
-        '昨天': timedelta(days=-1),
-        '昨晚': timedelta(days=-1),
-        '昨早': timedelta(days=-1),
-        '今天': timedelta(days=0),
-        '今晚': timedelta(days=0),
-        '今早': timedelta(days=0),
-        '明天': timedelta(days=1),
-        '明早': timedelta(days=1),
-        '明晚': timedelta(days=1),
-        '后天': timedelta(days=2),
-    }
-    _cn_day_names = {'一': 0, '二': 1, '三': 2, '四': 3,
-                     '五': 4, '六': 5, '日': 6, '天': 6}
-    for _kw, _delta in _chinese_date_map.items():
+    for _kw, _delta in _CHINESE_DATE_MAP.items():
         if first_line.startswith(_kw):
             d = now + _delta
             date_str = d.strftime('%Y-%m-%d')
@@ -207,7 +219,7 @@ def parse_natural_date(text: str, now: datetime) -> tuple[str, bool, str]:
         first_line, re.DOTALL)
     if _chinese_weekday_re:
         prefix, day_char, rest_of_first = _chinese_weekday_re.groups()
-        target_wd = _cn_day_names[day_char]
+        target_wd = _CN_DAY_NAMES[day_char]
         current_wd = now.weekday()
         if prefix[0] == '上':
             weeks_back = len(prefix)
@@ -364,6 +376,31 @@ QUERY_RESULT_MAX_CHARS = 3500
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 
+def _utf16_len(s: str) -> int:
+    """Telegram measures a message against its 4096 cap in UTF-16 code units, so an astral
+    char (most emoji) counts as 2, not 1. Python's len() counts code points; use this wherever
+    a Telegram length cap is enforced, or an emoji near the limit slips over it and 400s."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _capped_code_block(text: str, budget: int) -> tuple[str, bool]:
+    """Return (html_code_block, truncated) whose UTF-16 length is <= `budget`.
+
+    html.escape only ever grows the string (a quote-heavy beancount line can nearly double),
+    so truncating the raw text before escaping — as callers used to — can still overflow past
+    the limit once wrapped, silently 400ing the whole HTML message. Here we shrink the raw
+    text until the *escaped, wrapped* result fits, measured in UTF-16 units (what Telegram
+    counts), so it can't reflow over budget."""
+    truncated = False
+    while True:
+        block = _code_block(text)
+        overshoot = _utf16_len(block) - budget
+        if overshoot <= 0 or not text:
+            return block, truncated
+        text = text[:-max(overshoot, 1)]
+        truncated = True
+
+
 def extract_json_object(text: str) -> dict | None:
     """Pull the first JSON object out of an LLM reply, tolerating code fences and prose.
 
@@ -496,6 +533,27 @@ def format_query_result(rtypes, rrows, max_chars: int = QUERY_RESULT_MAX_CHARS) 
     return "\n".join(head + kept + [f"... ({dropped} more rows omitted)"])
 
 
+def _directive_block_span(lines: list[str], header_idx: int) -> tuple[int, int]:
+    """Given the index of a directive header line, return (comment_start, block_end).
+
+    `comment_start` extends backward over any leading ';' comment lines; `block_end` is the
+    exclusive end after the header's continuation lines (indented or blank), with trailing
+    blank lines trimmed off. Shared by extract_all/extract_last so the two can't drift."""
+    comment_start = header_idx
+    while comment_start > 0 and lines[comment_start - 1].startswith(';'):
+        comment_start -= 1
+    block_end = header_idx + 1
+    while block_end < len(lines):
+        line = lines[block_end]
+        if line.strip() == '' or line[0] in (' ', '\t'):
+            block_end += 1
+        else:
+            break
+    while block_end > header_idx + 1 and lines[block_end - 1].strip() == '':
+        block_end -= 1
+    return comment_start, block_end
+
+
 def extract_all_directive_blocks(content: str) -> list[tuple[str, str]]:
     """Returns list of (date_str, directive_block_text) for all directives, in file order.
 
@@ -507,23 +565,7 @@ def extract_all_directive_blocks(content: str) -> list[tuple[str, str]]:
     while i < len(lines):
         if _DIRECTIVE_HEADER_RE.match(lines[i]):
             date_str = lines[i][:10]
-            # Look backward for leading ';' comment lines
-            comment_start = i
-            while comment_start > 0 and lines[comment_start - 1].startswith(';'):
-                comment_start -= 1
-            # Find block end: continuation lines are indented or blank
-            block_end = i + 1
-            while block_end < len(lines):
-                line = lines[block_end]
-                if line.strip() == '':
-                    block_end += 1
-                elif line[0] in (' ', '\t'):
-                    block_end += 1
-                else:
-                    break
-            # Trim trailing blank lines from block
-            while block_end > i + 1 and lines[block_end - 1].strip() == '':
-                block_end -= 1
+            comment_start, block_end = _directive_block_span(lines, i)
             directive_text = '\n'.join(lines[comment_start:block_end])
             blocks.append((date_str, directive_text))
             i = block_end
@@ -542,23 +584,7 @@ def extract_last_directive_block(content: str) -> tuple[str, str] | None:
             break
     if last_idx is None:
         return None
-    # Look backward for leading ';' comment lines
-    comment_start = last_idx
-    while comment_start > 0 and lines[comment_start - 1].startswith(';'):
-        comment_start -= 1
-    # Find block end: stop at next col-0 non-blank line
-    block_end = last_idx + 1
-    while block_end < len(lines):
-        line = lines[block_end]
-        if line.strip() == '':
-            block_end += 1
-        elif line[0] not in (' ', '\t'):
-            break
-        else:
-            block_end += 1
-    # Trim trailing blank lines from block
-    while block_end > last_idx + 1 and lines[block_end - 1].strip() == '':
-        block_end -= 1
+    comment_start, block_end = _directive_block_span(lines, last_idx)
     directive_text = '\n'.join(lines[comment_start:block_end])
     # Remove block + its leading blank separator
     remove_start = comment_start
@@ -822,7 +848,7 @@ class Bot:
         currencies = set(p["currency"] for p in postings)
         if len(currencies) == 1:
             total = sum(float(p["amount"]) for p in postings)
-            if abs(total) > 0.0001:
+            if abs(total) > BALANCE_TOLERANCE:
                 raise ValueError(f"LLM output invalid: postings do not balance (sum = {total:.4f}).")
 
         if len(postings) == 2:
@@ -836,7 +862,7 @@ class Bot:
             if a0 * a1 >= 0:
                 raise ValueError("LLM output invalid: two postings must be one positive and one negative.")
 
-            if c0 == c1 and abs(a0 + a1) > 0.0001:
+            if c0 == c1 and abs(a0 + a1) > BALANCE_TOLERANCE:
                 raise ValueError(f"LLM output invalid: same-currency postings are unbalanced ({a0} + {a1} != 0).")
 
             if c0 != c1:
@@ -1046,9 +1072,12 @@ class Bot:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def run_bql(self, bql: str) -> tuple[list, list]:
-        """Execute a BQL query. Raises on a bad query; the caller feeds that back to the LLM."""
-        loaded = self.load_ledger()
+    def run_bql(self, bql: str, loaded=None) -> tuple[list, list]:
+        """Execute a BQL query. Raises on a bad query; the caller feeds that back to the LLM.
+        Callers retrying a query pass a cached `load_ledger()` result as `loaded` to avoid
+        re-fetching and re-parsing the (unchanged) ledger on every attempt."""
+        if loaded is None:
+            loaded = self.load_ledger()
         if loaded is None:
             raise ValueError("Failed to download the ledger from GitHub.")
         entries, options_map = loaded
@@ -1180,10 +1209,15 @@ class Bot:
         Mirrors the beancount-syntax retry loop used for entries. Returns (bql, rendered).
         """
         accounts = self._accounts_for_prompt()
+        # The ledger can't change across retries, so load it once here rather than paying a
+        # fetch+parse (or, on the no-tree-sha fallback path, a full re-download) each attempt.
+        loaded = self.load_ledger()
+        if loaded is None:
+            raise ValueError("Failed to download the ledger from GitHub.")
         error = None
         for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
             try:
-                rtypes, rrows = self.run_bql(bql)
+                rtypes, rrows = self.run_bql(bql, loaded=loaded)
                 log(f"BQL ok ({len(rrows)} rows): {bql}")
                 return bql, format_query_result(rtypes, rrows)
             except ValueError:
@@ -1298,7 +1332,13 @@ class Bot:
         if r.status_code != 200:
             log(f"Error getting file info: {r.status_code}")
             return None
-        file_path = r.json()["result"]["file_path"]
+        try:
+            file_path = r.json()["result"]["file_path"]
+        except (ValueError, KeyError, TypeError) as e:
+            # A 200 with a malformed/non-JSON body must honour this method's None contract
+            # (the caller replies "Failed to download the image."), not raise past it.
+            log(f"getFile returned an unexpected body: {e}")
+            return None
         token = config["TELEGRAM_BOT_TOKEN"]
         dl = HTTP.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=60)
         if dl.status_code != 200:
@@ -1404,7 +1444,6 @@ class Bot:
 
         dt = datetime.now(self.timezone)
         date_str = dt.strftime('%Y-%m-%d')
-        time_str = dt.strftime('%H:%M')
         datetime_str = dt.isoformat(timespec='seconds')
 
         # Use highest-resolution photo
@@ -1497,13 +1536,11 @@ class Bot:
             return
         last_blocks = blocks[-count:]
         text = "\n\n".join(block_text for _, block_text in last_blocks)
-        truncated = False
-        if len(text) > 4000:
-            text = text[:4000]
-            truncated = True
-        msg = f"最近 {len(last_blocks)} 条记录：\n{_code_block(text)}"
-        if truncated:
-            msg += "\n（内容过长，已截断显示）"
+        prefix = f"最近 {len(last_blocks)} 条记录：\n"
+        notice = "\n（内容过长，已截断显示）"
+        block, truncated = _capped_code_block(
+            text, TELEGRAM_MESSAGE_LIMIT - _utf16_len(prefix) - _utf16_len(notice))
+        msg = prefix + block + (notice if truncated else "")
         self.send_message(
             chat_id,
             msg,
@@ -1522,9 +1559,13 @@ class Bot:
             self.send_message(chat_id, f"今天（{today}）没有记录。")
             return
         text = "\n\n".join(block_text for _, block_text in today_blocks)
+        prefix = f"今天（{today}）共 {len(today_blocks)} 条记录：\n"
+        notice = "\n（内容过长，已截断显示）"
+        block, truncated = _capped_code_block(
+            text, TELEGRAM_MESSAGE_LIMIT - _utf16_len(prefix) - _utf16_len(notice))
         self.send_message(
             chat_id,
-            f"今天（{today}）共 {len(today_blocks)} 条记录：\n{_code_block(text)}",
+            prefix + block + (notice if truncated else ""),
             parse_mode="HTML",
         )
 
@@ -1534,8 +1575,14 @@ class Bot:
         # (e.g. an error that embeds raw LLM output) would fail *silently*, leaving the user
         # with nothing. Guard plain text here; HTML callers pre-truncate their own payload
         # so we must not blind-cut mid-tag.
-        if parse_mode is None and isinstance(text, str) and len(text) > TELEGRAM_MESSAGE_LIMIT:
-            text = text[:TELEGRAM_MESSAGE_LIMIT - 1] + "…"
+        if parse_mode is None and isinstance(text, str) and _utf16_len(text) > TELEGRAM_MESSAGE_LIMIT:
+            # Cut by code points until the UTF-16 length (what Telegram counts) fits, leaving
+            # room for the ellipsis. Over-cuts on astral chars, which is fine — it only needs
+            # to get under the cap, and this path is a last-resort backstop for outsized text.
+            text = text[:TELEGRAM_MESSAGE_LIMIT - 1]
+            while _utf16_len(text) > TELEGRAM_MESSAGE_LIMIT - 1:
+                text = text[:-1]
+            text += "…"
         data = {"chat_id": chat_id, "text": text}
         if parse_mode:
             data["parse_mode"] = parse_mode
@@ -1698,7 +1745,7 @@ class Bot:
             self._pop_pending(pending_id)
             log(f"LLM recheck failed: {e}")
             error_text = str(e)
-            if error_text and ("账户" in error_text or "account" in error_text.lower()):
+            if _is_account_error(error_text):
                 self.send_message(chat_id, error_text)
             else:
                 self.send_message(chat_id, f"LLM recheck failed: {e}")
@@ -2170,7 +2217,11 @@ class Bot:
                     return
                 # Send only the formatted result. The BQL stays in the console log
                 # (Query BQL from LLM / BQL ok) — it's noise to the person asking.
-                self.send_message(chat_id, _code_block(rendered), parse_mode="HTML")
+                # format_query_result caps by code points; go through the UTF-16-aware
+                # capper so an emoji-heavy table can't still overflow Telegram's cap on
+                # this HTML path (which bypasses send_message's plain-text guard).
+                block, _ = _capped_code_block(rendered, TELEGRAM_MESSAGE_LIMIT)
+                self.send_message(chat_id, block, parse_mode="HTML")
                 return
 
             # Between the two LLM calls that a text entry already makes (router above,
@@ -2221,7 +2272,7 @@ class Bot:
             except Exception as e:
                 log(f"LLM generation failed: {e}")
                 error_text = str(e)
-                if error_text and ("账户" in error_text or "account" in error_text.lower()):
+                if _is_account_error(error_text):
                     reply(error_text)
                 else:
                     reply(f"LLM generation failed: {e}")
@@ -2276,8 +2327,12 @@ class Bot:
                 currency = pmatches.group(3)
                 rest = pmatches.group(4) or ""
 
-                if not re.match(r'^[A-Z0-9][A-Z0-9\'._-]*$', currency) or not re.search(r'[A-Z]', currency):
-                    reply(f"货币符号 '{currency}' 无效：必须全部大写，可包含数字，例如 USD、CNY、3NVD。")
+                # beancount commodities are 2-24 chars, start with an uppercase letter and end
+                # with a letter or digit (a leading digit like "3NVD" parses as a number, a
+                # single letter is rejected, and 24 is the max length). Mirror that exactly here
+                # so the user gets a clear error instead of an opaque parser failure at commit.
+                if not re.match(r"^[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]$", currency):
+                    reply(f"货币符号 '{currency}' 无效：需以大写字母开头、字母或数字结尾，2-24 位，例如 USD、CNY、NVD3。")
                     return
 
                 postings.append({
@@ -2298,7 +2353,7 @@ class Bot:
                     return
 
                 if c0 == c1:
-                    if abs(a0 + a1) > 0.0001:
+                    if abs(a0 + a1) > BALANCE_TOLERANCE:
                         reply(f"同币种 {c0} 的两条 posting 金额不平衡：{a0} + {a1} != 0")
                         return
                 else:
@@ -2307,10 +2362,21 @@ class Bot:
                         reply(f"不同币种 ({c0}/{c1}) 的交易需要标记成本 {{}} 或价格 @。")
                         return
 
+            # The template drops payee/narration straight between quotes, so a literal " (or
+            # \) would produce a malformed or silently-mangled directive. Escape both the same
+            # way insert_prompt_metadata does (backslash first, then quote) and parse the
+            # rendered result before committing, so a bad manual entry never poisons the ledger
+            # and every downstream reader (/last, /today, /undo, NL→BQL).
+            def _esc(s: str) -> str:
+                return s.replace('\\', '\\\\').replace('"', '\\"')
             appendix = jinja2.get_template("transaction.bean.j2").render(
-                date=date_str, payee=payee, narration=narration,
+                date=date_str, payee=_esc(payee), narration=_esc(narration),
                 postings=postings, tag=tag, link=link, datetime=datetime_str,
             )
+            syntax_error = self.validate_beancount_syntax(appendix)
+            if syntax_error:
+                reply(f"生成的分录无法通过 beancount 校验：{syntax_error}")
+                return
 
         ok, err = self.append_to_file(appendix, commit_message.strip(), target_file_path)
         if ok:
