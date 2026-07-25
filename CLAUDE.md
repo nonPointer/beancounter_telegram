@@ -183,7 +183,15 @@ If a date is detected, it overrides today's date and the first line is stripped 
 ### Input validation
 - `/open` validates account name against beancount pattern (`^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$`) and currency against `^[A-Z][A-Z0-9]{0,9}$`
 - `/update` validates amount is numeric
-- Manual transaction postings validate currency format
+- Manual (hand-typed multi-line) transactions validate each currency against beancount's real
+  commodity rule (`^[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]$` — 2–24 chars, upper-alpha start, alnum
+  end), escape `\` and `"` in payee/narration, and run `validate_beancount_syntax` on the
+  rendered directive **before** commit — so a bad hand entry can't poison the ledger and every
+  downstream reader (`/last`, `/today`, `/undo`, NL→BQL). This mirrors the LLM path's validation.
+- Telegram counts message length in UTF-16 code units, so every length cap uses `_utf16_len`
+  (an astral emoji = 2). Plain text is capped in `send_message`; HTML code blocks (`/last`,
+  `/today`, query results) go through `_capped_code_block`, which shrinks the raw text until the
+  html-escaped, wrapped result fits — escaping alone could otherwise reflow it back over 4096.
 
 ### GitHub Actions workflows (`.github/workflows/*.yml.example`)
 - `monthly-report.yml.example` — daily Sankey chart of monthly expenses sent to Telegram; configurable `REPORT_CURRENCY` and `FX_RATES` (JSON dict) at workflow `env` level; aggregates sub-accounts into top-level categories
