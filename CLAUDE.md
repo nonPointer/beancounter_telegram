@@ -92,6 +92,24 @@ syntax validation (a download failure is not retried). Queries are read-only (no
 `format_query_result()` sizes columns by `display_width()` (CJK=2) because beancount's own
 renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
 
+### Payee context for drafts
+When the router classifies input as an entry, two best-effort lookups enrich the draft prompt
+so the LLM matches the user's own conventions. Both reuse `load_ledger()`'s tree-sha cache
+(no extra download) and **never block entry generation** — any failure logs and falls back to
+generating without the context.
+- **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's
+  most recent past transactions for that merchant (loose case-folded substring match, either
+  direction) are rendered back to beancount text via `_format_example_entry` (header + postings
+  only, no metadata) and shown so the LLM reuses the account/narration/currency conventions.
+- **Frequent-payee list** (`frequent_payees`): the top 50 payees by frequency across the whole
+  ledger are handed to the LLM so it snaps a fuzzy input onto an existing merchant spelling
+  instead of coining a near-duplicate. The ranked list is cached in `_ledger_cache["payees"]`
+  keyed by tree sha (recomputed only when the ledger changes, guarded by an `entries is entries`
+  identity check against a concurrent reload). Interior whitespace is collapsed so a multi-line
+  payee stays a single `、`-joined token.
+
+Both feed into `build_user_prompt(..., examples, payees)`, threaded through `call_openai_compatible`.
+
 ### Beancount syntax validation
 After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
 
