@@ -321,6 +321,189 @@ class TestBuildUserPromptExamples(unittest.TestCase):
         self.assertLess(p.index("EXAMPLE_BLOCK"), p.index("OLD_DRAFT"))
 
 
+class TestFrequentPayees(unittest.TestCase):
+    """The top-N payee list handed to the generator so it reuses existing spellings."""
+
+    LEDGER = (
+        "2026-01-01 open Expenses:Food:Coffee\n"
+        "2026-01-01 open Assets:Cash\n\n"
+        '2026-03-10 * "瑞幸咖啡" "a"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-03-11 * "瑞幸咖啡" "b"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-03-12 * "瑞幸咖啡" "c"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-05-02 * "星巴克" "d"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-05-03 * "星巴克" "e"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-06-20 * "麦当劳" "f"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n'
+    )
+
+    def _load(self, ledger):
+        from beancount import loader
+        entries, _e, opts = loader.load_string(ledger)
+        return entries, opts
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.entries, self.opts = self._load(self.LEDGER)
+        self.bot.load_ledger = lambda: (self.entries, self.opts)
+
+    def test_sorted_by_frequency(self):
+        # 瑞幸咖啡 x3 > 星巴克 x2 > 麦当劳 x1
+        self.assertEqual(self.bot.frequent_payees(), ["瑞幸咖啡", "星巴克", "麦当劳"])
+
+    def test_limit_slices_top_n(self):
+        self.assertEqual(self.bot.frequent_payees(limit=2), ["瑞幸咖啡", "星巴克"])
+
+    def test_ledger_unavailable_returns_empty(self):
+        self.bot.load_ledger = lambda: None
+        self.assertEqual(self.bot.frequent_payees(), [])
+
+    def test_whitespace_collapsed_and_merged(self):
+        # A payee written with interior double-space and its single-space twin collapse to
+        # one token (re.sub \s+ → " ") and are counted together — otherwise the 、-joined
+        # list handed to the LLM could break across the extra whitespace.
+        entries, opts = self._load(
+            "2026-01-01 open Expenses:X\n2026-01-01 open Assets:Cash\n\n"
+            '2026-02-01 * "A  B" "n"\n  Expenses:X  1 CNY\n  Assets:Cash\n\n'
+            '2026-02-02 * "A B" "n"\n  Expenses:X  1 CNY\n  Assets:Cash\n')
+        self.bot.load_ledger = lambda: (entries, opts)
+        self.assertEqual(self.bot.frequent_payees(), ["A B"])
+
+    def test_none_payee_ignored(self):
+        # A single-string directive is a narration with no payee; it must not appear.
+        entries, opts = self._load(
+            "2026-01-01 open Expenses:X\n2026-01-01 open Assets:Cash\n\n"
+            '2026-02-01 * "转账"\n  Expenses:X  1 CNY\n  Assets:Cash\n\n'
+            '2026-02-02 * "Foo" "n"\n  Expenses:X  1 CNY\n  Assets:Cash\n')
+        self.bot.load_ledger = lambda: (entries, opts)
+        self.assertEqual(self.bot.frequent_payees(), ["Foo"])
+
+    def test_cached_by_entries_identity(self):
+        # First call stashes against the current cache entries; a second call with the same
+        # entries object serves from cache. Corrupt the stored list to prove no recount.
+        self.bot._ledger_cache["entries"] = self.entries
+        self.bot.frequent_payees()
+        self.bot._ledger_cache["payees"] = ["SENTINEL"]
+        self.assertEqual(self.bot.frequent_payees(), ["SENTINEL"])
+
+    def test_no_stash_when_cache_describes_other_ledger(self):
+        # Fallback path (cache entries is None, e.g. no tree sha): never stashes, so every
+        # call recomputes rather than serving a list built from a different ledger.
+        self.bot._ledger_cache["entries"] = None
+        self.bot.frequent_payees()
+        self.assertIsNone(self.bot._ledger_cache.get("payees"))
+
+    def test_loaded_param_skips_reload(self):
+        # Passing an already-loaded ledger avoids a second load_ledger round trip (P1).
+        calls = {"n": 0}
+        def counting_load():
+            calls["n"] += 1
+            return (self.entries, self.opts)
+        self.bot.load_ledger = counting_load
+        self.bot.frequent_payees(loaded=(self.entries, self.opts))
+        self.bot.examples_for_payee("瑞幸", loaded=(self.entries, self.opts))
+        self.assertEqual(calls["n"], 0)
+
+
+class TestHandlePhotoMessage(unittest.TestCase):
+    """Photo entry point: invest-vs-expense routing and the download-failure path."""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.bot.llm_enabled = True
+        self.bot.parse_accounts = lambda: ["Expenses:Food", "Assets:Cash"]
+        self.bot.get_telegram_file_bytes = lambda file_id: b"fakeimg"
+        self.bot.send_draft_for_review = MagicMock()
+        self.bot.send_message = MagicMock()
+        self.bot.call_openai_vision_invest = MagicMock(
+            return_value='2026-07-25 * "IBKR" "buy"\n  Assets:Cash  -1 USD\n  Expenses:Food  1 USD')
+        self.bot.call_openai_vision_expense = MagicMock(
+            return_value='2026-07-25 * "Cafe" "lunch"\n  Expenses:Food  1 CNY\n  Assets:Cash')
+
+    def _msg(self, caption):
+        return {"message": {"chat": {"id": 123}, "caption": caption,
+                            "photo": [{"file_id": "f1", "file_size": 100}]}}
+
+    def test_invest_caption_routes_to_invest(self):
+        self.bot.handle_photo_message(self._msg("isa buy"))
+        self.bot.call_openai_vision_invest.assert_called_once()
+        self.bot.call_openai_vision_expense.assert_not_called()
+        self.bot.send_draft_for_review.assert_called_once()
+
+    def test_plain_caption_routes_to_expense(self):
+        self.bot.handle_photo_message(self._msg("lunch"))
+        self.bot.call_openai_vision_expense.assert_called_once()
+        self.bot.call_openai_vision_invest.assert_not_called()
+
+    def test_no_caption_routes_to_expense(self):
+        self.bot.handle_photo_message(self._msg(""))
+        self.bot.call_openai_vision_expense.assert_called_once()
+
+    def test_download_failure_replies_and_makes_no_draft(self):
+        self.bot.get_telegram_file_bytes = lambda file_id: None
+        self.bot.handle_photo_message(self._msg("lunch"))
+        self.bot.send_message.assert_called_once_with(123, "Failed to download the image.")
+        self.bot.send_draft_for_review.assert_not_called()
+
+    def test_vision_error_replies_failure_and_makes_no_draft(self):
+        self.bot.call_openai_vision_expense = MagicMock(side_effect=RuntimeError("boom"))
+        self.bot.handle_photo_message(self._msg("lunch"))
+        self.bot.send_draft_for_review.assert_not_called()
+        self.assertTrue(any("Failed to process screenshot" in str(c.args)
+                            for c in self.bot.send_message.call_args_list))
+
+
+class TestSendMessageHardening(unittest.TestCase):
+    """R1/R2: over-limit plain text is truncated; a non-JSON error body can't raise."""
+
+    def setUp(self):
+        self.bot = make_bot()
+
+    def _resp(self, status=200, json_ok=True, text="ok"):
+        r = MagicMock()
+        r.status_code = status
+        r.text = text
+        if json_ok:
+            r.json.return_value = {"ok": True}
+        else:
+            r.json.side_effect = ValueError("no json")
+        return r
+
+    def test_long_plain_text_truncated(self):
+        captured = {}
+        def fake_post(url, json=None, timeout=None):
+            captured["text"] = json["text"]
+            return self._resp()
+        with patch.object(main.HTTP, "post", side_effect=fake_post):
+            self.bot.send_message(123, "x" * 5000)
+        self.assertLessEqual(len(captured["text"]), main.TELEGRAM_MESSAGE_LIMIT)
+        self.assertTrue(captured["text"].endswith("…"))
+
+    def test_html_text_not_truncated(self):
+        # HTML callers pre-truncate their payload; send_message must not blind-cut a tag.
+        captured = {}
+        def fake_post(url, json=None, timeout=None):
+            captured["text"] = json["text"]
+            return self._resp()
+        body = "<pre>" + "y" * 5000 + "</pre>"
+        with patch.object(main.HTTP, "post", side_effect=fake_post):
+            self.bot.send_message(123, body, parse_mode="HTML")
+        self.assertEqual(captured["text"], body)
+
+    def test_non_json_error_body_does_not_raise(self):
+        resp = self._resp(status=502, json_ok=False, text="<html>bad gateway</html>")
+        with patch.object(main.HTTP, "post", return_value=resp):
+            self.assertEqual(self.bot.send_message(123, "hi"), {})
+
+
+class TestScrub(unittest.TestCase):
+    """S1: control chars stripped from untrusted text before it reaches the terminal."""
+
+    def test_strips_ansi_and_newlines(self):
+        self.assertEqual(main._scrub("a\x1b[31mred\nnext\r\x00"), "a?[31mred?next??")
+
+    def test_non_str_coerced(self):
+        self.assertEqual(main._scrub({"k": "v"}), str({"k": "v"}))
+
+
 class TestNormalizeAndValidateLLMEntry(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()

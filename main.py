@@ -137,6 +137,14 @@ def log(message):
             print(" " + pformat(message))
 
 
+def _scrub(value) -> str:
+    """Strip control chars (ANSI escapes, CR/LF, etc.) from untrusted text before it
+    reaches the operator's terminal. process_updates logs a sender's name/username/text
+    *before* the authorization check, so any stranger who finds the bot could otherwise
+    inject escape sequences to forge or hide console log lines."""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
+
+
 _FAKE_YEAR = 9999
 _pdt_consts = pdt.Constants(usePyICU=False)
 _pdt_consts.DOWParseStyle = -1  # "Monday" → today or the *last* Monday
@@ -352,6 +360,8 @@ def _code_block(text: str) -> str:
 
 # Telegram caps a message at 4096 chars; leave room for the <pre> wrapper and a notice.
 QUERY_RESULT_MAX_CHARS = 3500
+# Telegram's hard per-message limit; send_message truncates plain text to fit under it.
+TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 def extract_json_object(text: str) -> dict | None:
@@ -1070,17 +1080,19 @@ class Bot:
             lines.append(f"  {p.account}  {amount}".rstrip())
         return "\n".join(lines)
 
-    def examples_for_payee(self, payee: str, limit: int = 10) -> str | None:
+    def examples_for_payee(self, payee: str, limit: int = 10, loaded=None) -> str | None:
         """Return up to `limit` most recent past transactions whose payee matches,
         rendered as beancount directives, to show the LLM this user's own format for
         that merchant (route A in CLAUDE.md). Best-effort: returns None when the ledger
         can't be loaded or nothing matches — it must never block entry generation.
         Matching is loose (substring both ways, case-folded) because the payee is only
-        the router's guess and may not exactly equal the stored string."""
+        the router's guess and may not exactly equal the stored string. Callers that
+        already hold a `load_ledger()` result pass it as `loaded` to skip a round trip."""
         needle = payee.casefold().strip()
         if not needle:
             return None
-        loaded = self.load_ledger()
+        if loaded is None:
+            loaded = self.load_ledger()
         if loaded is None:
             return None
         entries, _ = loaded
@@ -1094,15 +1106,17 @@ class Bot:
         matched.sort(key=lambda e: e.date)
         return "\n\n".join(self._format_example_entry(e) for e in matched[-limit:])
 
-    def frequent_payees(self, limit: int = 50) -> list[str]:
+    def frequent_payees(self, limit: int = 50, loaded=None) -> list[str]:
         """Return up to `limit` payees ordered by how often they appear in the ledger.
 
         Seeds the draft prompt so the LLM reuses the user's existing spelling of a
         merchant instead of inventing a near-duplicate (「星巴克」vs「Starbucks」).
         Best-effort: returns [] when the ledger can't be loaded — it must never block
         entry generation. The O(n) count is cached alongside the parsed ledger (keyed by
-        tree sha), so it runs once per ledger change rather than once per draft."""
-        loaded = self.load_ledger()
+        tree sha), so it runs once per ledger change rather than once per draft. Callers
+        that already hold a `load_ledger()` result pass it as `loaded` to skip a round trip."""
+        if loaded is None:
+            loaded = self.load_ledger()
         if loaded is None:
             return []
         entries, _ = loaded
@@ -1515,6 +1529,13 @@ class Bot:
         )
 
     def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+        # Telegram hard-caps a message at 4096 chars and 400s the whole POST if exceeded —
+        # since send_message is the last hop of every reply() error path, an over-long body
+        # (e.g. an error that embeds raw LLM output) would fail *silently*, leaving the user
+        # with nothing. Guard plain text here; HTML callers pre-truncate their own payload
+        # so we must not blind-cut mid-tag.
+        if parse_mode is None and isinstance(text, str) and len(text) > TELEGRAM_MESSAGE_LIMIT:
+            text = text[:TELEGRAM_MESSAGE_LIMIT - 1] + "…"
         data = {"chat_id": chat_id, "text": text}
         if parse_mode:
             data["parse_mode"] = parse_mode
@@ -1524,7 +1545,13 @@ class Bot:
         if response.status_code != 200:
             log(f"Error sending message: {response.status_code}")
             log(response.text)
-        return response.json()
+        # No caller uses the return value; guard .json() so a non-JSON error body (e.g. an
+        # HTML 502 from a proxy) can't raise here and mask the original failure that this
+        # very call was trying to report.
+        try:
+            return response.json()
+        except ValueError:
+            return {}
 
     def answer_callback_query(self, callback_query_id, text=None):
         data = {"callback_query_id": callback_query_id}
@@ -2147,26 +2174,33 @@ class Bot:
                 return
 
             # Between the two LLM calls that a text entry already makes (router above,
-            # generator below), do a free local lookup: if the router named a payee,
-            # feed the user's own past entries for that merchant to the generator so it
-            # matches their account/narration conventions. Best-effort — never blocks.
+            # generator below), do free local lookups to enrich the draft prompt. Load the
+            # ledger once here and hand it to both helpers so they don't each pay a separate
+            # GitHub round trip for the same tree. Best-effort — never blocks.
+            try:
+                loaded_ledger = self.load_ledger()
+            except Exception as e:
+                log(f"Ledger load for payee context failed ({e}); generating without it.")
+                loaded_ledger = None
+
+            # If the router named a payee, feed the user's own past entries for that
+            # merchant to the generator so it matches their account/narration conventions.
             examples = None
             payee_raw = route.get("payee")
             payee_hint = payee_raw.strip() if isinstance(payee_raw, str) else ""
             if payee_hint:
                 try:
-                    examples = self.examples_for_payee(payee_hint)
+                    examples = self.examples_for_payee(payee_hint, loaded=loaded_ledger)
                     if examples:
                         log(f"Injecting past entries for payee {payee_hint!r} into the draft prompt.")
                 except Exception as e:
                     log(f"Payee-history lookup failed ({e}); generating without examples.")
 
             # Also hand the LLM the user's most-used merchant names so it snaps a fuzzy
-            # input onto an existing payee instead of coining a near-duplicate. Cached by
-            # ledger sha; best-effort — never blocks entry generation.
+            # input onto an existing payee instead of coining a near-duplicate.
             payees = None
             try:
-                payees = self.frequent_payees()
+                payees = self.frequent_payees(loaded=loaded_ledger)
             except Exception as e:
                 log(f"Frequent-payee lookup failed ({e}); generating without payee list.")
 
@@ -2378,25 +2412,25 @@ class Bot:
         for message in messages:
             chat = message["message"]["chat"]
             chat_id = chat["id"]
-            first_name = chat.get("first_name", "")
-            last_name = chat.get("last_name", "")
-            username = chat.get("username", "")
+            # These fields are attacker-controlled and logged before is_authorized() runs
+            # (inside the spawned handler), so scrub control chars out of anything that
+            # reaches the terminal. See _scrub.
+            first_name = _scrub(chat.get("first_name", ""))
+            last_name = _scrub(chat.get("last_name", ""))
+            username = _scrub(chat.get("username", ""))
             text = message["message"].get("text")
 
             fmt = f"{_C_BLUE}[{chat_id}]{_C_RESET} {first_name} {last_name} (@{username}):"
             photo = message["message"].get("photo")
             if text:
                 self._spawn_handler(self.handle_message, message, chat_id)
-                if len(text.splitlines()) > 1:
-                    log(f"{fmt} \n{text}")
-                else:
-                    log(f"{fmt} {text}")
+                log(f"{fmt} \n{_scrub(text)}" if len(text.splitlines()) > 1 else f"{fmt} {_scrub(text)}")
             elif photo:
                 log(f"{fmt} [photo]")
                 self._spawn_handler(self.handle_photo_message, message, chat_id)
             else:
                 obj = {k: v for k, v in message['message'].items() if k not in ['chat', 'date', 'from', 'message_id']}
-                log(f"{fmt} {obj}")
+                log(f"{fmt} {_scrub(obj)}")
 
     def start(self):
         while not self.stop.is_set():

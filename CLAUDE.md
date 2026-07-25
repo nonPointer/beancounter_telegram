@@ -52,6 +52,9 @@ empty value would let anyone who finds the bot read the ledger and commit with t
 `GITHUB_TOKEN`. All three entry points (`handle_message`, `handle_photo_message`,
 `handle_callback_query`) gate on `is_authorized(chat_id)` and drop unauthorized traffic
 silently — no reply, so the bot does not confirm its own existence to strangers.
+`process_updates` logs a sender's name/username/text **before** that gate runs (in the spawned
+handler), so those attacker-controlled fields pass through `_scrub()` (strips `\x00-\x1f\x7f`)
+to stop a stranger injecting ANSI/newline escapes into the operator's console.
 
 ### Beancount storage (GitHub)
 - `main.bean` — top-level file (value of `FILE_PATH`)
@@ -94,9 +97,10 @@ renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
 
 ### Payee context for drafts
 When the router classifies input as an entry, two best-effort lookups enrich the draft prompt
-so the LLM matches the user's own conventions. Both reuse `load_ledger()`'s tree-sha cache
-(no extra download) and **never block entry generation** — any failure logs and falls back to
-generating without the context.
+so the LLM matches the user's own conventions. `handle_message` calls `load_ledger()` **once**
+and passes the result to both helpers via their optional `loaded=` param, so they don't each
+pay a separate GitHub round trip for the same tree. Both **never block entry generation** — any
+failure logs and falls back to generating without the context.
 - **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's
   most recent past transactions for that merchant (loose case-folded substring match, either
   direction) are rendered back to beancount text via `_format_example_entry` (header + postings
@@ -130,7 +134,7 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 - Callback actions: `undo_confirm:<id>` commits `new_content` to GitHub; `undo_cancel:<id>` discards
 
 ### /last and /today commands
-- `/last [N]` — shows the last N directives from `main.bean` (default 5, max 50); output truncated at 4000 chars for Telegram message limit
+- `/last [N]` — shows the last N directives from `main.bean` (default 5, max 50); output truncated at 4000 chars for Telegram message limit. As a backstop, `send_message` truncates any plain-text body to `TELEGRAM_MESSAGE_LIMIT` (4096) so an over-long error can't 400 the whole POST and vanish; HTML callers pre-truncate their own payload and are left untouched. It also guards `response.json()` so a non-JSON error body (e.g. a proxy's HTML 502) can't raise and mask the failure it was reporting.
 - `/today` — shows all directives matching today's date (timezone-aware via `self.timezone`)
 - Both use `extract_all_directive_blocks(content)` — module-level pure function that returns `[(date_str, block_text), ...]` in file order; each block includes leading `;` comment lines
 - Read-only commands; no pending entry or confirmation flow
