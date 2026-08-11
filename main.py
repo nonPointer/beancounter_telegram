@@ -32,6 +32,7 @@ from prompts import (
     QUERY_ROUTER_SYSTEM_PROMPT, build_query_router_prompt,
     INVEST_ORDER_SYSTEM_PROMPT, build_invest_order_prompt,
     EXPENSE_SCREENSHOT_SYSTEM_PROMPT, build_expense_screenshot_prompt,
+    LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, build_ledger_error_explanation_prompt,
 )
 
 MAX_BEANCOUNT_RETRIES = 3
@@ -152,6 +153,12 @@ def _is_account_error(message: str) -> bool:
     """True when an LLM-generation error is really 'a needed account is missing', which the
     user can fix — so we surface the guidance verbatim instead of a generic failure notice."""
     return bool(message) and ("账户" in message or "account" in message.lower())
+
+
+class LedgerValidationError(ValueError):
+    """A generated entry still breaks the ledger (bean-check level) after all retries.
+    The message is already user-facing Chinese advice, so catch sites send it verbatim
+    instead of wrapping it in a generic 'generation failed' notice."""
 
 
 _FAKE_YEAR = 9999
@@ -617,7 +624,10 @@ class Bot:
         self._accounts_cache_lock = threading.Lock()
         self._file_etag_cache = {}  # file_path -> {"etag": str, "content": str, "sha": str}
         # Parsed ledger cached by repo tree sha; reused until any .bean file changes.
-        self._ledger_cache = {"tree_sha": None, "entries": None, "options_map": None}
+        # "texts" (path -> raw content) and "errors" (loader baseline errors) power the
+        # bean-check level validation of new entries (validate_entry_against_ledger).
+        self._ledger_cache = {"tree_sha": None, "entries": None, "options_map": None,
+                              "errors": None, "texts": None}
         self._ledger_cache_lock = threading.Lock()
         self.llm_enabled = LLM_ENABLED
 
@@ -1053,6 +1063,23 @@ class Bot:
             log("Ledger main file is empty or missing; cannot query.")
             return None
 
+        entries, errors, options_map = self._load_ledger_texts(texts)
+        if errors:
+            log(f"Ledger parsed with {len(errors)} error(s); first: {errors[0]}")
+        # Always store the snapshot (even without a tree sha) so validation can reuse
+        # the texts/baseline errors; the cache-hit check above still requires a real
+        # tree sha, so a sha-less snapshot is never served as a stale cache hit.
+        with self._ledger_cache_lock:
+            self._ledger_cache = {"tree_sha": tree_sha, "entries": entries,
+                                  "options_map": options_map, "errors": errors,
+                                  "texts": texts}
+        return entries, options_map
+
+    @staticmethod
+    def _load_ledger_texts(texts: dict) -> tuple[list, list, dict]:
+        """Mirror {repo path -> content} into a temp dir and run beancount's file loader
+        on FILE_PATH (the only way to honor arbitrary `include` directives). Returns the
+        loader's (entries, errors, options_map)."""
         tmpdir = tempfile.mkdtemp(prefix="ledger_")
         try:
             for rel, content in texts.items():
@@ -1060,17 +1087,94 @@ class Bot:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as fh:
                     fh.write(content)
-            entries, errors, options_map = beancount_loader.load_file(
-                os.path.join(tmpdir, FILE_PATH))
-            if errors:
-                log(f"Ledger parsed with {len(errors)} error(s); first: {errors[0]}")
-            if tree_sha is not None:
-                with self._ledger_cache_lock:
-                    self._ledger_cache = {"tree_sha": tree_sha, "entries": entries,
-                                          "options_map": options_map}
-            return entries, options_map
+            return beancount_loader.load_file(os.path.join(tmpdir, FILE_PATH))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def validate_entry_against_ledger(self, entry_text: str, loaded=None) -> str | None:
+        """bean-check level validation: load "whole ledger + new entry" with beancount's
+        loader (accounts opened, currency constraints, balance assertions, ...) and
+        report only the errors the new entry introduces.
+
+        The ledger may already contain historical errors, so blame is assigned by
+        (a) multiset difference against the baseline errors recorded when the ledger
+        snapshot was loaded — primary, catches e.g. a balance assertion elsewhere that
+        the new entry breaks — and (b) any error whose source points into the appended
+        entry's line range in FILE_PATH.
+
+        Returns an error string for the LLM retry loop, or None when the entry is clean
+        — or when the validation infrastructure is unavailable (best-effort: an
+        unreachable ledger must never block bookkeeping; parse_string syntax validation
+        still applies)."""
+        try:
+            if loaded is None:
+                loaded = self.load_ledger()
+        except Exception as e:
+            log(f"Ledger load for validation failed ({e}); skipping ledger-level check.")
+            return None
+        if loaded is None:
+            log("Ledger unavailable; skipping ledger-level check.")
+            return None
+
+        with self._ledger_cache_lock:
+            texts = self._ledger_cache.get("texts")
+            baseline_errors = self._ledger_cache.get("errors") or []
+            if texts is None or self._ledger_cache.get("entries") is not loaded[0]:
+                texts = None
+        if texts is None:
+            # The cache moved on under us (concurrent reload); without the raw texts of
+            # this exact load there is nothing consistent to append to.
+            log("No ledger text snapshot for this load; skipping ledger-level check.")
+            return None
+
+        base = (texts.get(FILE_PATH) or "").rstrip("\n")
+        candidate = dict(texts)
+        candidate[FILE_PATH] = (base + "\n\n" if base else "") + entry_text.strip() + "\n"
+        # 1-based line where the appended entry starts, for lineno attribution.
+        new_start_line = base.count("\n") + 3 if base else 1
+
+        try:
+            _, errors, _ = self._load_ledger_texts(candidate)
+        except Exception as e:
+            log(f"Ledger-level validation failed to run ({e}); skipping.")
+            return None
+
+        budget = Counter(getattr(e, "message", str(e)) for e in baseline_errors)
+        main_basename = os.path.basename(FILE_PATH)
+        new_messages = []
+        for err in errors:
+            msg = getattr(err, "message", str(err))
+            source = getattr(err, "source", None) or {}
+            in_new_entry = (os.path.basename(str(source.get("filename") or "")) == main_basename
+                            and (source.get("lineno") or 0) >= new_start_line)
+            if not in_new_entry and budget[msg] > 0:
+                budget[msg] -= 1
+                continue
+            new_messages.append(msg)
+        if not new_messages:
+            return None
+        seen = set()
+        unique = [m for m in new_messages if not (m in seen or seen.add(m))]
+        return "; ".join(unique)
+
+    def explain_ledger_error(self, entry_text: str, error: str) -> str:
+        """Turn a raw beancount ledger error into user-facing Chinese advice via the LLM.
+        Falls back to showing the raw error when the LLM call fails."""
+        header = "这条分录没有通过账本校验，已放弃保存。"
+        try:
+            payload = {
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_ledger_error_explanation_prompt(entry_text, error)},
+                ],
+            }
+            explained = self._call_llm_backends(payload, " ledger-error").strip()
+            if explained:
+                return f"{header}\n{explained}"
+        except Exception as e:
+            log(f"Ledger-error explanation failed ({e}); showing the raw error.")
+        return f"{header}\n错误信息：{error}\n请调整输入（如换用已开设的账户、检查金额和货币）后重新发送。"
 
     def run_bql(self, bql: str, loaded=None) -> tuple[list, list]:
         """Execute a BQL query. Raises on a bad query; the caller feeds that back to the LLM.
@@ -1283,13 +1387,24 @@ class Bot:
         current_time: str = "",
         examples: str | None = None,
         payees: list[str] | None = None,
+        loaded=None,
     ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
 
+        if loaded is None:
+            # Best-effort snapshot for the bean-check level validation below. A failed
+            # fetch degrades to syntax + account validation only — a broken validator
+            # must never block bookkeeping.
+            try:
+                loaded = self.load_ledger()
+            except Exception as e:
+                log(f"Ledger load for draft validation failed ({e}); skipping ledger-level check.")
+
         accounts_for_prompt = self._accounts_for_prompt()
         validation_error = None
         entry = None
+        ledger_error = False
 
         for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
             if attempt == 0:
@@ -1320,11 +1435,17 @@ class Bot:
                 raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
 
             validation_error = self.validate_beancount_syntax(entry) or self.validate_accounts_exist(entry, accounts)
+            ledger_error = False
+            if validation_error is None and loaded is not None:
+                validation_error = self.validate_entry_against_ledger(entry, loaded=loaded)
+                ledger_error = validation_error is not None
             if validation_error is None:
                 return entry
 
             log(f"Draft validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {validation_error}")
 
+        if ledger_error:
+            raise LedgerValidationError(self.explain_ledger_error(entry, validation_error))
         raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
 
     def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
@@ -1356,6 +1477,16 @@ class Bot:
         b64 = base64.b64encode(image_bytes).decode("utf-8")
         validation_error = None
         entry = None
+        ledger_error = False
+
+        # Best-effort ledger snapshot for the bean-check level validation below; the
+        # photo path has no pre-loaded ledger, so fetch one here. A failed fetch
+        # degrades to syntax + account validation only.
+        try:
+            loaded = self.load_ledger()
+        except Exception as e:
+            log(f"Ledger load for vision validation failed ({e}); skipping ledger-level check.")
+            loaded = None
 
         for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
             if attempt == 0:
@@ -1400,11 +1531,17 @@ class Bot:
                 raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
 
             validation_error = self.validate_beancount_syntax(entry) or self.validate_accounts_exist(entry, accounts)
+            ledger_error = False
+            if validation_error is None and loaded is not None:
+                validation_error = self.validate_entry_against_ledger(entry, loaded=loaded)
+                ledger_error = validation_error is not None
             if validation_error is None:
                 return entry
 
             log(f"Draft validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {validation_error}")
 
+        if ledger_error:
+            raise LedgerValidationError(self.explain_ledger_error(entry, validation_error))
         raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
 
     def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
@@ -1485,7 +1622,10 @@ class Bot:
             self.send_draft_for_review(chat_id, f"{draft_label}:", appendix, pending_id)
         except Exception as e:
             log(f"Photo processing failed: {e}")
-            reply(f"Failed to process screenshot: {e}")
+            if isinstance(e, LedgerValidationError):
+                reply(str(e))
+            else:
+                reply(f"Failed to process screenshot: {e}")
 
     def handle_undo(self, chat_id: int):
         f = self.github_download_file()
@@ -1745,7 +1885,7 @@ class Bot:
             self._pop_pending(pending_id)
             log(f"LLM recheck failed: {e}")
             error_text = str(e)
-            if _is_account_error(error_text):
+            if isinstance(e, LedgerValidationError) or _is_account_error(error_text):
                 self.send_message(chat_id, error_text)
             else:
                 self.send_message(chat_id, f"LLM recheck failed: {e}")
@@ -2256,7 +2396,7 @@ class Bot:
                 log(f"Frequent-payee lookup failed ({e}); generating without payee list.")
 
             try:
-                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples, payees=payees)
+                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples, payees=payees, loaded=loaded_ledger)
                 appendix = self.insert_prompt_metadata(appendix, text)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
 
@@ -2272,7 +2412,7 @@ class Bot:
             except Exception as e:
                 log(f"LLM generation failed: {e}")
                 error_text = str(e)
-                if _is_account_error(error_text):
+                if isinstance(e, LedgerValidationError) or _is_account_error(error_text):
                     reply(error_text)
                 else:
                     reply(f"LLM generation failed: {e}")

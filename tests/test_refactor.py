@@ -1310,7 +1310,8 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
         # First call returns entry that fails beancount validation, second succeeds
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", side_effect=fake_post):
-                with patch.object(self.bot, "validate_beancount_syntax",
+                with patch.object(self.bot, "load_ledger", return_value=None), \
+                     patch.object(self.bot, "validate_beancount_syntax",
                                   side_effect=["fake error", None]):
                     result = self.bot.call_openai_compatible(
                         "test", ["Expenses:Food", "Assets:Bank"], "2024-01-01"
@@ -1325,7 +1326,8 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
 
         with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", return_value=self._mock_llm_response(entry)):
-                with patch.object(self.bot, "validate_beancount_syntax",
+                with patch.object(self.bot, "load_ledger", return_value=None), \
+                     patch.object(self.bot, "validate_beancount_syntax",
                                   return_value="persistent error"):
                     with self.assertRaises(ValueError) as cm:
                         self.bot.call_openai_compatible(
@@ -1654,6 +1656,7 @@ class TestVisionRetryDropsImage(unittest.TestCase):
         base_prompt = "ACCOUNT LIST AND INSTRUCTIONS"
         self.bot.llm_enabled = True
         with patch.object(self.bot, "_call_llm_backends", side_effect=fake_backends), \
+             patch.object(self.bot, "load_ledger", return_value=None), \
              patch.object(self.bot, "normalize_and_validate_llm_entry", return_value="ENTRY"), \
              patch.object(self.bot, "validate_beancount_syntax", side_effect=fake_syntax), \
              patch.object(self.bot, "validate_accounts_exist", return_value=None):
@@ -1679,6 +1682,213 @@ class TestVisionRetryDropsImage(unittest.TestCase):
         self.assertNotIn("image_url", types1)
         text1 = next(b["text"] for b in attempt1_content if b["type"] == "text")
         self.assertIn(base_prompt, text1)
+
+
+class _LedgerFixtureMixin:
+    """Shared fictional ledger fixture for the bean-check level validation tests.
+    Installs a real loaded ledger snapshot (real beancount loader, no network) into
+    the bot's _ledger_cache, exactly as load_ledger would."""
+
+    ACCOUNTS_BEAN = (
+        "2020-01-01 open Assets:Bank:Demo:Current CNY\n"
+        "2020-01-01 open Assets:Cash:Wallet CNY\n"
+        "2020-01-01 open Expenses:Food:Coffee CNY\n"
+    )
+    MAIN_BEAN = (
+        'include "accounts/*.bean"\n'
+        "\n"
+        '2026-01-05 * "Cafe Aurora" "咖啡"\n'
+        "  Expenses:Food:Coffee      30 CNY\n"
+        "  Assets:Bank:Demo:Current  -30 CNY\n"
+    )
+    ACCOUNT_NAMES = ["Assets:Bank:Demo:Current", "Assets:Cash:Wallet", "Expenses:Food:Coffee"]
+
+    GOOD_ENTRY = (
+        '2026-02-01 * "Cafe Aurora" "咖啡"\n'
+        "  Expenses:Food:Coffee      28 CNY\n"
+        "  Assets:Bank:Demo:Current  -28 CNY"
+    )
+    # Passes syntax + account-list validation but violates the CNY-only currency
+    # constraint of both accounts — only the ledger-level check can catch it.
+    BAD_CURRENCY_ENTRY = (
+        '2026-02-01 * "Cafe Aurora" "咖啡"\n'
+        "  Expenses:Food:Coffee      28 USD\n"
+        "  Assets:Bank:Demo:Current  -28 USD"
+    )
+
+    def _install_ledger(self, main_bean=None):
+        texts = {"main.bean": main_bean or self.MAIN_BEAN,
+                 "accounts/assets.bean": self.ACCOUNTS_BEAN}
+        entries, errors, options_map = main.Bot._load_ledger_texts(texts)
+        self.bot._ledger_cache = {"tree_sha": "sha-test", "entries": entries,
+                                  "options_map": options_map, "errors": errors,
+                                  "texts": texts}
+        return entries, options_map
+
+
+class TestValidateEntryAgainstLedger(_LedgerFixtureMixin, unittest.TestCase):
+    """Bean-check level validation: only errors the NEW entry introduces count."""
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+
+    def test_valid_entry_passes(self):
+        loaded = self._install_ledger()
+        self.assertIsNone(self.bot.validate_entry_against_ledger(self.GOOD_ENTRY, loaded=loaded))
+
+    def test_unopened_account_is_flagged(self):
+        loaded = self._install_ledger()
+        entry = (
+            '2026-02-01 * "Cafe Aurora" "咖啡"\n'
+            "  Expenses:Food:Coffee       28 CNY\n"
+            "  Assets:Bank:Ghost:Current  -28 CNY"
+        )
+        error = self.bot.validate_entry_against_ledger(entry, loaded=loaded)
+        self.assertIsNotNone(error)
+        self.assertIn("Ghost", error)
+
+    def test_currency_constraint_violation_is_flagged(self):
+        loaded = self._install_ledger()
+        error = self.bot.validate_entry_against_ledger(self.BAD_CURRENCY_ENTRY, loaded=loaded)
+        self.assertIsNotNone(error)
+        self.assertIn("USD", error)
+
+    def test_baseline_errors_not_blamed_on_valid_new_entry(self):
+        # The ledger already has a historical error (posting to a never-opened
+        # account); a clean new entry must NOT be rejected for it.
+        broken_main = self.MAIN_BEAN + (
+            "\n"
+            '2026-01-10 * "Old Shop" "历史遗留"\n'
+            "  Expenses:Food:Coffee  5 CNY\n"
+            "  Assets:Bank:Legacy    -5 CNY\n"
+        )
+        loaded = self._install_ledger(main_bean=broken_main)
+        self.assertTrue(self.bot._ledger_cache["errors"])  # baseline really is dirty
+        self.assertIsNone(self.bot.validate_entry_against_ledger(self.GOOD_ENTRY, loaded=loaded))
+
+    def test_new_entry_repeating_a_baseline_error_still_flagged(self):
+        # Same error message already exists in the baseline; lineno attribution must
+        # still pin the new occurrence on the new entry.
+        broken_main = self.MAIN_BEAN + (
+            "\n"
+            '2026-01-10 * "Old Shop" "历史遗留"\n'
+            "  Expenses:Food:Coffee  5 CNY\n"
+            "  Assets:Bank:Legacy    -5 CNY\n"
+        )
+        loaded = self._install_ledger(main_bean=broken_main)
+        entry = (
+            '2026-02-01 * "Old Shop" "又一次"\n'
+            "  Expenses:Food:Coffee  7 CNY\n"
+            "  Assets:Bank:Legacy    -7 CNY"
+        )
+        error = self.bot.validate_entry_against_ledger(entry, loaded=loaded)
+        self.assertIsNotNone(error)
+        self.assertIn("Legacy", error)
+
+    def test_ledger_download_failure_degrades_to_no_check(self):
+        with patch.object(self.bot, "load_ledger", return_value=None):
+            self.assertIsNone(self.bot.validate_entry_against_ledger(self.BAD_CURRENCY_ENTRY))
+        with patch.object(self.bot, "load_ledger", side_effect=ConnectionError("offline")):
+            self.assertIsNone(self.bot.validate_entry_against_ledger(self.BAD_CURRENCY_ENTRY))
+
+    def test_stale_loaded_result_degrades_to_no_check(self):
+        # A loaded result the cache no longer knows (concurrent reload) has no text
+        # snapshot to append to — skip rather than validate against the wrong tree.
+        self._install_ledger()
+        stale = ([], {})
+        self.assertIsNone(self.bot.validate_entry_against_ledger(self.BAD_CURRENCY_ENTRY, loaded=stale))
+
+
+class TestLedgerValidationRetryLoop(_LedgerFixtureMixin, unittest.TestCase):
+    """Ledger errors are fed back to the LLM; exhaustion yields a friendly message."""
+
+    def setUp(self):
+        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
+            self.bot = main.Bot()
+        self.bot.llm_enabled = True
+        self.loaded = self._install_ledger()
+
+    def test_ledger_error_fed_back_and_fixed_silently(self):
+        payloads = []
+        responses = [self.BAD_CURRENCY_ENTRY, self.GOOD_ENTRY]
+
+        def fake_backends(payload, *args, **kwargs):
+            payloads.append(payload)
+            return responses.pop(0)
+
+        with patch.object(self.bot, "_call_llm_backends", side_effect=fake_backends):
+            result = self.bot.call_openai_compatible(
+                "咖啡 28", self.ACCOUNT_NAMES, "2026-02-01", loaded=self.loaded
+            )
+
+        self.assertIn("28 CNY", result)
+        self.assertEqual(len(payloads), 2)
+        # The retry prompt carries both the bad draft and the ledger error.
+        retry_prompt = payloads[1]["messages"][1]["content"]
+        self.assertIn("28 USD", retry_prompt)
+        self.assertIn("USD", retry_prompt)
+
+    def test_vision_path_also_intercepts_and_fixes(self):
+        responses = [self.BAD_CURRENCY_ENTRY, self.GOOD_ENTRY]
+        with patch.object(self.bot, "_call_llm_backends",
+                          side_effect=lambda *a, **k: responses.pop(0)), \
+             patch.object(self.bot, "load_ledger", return_value=self.loaded):
+            result = self.bot._call_vision_with_retry(
+                b"\x00img", self.ACCOUNT_NAMES,
+                system_prompt="SYS", base_prompt="BASE", temperature=0.1, log_label="vision",
+            )
+        self.assertIn("28 CNY", result)
+        self.assertEqual(responses, [])
+
+    def test_exhaustion_raises_friendly_ledger_error(self):
+        friendly = "账户只支持人民币记账，请把金额改成 CNY 后重新发送。"
+        # 1 + MAX_BEANCOUNT_RETRIES generations all bad, then the explanation call.
+        responses = [self.BAD_CURRENCY_ENTRY] * (1 + main.MAX_BEANCOUNT_RETRIES) + [friendly]
+
+        with patch.object(self.bot, "_call_llm_backends",
+                          side_effect=lambda *a, **k: responses.pop(0)):
+            with self.assertRaises(main.LedgerValidationError) as cm:
+                self.bot.call_openai_compatible(
+                    "咖啡 28", self.ACCOUNT_NAMES, "2026-02-01", loaded=self.loaded
+                )
+        self.assertIn(friendly, str(cm.exception))
+        self.assertIn("没有通过账本校验", str(cm.exception))
+        self.assertEqual(responses, [])
+
+    def test_exhaustion_falls_back_to_raw_error_when_llm_fails(self):
+        calls = {"n": 0}
+
+        def fake_backends(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 1 + main.MAX_BEANCOUNT_RETRIES:
+                return self.BAD_CURRENCY_ENTRY
+            raise ConnectionError("llm down")
+
+        with patch.object(self.bot, "_call_llm_backends", side_effect=fake_backends):
+            with self.assertRaises(main.LedgerValidationError) as cm:
+                self.bot.call_openai_compatible(
+                    "咖啡 28", self.ACCOUNT_NAMES, "2026-02-01", loaded=self.loaded
+                )
+        # Raw beancount error surfaced when the explanation LLM call fails.
+        self.assertIn("USD", str(cm.exception))
+        self.assertIn("错误信息", str(cm.exception))
+
+    def test_handle_message_sends_friendly_error_without_pending_draft(self):
+        sent = []
+        with patch.object(self.bot, "parse_accounts", return_value=self.ACCOUNT_NAMES), \
+             patch.object(self.bot, "route_intent", return_value={"intent": "entry", "payee": ""}), \
+             patch.object(self.bot, "load_ledger", return_value=self.loaded), \
+             patch.object(self.bot, "call_openai_compatible",
+                          side_effect=main.LedgerValidationError("这条分录没有通过账本校验，已放弃保存。\n请改用 CNY。")), \
+             patch.object(self.bot, "send_message",
+                          side_effect=lambda chat_id, text, **kw: sent.append(text)):
+            self.bot.handle_message({"message": {"text": "咖啡 28 美元", "chat": {"id": 42}}})
+
+        self.assertFalse(self.bot.pending_llm_entries)
+        self.assertTrue(sent)
+        self.assertIn("没有通过账本校验", sent[-1])
+        self.assertNotIn("LLM generation failed", sent[-1])
 
 
 if __name__ == "__main__":

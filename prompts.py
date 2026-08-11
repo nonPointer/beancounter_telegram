@@ -227,6 +227,30 @@ def build_invest_order_prompt(txn_date: str, accounts: list[str], caption: str =
     return prompt
 
 
+LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT = (
+    "你是一个 Beancount 记账助手。一条新分录多次修复后仍未通过账本校验，"
+    "请把 beancount 的原始错误翻译成普通用户能看懂的中文说明。\n\n"
+    "【输出规则】\n"
+    "- 先用一句话说明问题出在哪里，再给出 1-2 条具体的修改建议。\n"
+    "- 面向不懂 beancount 内部机制的用户：不要复述原始错误英文，不要讲语法教程。\n"
+    "- 仅输出纯文本，不要 markdown、不要代码块，控制在 3 行以内。\n\n"
+    "示例：\n"
+    "错误：Invalid reference to unknown account 'Assets:Bank:Example:Current'\n"
+    "输出：分录用到的账户 Assets:Bank:Example:Current 还没有在账本中开设。"
+    "可以先用 /open 开设该账户，或者在输入中改用一个已有的账户后重新发送。"
+)
+
+
+def build_ledger_error_explanation_prompt(entry_text: str, error: str) -> str:
+    """构建账本校验错误解释的 user prompt"""
+    return (
+        "以下分录未通过账本校验：\n"
+        f"{entry_text}\n\n"
+        f"beancount 错误信息：\n{error}\n\n"
+        "请按规则输出中文说明和修改建议。"
+    )
+
+
 def build_user_prompt(
     txn_date: str,
     accounts: list[str],

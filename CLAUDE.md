@@ -88,8 +88,9 @@ returns `(ok, status)`; `github_upload_file()` is a bool wrapper.
 Single-line text first goes through `route_intent()`, one temperature-0 LLM call that
 classifies entry-vs-query and, for a query, emits the BQL in the same response
 (`QUERY_ROUTER_SYSTEM_PROMPT`). It **fails toward `entry`** on any doubt. `load_ledger()`
-concatenates the account files (open/close only) with the journal and feeds
-`loader.load_string()` — beancount's loader wants a path on disk but the ledger is on GitHub.
+downloads every `.bean` file and `_load_ledger_texts()` mirrors them into a temp dir for
+`loader.load_file()` — beancount's loader wants a path on disk (and resolves `include` globs
+relative to it) but the ledger is on GitHub.
 `run_bql()` runs it; `answer_query()` wraps the same feed-error-back-to-LLM retry loop as
 syntax validation (a download failure is not retried). Queries are read-only (no draft), and
 `format_query_result()` sizes columns by `display_width()` (CJK=2) because beancount's own
@@ -116,6 +117,9 @@ Both feed into `build_user_prompt(..., examples, payees)`, threaded through `cal
 
 ### Beancount syntax validation
 After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
+
+### Ledger-level (bean-check) validation
+After the syntax check, `validate_entry_against_ledger()` appends the draft to the ledger's cached raw texts and re-runs the beancount loader in memory — full semantic checks (account opened, currency constraints, balance assertions). Only errors the new entry *introduces* count: baseline errors recorded at `load_ledger()` time are subtracted (multiset diff of messages, primary) and any error whose source lineno falls inside the appended region is always attributed (secondary). Failures feed the same retry loop; a successful fix is adopted silently. On exhaustion no pending draft is created — `explain_ledger_error()` has the LLM translate the error into user-facing Chinese advice (falls back to the raw error) and a `LedgerValidationError` carries it to the user verbatim. Infrastructure failures (ledger unreachable, loader crash) skip the check rather than block entry creation. `_ledger_cache` stores `texts` + baseline `errors` alongside the parsed entries per tree sha; the text path reuses `handle_message`'s `load_ledger()` result via `call_openai_compatible(..., loaded=)`, the vision path loads best-effort before its retry loop. The worker has no ledger-level validation.
 
 ### Pending draft lifecycle
 1. LLM generates entry → beancount syntax validated (with auto-retry) → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
