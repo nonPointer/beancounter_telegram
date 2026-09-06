@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 # gate (the thing that decides whether an entry reaches the ledger) was only ever
 # tested against a regex that approximated it.
 
-# Stub config.json so main.py can be imported without the real file.
+# Explicit settings keep tests independent of the deployment config.
 FAKE_CONFIG = {
     "GITHUB_TOKEN": "tok",
     "REPO_OWNER": "o",
@@ -29,8 +29,7 @@ FAKE_CONFIG = {
     "CHAT_ID": "1,42,99",
 }
 
-with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-    import main
+import main
 
 
 class TestAccountTypeMap(unittest.TestCase):
@@ -53,8 +52,8 @@ class TestMakePendingEntry(unittest.TestCase):
     """1.4 – _make_pending_entry helper."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_keys_present(self):
         entry = self.bot._make_pending_entry(42, "appendix", "commit msg", "user input", "2024-01-15")
@@ -76,8 +75,8 @@ class TestCallLlmBackends(unittest.TestCase):
     """1.3 – _call_llm_backends helper."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def _make_backend(self, url="http://fake", key="k", model="m"):
         return {"base_url": url, "api_key": key, "model": model}
@@ -87,7 +86,7 @@ class TestCallLlmBackends(unittest.TestCase):
         mock_resp.json.return_value = {"choices": [{"message": {"content": "  hello  "}}]}
         mock_resp.raise_for_status = MagicMock()
 
-        with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", return_value=mock_resp):
                 result = self.bot._call_llm_backends({})
         self.assertEqual(result, "hello")
@@ -106,14 +105,14 @@ class TestCallLlmBackends(unittest.TestCase):
             return good_resp
 
         backends = [self._make_backend(model="m1"), self._make_backend(model="m2")]
-        with patch.object(main, "LLM_BACKENDS", backends):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", backends):
             with patch.object(main.HTTP, "post", side_effect=fake_post):
                 result = self.bot._call_llm_backends({})
         self.assertEqual(result, "ok")
         self.assertEqual(call_count, 2)
 
     def test_raises_when_all_fail(self):
-        with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", side_effect=ConnectionError("nope")):
                 with self.assertRaises(ValueError) as cm:
                     self.bot._call_llm_backends({})
@@ -125,7 +124,7 @@ class TestCallLlmBackends(unittest.TestCase):
         mock_resp.raise_for_status = MagicMock()
 
         backend = {**self._make_backend(model="text-model"), "vision_model": "vision-model"}
-        with patch.object(main, "LLM_BACKENDS", [backend]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [backend]):
             with patch.object(main.HTTP, "post", return_value=mock_resp) as mock_post:
                 self.bot._call_llm_backends({}, vision=True)
 
@@ -138,7 +137,7 @@ class TestCallLlmBackends(unittest.TestCase):
         mock_resp.raise_for_status = MagicMock()
 
         backend = self._make_backend(model="text-model")  # no vision_model
-        with patch.object(main, "LLM_BACKENDS", [backend]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [backend]):
             with patch.object(main.HTTP, "post", return_value=mock_resp) as mock_post:
                 self.bot._call_llm_backends({}, vision=True)
 
@@ -151,7 +150,7 @@ class TestCallLlmBackends(unittest.TestCase):
         mock_resp.raise_for_status = MagicMock()
 
         backend = {**self._make_backend(model="text-model"), "vision_model": "vision-model"}
-        with patch.object(main, "LLM_BACKENDS", [backend]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [backend]):
             with patch.object(main.HTTP, "post", return_value=mock_resp) as mock_post:
                 self.bot._call_llm_backends({})
 
@@ -193,8 +192,8 @@ class TestDateValidation(unittest.TestCase):
 
 class TestStripCodeFence(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_no_fence_passthrough(self):
         text = "2024-01-01 * \"Shop\" \"Groceries\"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD"
@@ -226,8 +225,8 @@ class TestStripCodeFence(unittest.TestCase):
 
 class TestNormalizeAndValidate(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
         self.accounts = [
             "Assets:WeChat:Current",
             "Expenses:Food",
@@ -362,8 +361,8 @@ class TestNormalizeAndValidate(unittest.TestCase):
 
 class TestEnsureDatetimeMetadata(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_inserts_after_header(self):
         entry = '2024-01-15 * "A" "B"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD'
@@ -400,8 +399,8 @@ class TestEnsureDatetimeMetadata(unittest.TestCase):
 
 class TestInsertPromptMetadata(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_inserts_metadata_after_header(self):
         entry = '2024-01-15 * "A" "B"\n  X  10 USD\n  Y  -10 USD'
@@ -438,8 +437,8 @@ class TestInsertPromptMetadata(unittest.TestCase):
 
 class TestMatchAccount(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
         self.bot._accounts_cache["accounts"] = [
             "Assets:WeChat:Current",
             "Assets:Alipay:Current",
@@ -465,8 +464,8 @@ class TestMatchAccount(unittest.TestCase):
 
 class TestPreferCurrentAccount(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_exact_match_returned(self):
         accounts = ["Assets:WeChat:Current", "Expenses:Food"]
@@ -495,8 +494,8 @@ class TestPreferCurrentAccount(unittest.TestCase):
 
 class TestExtractAccountsFromEntry(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_extracts_posting_accounts(self):
         entry = (
@@ -534,8 +533,8 @@ class TestExtractAccountsFromEntry(unittest.TestCase):
 
 class TestAccountsForPrompt(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_annotates_accounts_with_currency(self):
         self.bot._accounts_cache["accounts"] = ["Assets:WeChat:Current", "Expenses:Food"]
@@ -570,8 +569,8 @@ class TestAccountsForPrompt(unittest.TestCase):
 
 class TestAddNonPnlAccountsToCommitMessage(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_adds_assets_not_expenses(self):
         entry = (
@@ -605,8 +604,8 @@ class TestAddNonPnlAccountsToCommitMessage(unittest.TestCase):
 
 class TestIsPendingExpired(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_fresh_entry_not_expired(self):
         pending = self.bot._make_pending_entry(1, "app", "cm", "inp", "2024-01-15")
@@ -620,11 +619,14 @@ class TestIsPendingExpired(unittest.TestCase):
 
 class TestCleanupExpiredDrafts(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
+        self.bot._spawn_handler = lambda fn, update, chat_id: fn(update)
+        self.bot.commit_llm_entry = MagicMock(return_value="checked entry")
 
     def test_removes_expired_entries(self):
         old_entry = self.bot._make_pending_entry(42, "app", "cm", "inp", "2024-01-15")
+        old_entry["auto_confirm"] = True
         old_entry["created_at"] = time.time() - main.DRAFT_TTL_SECONDS - 10
         self.bot.pending_llm_entries["1"] = old_entry
 
@@ -640,13 +642,14 @@ class TestCleanupExpiredDrafts(unittest.TestCase):
 
     def test_notifies_user_on_expiry(self):
         old_entry = self.bot._make_pending_entry(99, "app", "cm", "inp", "2024-01-15")
+        old_entry["auto_confirm"] = True
         old_entry["created_at"] = time.time() - main.DRAFT_TTL_SECONDS - 10
         self.bot.pending_llm_entries["1"] = old_entry
 
         with patch.object(self.bot, "send_message") as mock_send:
             self.bot.cleanup_expired_drafts()
 
-        mock_send.assert_called_once_with(99, unittest.mock.ANY)
+        self.assertIn("超时自动确认", mock_send.call_args.args[1])
 
 
 class TestExtractLastDirectiveBlock(unittest.TestCase):
@@ -918,8 +921,8 @@ class TestExtractAllDirectiveBlocks(unittest.TestCase):
 
 class TestHandleLast(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def _make_file(self, content):
         return {"content": content, "sha": "abc123"}
@@ -998,8 +1001,8 @@ class TestHandleLast(unittest.TestCase):
 
 class TestHandleToday(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def _make_file(self, content):
         return {"content": content, "sha": "abc123"}
@@ -1052,8 +1055,8 @@ class TestHandleToday(unittest.TestCase):
 
 class TestGitHubDownloadFileETagCache(unittest.TestCase):
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def _mock_response(self, status_code, json_data=None, headers=None):
         resp = MagicMock()
@@ -1258,8 +1261,8 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
     """Beancount syntax validation and LLM retry loop."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_valid_entry_returns_none(self):
         entry = '2024-03-15 * "Payee" "Narration"\n  Expenses:Food  30 CNY\n  Assets:Bank  -30 CNY'
@@ -1308,7 +1311,7 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
             return self._mock_llm_response(entry)
 
         # First call returns entry that fails beancount validation, second succeeds
-        with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", side_effect=fake_post):
                 with patch.object(self.bot, "load_ledger", return_value=None), \
                      patch.object(self.bot, "validate_beancount_syntax",
@@ -1324,7 +1327,7 @@ class TestBeancountSyntaxValidation(unittest.TestCase):
         self.bot.llm_enabled = True
         entry = '2024-01-01 * "P" "N"\n  Expenses:Food  10 CNY\n  Assets:Bank  -10 CNY'
 
-        with patch.object(main, "LLM_BACKENDS", [self._make_backend()]):
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", return_value=self._mock_llm_response(entry)):
                 with patch.object(self.bot, "load_ledger", return_value=None), \
                      patch.object(self.bot, "validate_beancount_syntax",
@@ -1342,8 +1345,8 @@ class TestDeclineReasonReadBeforeDateParsing(unittest.TestCase):
     """
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_reason_with_date_keyword_reaches_recheck_intact(self):
         chat_id = 42
@@ -1375,8 +1378,8 @@ class TestDirectiveDispatchExactEquality(unittest.TestCase):
     """
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
         self.bot.llm_enabled = True
 
     def test_opened_natural_language_not_hijacked_to_open_handler(self):
@@ -1436,8 +1439,8 @@ class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
     """
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def _appendix(self):
         return '2026-06-26 * "x" "y"\n  Expenses:Food 5 CNY\n  Assets:Cash'
@@ -1455,7 +1458,7 @@ class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
             chat_id, self._appendix(), "cm", "inp", "2026-06-26"
         )
 
-        with patch.object(self.bot, "github_download_file", return_value=None), \
+        with patch.object(self.bot, "_download_ledger_snapshot", side_effect=ValueError("Failed to download from GitHub.")), \
              patch.object(self.bot, "edit_message_reply_markup") as mock_edit, \
              patch.object(self.bot, "github_upload_file") as mock_upload, \
              patch.object(self.bot, "answer_callback_query"), \
@@ -1475,8 +1478,7 @@ class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
             chat_id, self._appendix(), "cm", "inp", "2026-06-26"
         )
 
-        with patch.object(self.bot, "github_download_file",
-                          return_value={"content": "old", "sha": "s"}), \
+        with patch.object(self.bot, "commit_llm_entry", return_value=self._appendix()) as mock_commit, \
              patch.object(self.bot, "edit_message_reply_markup") as mock_edit, \
              patch.object(self.bot, "_github_put_file", return_value=(True, 200)) as mock_upload, \
              patch.object(self.bot, "answer_callback_query"), \
@@ -1486,7 +1488,7 @@ class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
         # Happy path still works: entry claimed, buttons stripped, upload done.
         self.assertNotIn(pending_id, self.bot.pending_llm_entries)
         mock_edit.assert_called_once()
-        mock_upload.assert_called_once()
+        mock_commit.assert_called_once()
 
 
 class TestRelativeDayCountBounded(unittest.TestCase):
@@ -1521,8 +1523,8 @@ class TestParseAccountsConditionalRefresh(unittest.TestCase):
     """M1 — conditional re-parse: skip per-file fetch when the dir sha map is unchanged."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     @staticmethod
     def _dir_resp(items):
@@ -1628,17 +1630,20 @@ class TestParseAccountsConditionalRefresh(unittest.TestCase):
 
         with patch.object(main.HTTP, "get", side_effect=fake_get):
             self.bot.parse_accounts()
+            self.assertEqual(self.bot.parse_accounts(), [])
 
         # A partial fetch must NOT lock a sha map in for the whole TTL.
         self.assertIsNone(self.bot._accounts_cache.get("sha_map"))
+        self.assertEqual(self.bot._accounts_cache["ts"], 0)
+        self.assertIsNone(self.bot._accounts_cache["accounts"])
 
 
 class TestVisionRetryDropsImage(unittest.TestCase):
     """M2 — vision retry sends text-only (no re-embedded screenshot) but keeps the prompt."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_retry_omits_image_keeps_prompt(self):
         captured_payloads = []
@@ -1730,8 +1735,8 @@ class TestValidateEntryAgainstLedger(_LedgerFixtureMixin, unittest.TestCase):
     """Bean-check level validation: only errors the NEW entry introduces count."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
 
     def test_valid_entry_passes(self):
         loaded = self._install_ledger()
@@ -1804,8 +1809,8 @@ class TestLedgerValidationRetryLoop(_LedgerFixtureMixin, unittest.TestCase):
     """Ledger errors are fed back to the LLM; exhaustion yields a friendly message."""
 
     def setUp(self):
-        with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-            self.bot = main.Bot()
+        self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
         self.bot.llm_enabled = True
         self.loaded = self._install_ledger()
 

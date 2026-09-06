@@ -5,6 +5,7 @@
     "REPO_NAME": "",
     "BRANCH_NAME": "main",
     "FILE_PATH": "journals/telegram.bean",
+    "LEDGER_ROOT": "main.bean",
     "TIMEZONE": "Asia/Shanghai",
     "CHAT_ID": "123456789",
     "LLM_BACKENDS": [
@@ -16,5 +17,8 @@
         }
     ],
     "ACCOUNTS_CACHE_TTL": 300,
-    "DRAFT_TTL_SECONDS": 30
+    "DRAFT_TTL_SECONDS": 120,
+    "WORKERS": 4,
+    "QUEUE_SIZE": 64,
+    "STATE_PATH": "data/bot.sqlite3"
 }

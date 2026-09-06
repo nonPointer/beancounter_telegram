@@ -11,12 +11,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run in debug mode (extra logging)
 .venv/bin/python main.py debug
 
-# Run tests (no pytest — use unittest directly). CI runs all three on push/PR
-# via .github/workflows/tests.yml; they import main with builtins.open patched,
-# so they need no config.json.
+# Run tests (unittest). All four suites inject settings and isolated state;
+# no deployment config or credentials are needed.
 .venv/bin/python tests/test_refactor.py   # core logic tests
 .venv/bin/python tests/test_bot.py        # Bot behaviour: auth, polling resilience, drafts, queries
 .venv/bin/python tests/test_fuzz.py       # fuzzing / edge-case tests
+.venv/bin/python tests/test_runtime.py    # SQLite restart, bounded queues, configuration
 
 # Interactive LLM test tool
 .venv/bin/python tests/test_llm.py
@@ -25,39 +25,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Architecture
 
 **Python Telegram Bot (`main.py`)** — the only backend
-- Polls Telegram for updates; spawns a daemon thread per message
+- Polls Telegram; persists updates before acknowledgment and uses bounded FIFO worker lanes
 - `Bot` class holds all state: pending drafts, account cache, LLM config
 - Per-message flow: text → LLM → pending draft → user confirm/decline → GitHub commit
 - Photo messages (investment screenshots) go through a vision LLM path (`call_openai_vision_invest`)
 
 ### Key modules
-- `main.py` — bot entry point, `Bot` class (~1700 lines)
+- `main.py` — Bot composition, initialization and command handlers
+- `settings.py` — explicit per-instance configuration; no import-time credential reads
+- `entries.py`, `ledger.py`, `llm.py`, `drafts.py`, `telegram_api.py` — focused Bot mixins preserving method entry points
+- `bot_utils.py` — formatting/date helpers, constants, thread-local HTTP connection pools
+- `dispatch.py`, `state_store.py` — bounded workers and SQLite state/inbox
+- `ledger_validation.py` — complete local bean-check equivalent
 - `prompts.py` — LLM system prompts and user prompt builders for both text and vision paths
 - `templates/*.bean.j2` — Jinja2 templates for beancount directives (`open`, `close`, `balance`, `pad`, `transaction`)
 
 ### Config (`config.json`, gitignored)
 Required keys: `GITHUB_TOKEN`, `REPO_OWNER`, `REPO_NAME`, `BRANCH_NAME`, `FILE_PATH`, `TIMEZONE`, `TELEGRAM_BOT_TOKEN`, `CHAT_ID`
 
-LLM backends (array preferred, single-backend keys for backward compat):
+LLM backends:
 ```json
 "LLM_BACKENDS": [{"LLM_API_BASE_URL": "...", "LLM_API_KEY": "...", "LLM_MODEL": "..."}]
 ```
 
-Optional tuning: `ACCOUNTS_CACHE_TTL` (default 300s), `DRAFT_TTL_SECONDS` (default 120s)
+Optional tuning: `ACCOUNTS_CACHE_TTL` (300s), `DRAFT_TTL_SECONDS` (120s), `WORKERS` (4),
+`QUEUE_SIZE` (64), `STATE_PATH` (`data/bot.sqlite3`), `LEDGER_ROOT` (main.bean if present,
+otherwise FILE_PATH). Paths are resolved relative to the configuration directory.
 
 ### Authorization (default-deny)
-`CHAT_ID` is a single chat id or a comma-separated whitelist, parsed at import into the
-`ALLOWED_CHATS` set. It is **required**: `Bot.__init__` raises if it is empty, because an
+`CHAT_ID` is a single chat id or comma-separated whitelist stored in each instance's Settings.
+It is **required**: initialization raises if it is empty, because an
 empty value would let anyone who finds the bot read the ledger and commit with the owner's
 `GITHUB_TOKEN`. All three entry points (`handle_message`, `handle_photo_message`,
 `handle_callback_query`) gate on `is_authorized(chat_id)` and drop unauthorized traffic
 silently — no reply, so the bot does not confirm its own existence to strangers.
-`process_updates` logs a sender's name/username/text **before** that gate runs (in the spawned
-handler), so those attacker-controlled fields pass through `_scrub()` (strips `\x00-\x1f\x7f`)
-to stop a stranger injecting ANSI/newline escapes into the operator's console.
+`process_updates` authorizes before storing or scheduling messages. Logged text is scrubbed
+with `_scrub()` to remove terminal control characters.
 
 ### Beancount storage (GitHub)
-- `main.bean` — top-level file (value of `FILE_PATH`)
+- `FILE_PATH` — journal being appended; `LEDGER_ROOT` selects the full ledger including it
 - `accounts/{assets,liabilities,equity,income,expenses}.bean` — account definitions; fetched in parallel via `ThreadPoolExecutor` and cached for `ACCOUNTS_CACHE_TTL` seconds
 - `ACCOUNT_TYPE_MAP` module constant maps lowercase prefix → bean file path
 
@@ -74,23 +80,21 @@ only — a crash must not become a liveness oracle) instead of dying silently; `
 catches a crashing cycle and backs off rather than exiting.
 
 ### Appending to the ledger
-`append_to_file(appendix, commit_message, file_path, downloaded=None)` is the single
-download→append→upload path (approve, manual entries). GitHub rejects a PUT with a stale
-sha (409/422) whenever two entries land close together; it drops the cached ETag, re-reads,
-and re-appends up to `GITHUB_CONFLICT_RETRIES` (3) — safe because appends commute. `approve`
-passes the file it already fetched via `downloaded` to skip a round trip, and on failure
-`_restore_pending()` puts the reviewed draft back (fresh TTL) with its buttons intact so one
-tap retries. `/undo` does **not** use this: it rewrites the whole file, so a 409 means its
-precomputed content is stale and the user is told to re-run `/undo`. `_github_put_file()`
-returns `(ok, status)`; `github_upload_file()` is a bool wrapper.
+Manual entries use `append_to_file`, with bounded stale-SHA retries. LLM entries use
+`commit_llm_entry`: download immutable blobs from one tree, check the complete candidate
+ledger locally, run an independent prompt/journal review, then check the tree again before
+writing via the shared `_github_put_file`. Every conflict rebuilds and checks the candidate.
+A stable `; telegram-operation: <uuid>` marker reconciles a PUT whose response was lost.
+Exceptions and HTTP failures restore the draft with automatic confirmation disabled.
+`/undo` rewrites precomputed content, so a conflict requires a fresh `/undo`.
 
 ### Conversational queries (NL → BQL)
 Single-line text first goes through `route_intent()`, one temperature-0 LLM call that
 classifies entry-vs-query and, for a query, emits the BQL in the same response
-(`QUERY_ROUTER_SYSTEM_PROMPT`). It **fails toward `entry`** on any doubt. `load_ledger()`
-downloads every `.bean` file and `_load_ledger_texts()` mirrors them into a temp dir for
-`loader.load_file()` — beancount's loader wants a path on disk (and resolves `include` globs
-relative to it) but the ledger is on GitHub.
+(`QUERY_ROUTER_SYSTEM_PROMPT`). `load_ledger()` mirrors a complete tree snapshot locally and
+uses `ledger_validation.check_ledger`, which invokes the same loader and hardcore checks as
+`bean-check`. Missing downloads, truncated trees and loader errors block queries; no partial
+ledger fallback is used. Parsed entries and downloaded snapshots are cached by tree SHA.
 `run_bql()` runs it; `answer_query()` wraps the same feed-error-back-to-LLM retry loop as
 syntax validation (a download failure is not retried). Queries are read-only (no draft), and
 `format_query_result()` sizes columns by `display_width()` (CJK=2) because beancount's own
@@ -118,17 +122,29 @@ Both feed into `build_user_prompt(..., examples, payees)`, threaded through `cal
 ### Beancount syntax validation
 After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
 
-### Ledger-level (bean-check) validation
-After the syntax check, `validate_entry_against_ledger()` appends the draft to the ledger's cached raw texts and re-runs the beancount loader in memory — full semantic checks (account opened, currency constraints, balance assertions). Only errors the new entry *introduces* count: baseline errors recorded at `load_ledger()` time are subtracted (multiset diff of messages, primary) and any error whose source lineno falls inside the appended region is always attributed (secondary). Failures feed the same retry loop; a successful fix is adopted silently. On exhaustion no pending draft is created — `explain_ledger_error()` has the LLM translate the error into user-facing Chinese advice (falls back to the raw error) and a `LedgerValidationError` carries it to the user verbatim. Infrastructure failures (ledger unreachable, loader crash) skip the check rather than block entry creation. `_ledger_cache` stores `texts` + baseline `errors` alongside the parsed entries per tree sha; the text path reuses `handle_message`'s `load_ledger()` result via `call_openai_compatible(..., loaded=)`, the vision path loads best-effort before its retry loop. The worker has no ledger-level validation.
+The production generation-stage ledger check is retained: cached snapshots provide early
+semantic errors to the same retry loop; exhaustion uses `explain_ledger_error` for Chinese
+advice. This early check attributes newly introduced errors, but it never replaces the
+mandatory fresh, complete bean-check immediately before commit. A missing generation-time
+snapshot cannot bypass the commit gate.
 
 ### Pending draft lifecycle
 1. LLM generates entry → beancount syntax validated (with auto-retry) → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
 2. Bot sends entry text + inline confirm/decline/edit buttons to user
-3. On confirm → GitHub commit; on decline → discard; on no action → expires after `DRAFT_TTL_SECONDS` and `cleanup_expired_drafts()` notifies user
+3. On confirm or timeout → `approve_pending` → local bean-check + LLM consistency review → commit
 
-On confirm the approve path downloads first, then claims (pops) the entry, then commits via
-`append_to_file`; buttons are stripped only after the write succeeds, and a failed commit
-restores the draft (fresh TTL) so one tap retries. See "Appending to the ledger".
+Automatic confirmation is armed only after the review message is delivered. Feedback pauses
+it; failed checks retain the draft for explicit retry without repeated automatic attempts.
+Both approval paths atomically claim the draft. Screenshot file IDs and feedback are retained
+for review. SQLite checkpoints preserve drafts, in-flight claims, IDs and feedback across
+restart. A journal write uses its stable operation/update ID to reconcile replay. Interrupted
+feedback stays paused. Undo still expires by canceling. Never delete production state on deploy.
+
+### User customization
+`_call_llm_backends` reloads root `user.md` for every logical request and includes it on every
+backend attempt, covering routing, generation, retries, vision and review. HTML comments are
+excluded. Missing/empty files add no prompt. Preferences cannot bypass the task's output
+contract or mandatory validation.
 
 Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish them from LLM draft entries. They store `new_content` and `file_sha` pre-computed at show-time.
 
@@ -182,7 +198,9 @@ If a date is detected, it overrides today's date and the first line is stripped 
 - `_pending_lock` — protects `pending_llm_entries` and `pending_decline_reasons` dicts
 - `_accounts_cache_lock` — protects `_accounts_cache` read/write (network calls run outside the lock)
 - `print_lock` — serializes log output
-- Each message/callback is processed in its own daemon thread
+- Fixed worker lanes preserve per-chat order, including timeout approval. Capacity is bounded.
+- SQLite inbox acknowledgment follows durable enqueue; interrupted jobs replay on startup.
+- `_ThreadHTTP` keeps one requests.Session per thread; sessions are never shared across workers.
 
 ### Input validation
 - `/open` validates account name against beancount pattern (`^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$`) and currency against `^[A-Z][A-Z0-9]{0,9}$`

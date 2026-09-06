@@ -19,8 +19,7 @@ FAKE_CONFIG = {
     "CHAT_ID": "123",
 }
 
-with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-    import main
+import main
 
 
 ACCOUNTS = [
@@ -40,8 +39,7 @@ ACCOUNTS = [
 
 
 def _bot():
-    with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(FAKE_CONFIG))):
-        return main.Bot()
+    return main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -50,6 +48,7 @@ def _bot():
 class TestStripCodeFenceFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     # --- basic passthrough ---
     def test_plain_entry_unchanged(self):
@@ -169,6 +168,7 @@ class TestStripCodeFenceFuzz(unittest.TestCase):
 class TestNormalizeAndValidateFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def _valid(self, header='2024-01-01 * "A" "B"', p1="Expenses:Food  10 USD", p2="Assets:Cash  -10 USD"):
         return f"{header}\n  {p1}\n  {p2}"
@@ -586,6 +586,7 @@ class TestExtractLastDirectiveBlockFuzz(unittest.TestCase):
 class TestEnsureDatetimeMetadataFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_empty_entry(self):
         self.assertEqual(self.bot.ensure_datetime_metadata("", "2024-01-01 12:00:00"), "")
@@ -634,6 +635,7 @@ class TestEnsureDatetimeMetadataFuzz(unittest.TestCase):
 class TestInsertPromptMetadataFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_empty_input(self):
         entry = '2024-01-01 * "A" "B"\n  X:Y  1 USD'
@@ -682,6 +684,7 @@ class TestInsertPromptMetadataFuzz(unittest.TestCase):
 class TestPreferCurrentAccountFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_exact_match(self):
         self.assertEqual(
@@ -749,6 +752,7 @@ class TestPreferCurrentAccountFuzz(unittest.TestCase):
 class TestExtractAccountsFromEntryFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_normal(self):
         entry = '2024-01-01 * "A" "B"\n  Expenses:Food  10 USD\n  Assets:Cash  -10 USD'
@@ -785,6 +789,7 @@ class TestExtractAccountsFromEntryFuzz(unittest.TestCase):
 class TestAddNonPnlAccountsFuzz(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_only_expenses_income(self):
         entry = '2024-01-01 * "A" "B"\n  Expenses:Food  10 USD\n  Income:Salary  -10 USD'
@@ -815,6 +820,7 @@ class TestStripAndNormalizeCombined(unittest.TestCase):
     """End-to-end tests for LLM output cleanup."""
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_markdown_bold_in_explanation(self):
         raw = (
@@ -881,6 +887,7 @@ class TestStripAndNormalizeCombined(unittest.TestCase):
 class TestFXRateEdgeCases(unittest.TestCase):
     def setUp(self):
         self.bot = _bot()
+        self.addCleanup(self.bot.close)
 
     def test_equal_amounts_different_currencies(self):
         """1 GBP and -1 USD → rate = 1."""

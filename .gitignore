@@ -217,3 +217,5 @@ check_balance.py
 
 # macOS
 .DS_Store
+# Durable bot state belongs to the deployment, not to source control.
+/data/

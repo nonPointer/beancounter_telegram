@@ -23,22 +23,19 @@ MOCK_CONFIG = {
     "LLM_BACKENDS": [],
 }
 
-# Patch config loading before importing main
-with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(MOCK_CONFIG))):
-    with patch("json.load", return_value=MOCK_CONFIG):
-        import main
-        from main import Bot
+# Importing main is side-effect free; tests pass their own settings.
+import main
+from main import Bot
 
 
 def make_bot() -> Bot:
-    with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(MOCK_CONFIG))):
-        with patch("json.load", return_value=MOCK_CONFIG):
-            return Bot()
+    return Bot(settings=MOCK_CONFIG, state_path=":memory:")
 
 
 class TestStripCodeFence(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_no_fence(self):
         self.assertEqual(self.bot.strip_code_fence("hello"), "hello")
@@ -57,6 +54,7 @@ class TestStripCodeFence(unittest.TestCase):
 class TestEnsureDatetimeMetadata(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_inserts_datetime(self):
         entry = '2024-01-01 * "Payee" "Narr"\n  Assets:Cash  10 USD\n  Expenses:Food  -10 USD'
@@ -83,6 +81,7 @@ class TestEnsureDatetimeMetadata(unittest.TestCase):
 class TestPreferCurrentAccount(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.accounts = [
             "Assets:Cash:Current",
             "Assets:Savings",
@@ -118,6 +117,7 @@ class TestPreferCurrentAccount(unittest.TestCase):
 class TestExtractAccounts(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_extracts_accounts(self):
         entry = (
@@ -138,6 +138,7 @@ class TestExtractAccounts(unittest.TestCase):
 class TestAddNonPnlAccounts(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_skips_expenses_and_income(self):
         entry = "2024-01-01 * \"P\" \"N\"\n  Assets:Cash  -100 USD\n  Expenses:Food  100 USD\n"
@@ -155,6 +156,7 @@ class TestAddNonPnlAccounts(unittest.TestCase):
 class TestIsPendingExpired(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_not_expired(self):
         pending = {"created_at": time.time()}
@@ -168,6 +170,7 @@ class TestIsPendingExpired(unittest.TestCase):
 class TestBuildReviewButtons(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_buttons_contain_pending_id(self):
         buttons = self.bot.build_review_buttons("42")
@@ -182,6 +185,7 @@ class TestBuildReviewButtons(unittest.TestCase):
 class TestNextPendingId(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_increments(self):
         id1 = self.bot.next_pending_id()
@@ -227,6 +231,7 @@ class TestExamplesForPayee(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         from beancount import loader
         entries, _errors, opts = loader.load_string(self.LEDGER)
         self.bot.load_ledger = lambda: (entries, opts)
@@ -342,6 +347,7 @@ class TestFrequentPayees(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.entries, self.opts = self._load(self.LEDGER)
         self.bot.load_ledger = lambda: (self.entries, self.opts)
 
@@ -408,6 +414,7 @@ class TestHandlePhotoMessage(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.llm_enabled = True
         self.bot.parse_accounts = lambda: ["Expenses:Food", "Assets:Cash"]
         self.bot.get_telegram_file_bytes = lambda file_id: b"fakeimg"
@@ -457,6 +464,7 @@ class TestUndoConfirmCallback(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.answer_callback_query = MagicMock()
         self.bot.send_message = MagicMock()
         self.bot.edit_message_reply_markup = MagicMock()
@@ -502,6 +510,7 @@ class TestCallbackQueryBranches(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.answer_callback_query = MagicMock()
         self.bot.send_message = MagicMock()
         self.bot.edit_message_reply_markup = MagicMock()
@@ -531,6 +540,7 @@ class TestSendMessageHardening(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def _resp(self, status=200, json_ok=True, text="ok"):
         r = MagicMock()
@@ -619,6 +629,7 @@ class TestGetTelegramFileBytes(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_missing_result_key_returns_none(self):
         r = MagicMock(); r.status_code = 200; r.json.return_value = {"ok": True}
@@ -636,6 +647,7 @@ class TestManualTransactionValidation(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.send_message = MagicMock()
         self.appended = {}
         def fake_append(appendix, msg, path):
@@ -694,6 +706,7 @@ class TestManualTransactionValidation(unittest.TestCase):
 class TestNormalizeAndValidateLLMEntry(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.accounts = ["Assets:Cash:Current", "Expenses:Food", "Assets:Savings", "Liabilities:CC"]
 
     def _entry(self, header, *postings):
@@ -831,7 +844,9 @@ class TestNormalizeAndValidateLLMEntry(unittest.TestCase):
 class TestCleanupExpiredDrafts(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.send_message = MagicMock()
+        self.bot._spawn_handler = lambda fn, update, chat_id: fn(update)
 
     def test_removes_expired_entries(self):
         self.bot.pending_llm_entries["1"] = {
@@ -872,6 +887,7 @@ class TestCleanupExpiredDrafts(unittest.TestCase):
 class TestRemoveDeclineReasonBindings(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_removes_binding(self):
         self.bot.pending_decline_reasons[100] = "5"
@@ -894,6 +910,7 @@ class TestPollingResilience(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.waits = []
         self.bot.stop.wait = lambda d: self.waits.append(d)
 
@@ -959,6 +976,7 @@ class TestUpdateIdAck(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.cleanup_expired_drafts = MagicMock()
         self.bot._spawn_handler = MagicMock()
 
@@ -995,18 +1013,21 @@ class TestHandlerCrashIsolation(unittest.TestCase):
 
     def test_authorized_user_is_told(self):
         bot = make_bot()
+        self.addCleanup(bot.close)
         bot.send_message = MagicMock()
         self._spawn_and_wait(bot, 123)
         self.assertEqual(bot.send_message.call_count, 1)
 
     def test_unauthorized_user_gets_nothing(self):
         bot = make_bot()
+        self.addCleanup(bot.close)
         bot.send_message = MagicMock()
         self._spawn_and_wait(bot, 999)
         self.assertEqual(bot.send_message.call_count, 0)
 
     def test_failure_to_notify_does_not_raise(self):
         bot = make_bot()
+        self.addCleanup(bot.close)
         bot.send_message = MagicMock(side_effect=RuntimeError("telegram down"))
         self._spawn_and_wait(bot, 123)
 
@@ -1015,28 +1036,33 @@ class TestAuthorizationGate(unittest.TestCase):
     """CHAT_ID is default-deny: empty means nobody, not everybody."""
 
     def test_empty_chat_id_refuses_to_start(self):
-        with patch.object(main, "ALLOWED_CHATS", set()):
+        with patch.dict(MOCK_CONFIG, {"CHAT_ID": ""}):
             with self.assertRaises(ValueError):
-                Bot()
+                make_bot()
 
     def test_is_authorized_matches_whitelist(self):
-        with patch.object(main, "ALLOWED_CHATS", {"123", "456"}):
-            self.assertTrue(main.is_authorized(123))
-            self.assertTrue(main.is_authorized("456"))
-            self.assertFalse(main.is_authorized(999))
-            self.assertFalse(main.is_authorized(None))
+        with patch.dict(MOCK_CONFIG, {"CHAT_ID": "123,456"}):
+            bot = make_bot()
+            self.addCleanup(bot.close)
+            self.addCleanup(bot.close)
+            self.assertTrue(bot.is_authorized(123))
+            self.assertTrue(bot.is_authorized("456"))
+            self.assertFalse(bot.is_authorized(999))
+            self.assertFalse(bot.is_authorized(None))
 
     def test_unauthorized_message_is_dropped_silently(self):
-        with patch.object(main, "ALLOWED_CHATS", {"123"}):
+        with patch.dict(MOCK_CONFIG, {"CHAT_ID": "123"}):
             bot = make_bot()
+            self.addCleanup(bot.close)
             bot.send_message = MagicMock()
             bot.parse_accounts = MagicMock(side_effect=AssertionError("must not reach GitHub"))
             bot.handle_message({"message": {"text": "/last 50", "chat": {"id": 999}}})
             self.assertEqual(bot.send_message.call_count, 0)
 
     def test_unauthorized_callback_cannot_claim_a_pending_entry(self):
-        with patch.object(main, "ALLOWED_CHATS", {"123"}):
+        with patch.dict(MOCK_CONFIG, {"CHAT_ID": "123"}):
             bot = make_bot()
+            self.addCleanup(bot.close)
             bot.answer_callback_query = MagicMock()
             bot._github_put_file = MagicMock(side_effect=AssertionError("must not write repo"))
             pid = bot.next_pending_id()
@@ -1081,6 +1107,7 @@ class TestAppendToFile(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.gh = FakeGitHub()
         self.bot.github_download_file = self.gh.download
         self.bot._github_put_file = self.gh.put
@@ -1137,12 +1164,20 @@ class TestApproveCommitWindow(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.send_message = MagicMock()
         self.bot.answer_callback_query = MagicMock()
         self.bot.edit_message_reply_markup = MagicMock()
         self.gh = FakeGitHub()
         self.bot.github_download_file = self.gh.download
         self.bot._github_put_file = self.gh.put
+        self.bot._download_ledger_snapshot = lambda: (self.gh.sha, {MOCK_CONFIG["FILE_PATH"]: self.gh.download()})
+        self.bot._list_bean_files = lambda: (self.gh.sha, {})
+        self.bot.parse_accounts = lambda: ["Assets:Cash"]
+        self.bot.review_journal = MagicMock()
+        validation = patch("drafts.check_ledger")
+        validation.start()
+        self.addCleanup(validation.stop)
 
     def _pending(self, appendix="ENTRY"):
         pid = self.bot.next_pending_id()
@@ -1297,7 +1332,7 @@ LEDGER_JOURNAL = '''
 # The main file pulls accounts in via an include glob, like the real ledger — load_ledger
 # must mirror every file to disk and let beancount resolve the include, not concatenate.
 LEDGER_MAIN = 'include "accounts/*.bean"\n' + LEDGER_JOURNAL
-LEDGER_TREE = ["test.bean", "accounts/assets.bean", "accounts/empty.bean"]
+LEDGER_TREE = {p: p for p in ["test.bean", "accounts/assets.bean", "accounts/empty.bean"]}
 
 
 def _ledger_download(file_path="test.bean"):
@@ -1316,18 +1351,19 @@ class TestListBeanFiles(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_returns_sha_and_bean_paths_only(self):
         resp = MagicMock(status_code=200)
         resp.json.return_value = {"sha": "tree123", "truncated": False, "tree": [
-            {"type": "blob", "path": "test.bean"},
-            {"type": "blob", "path": "accounts/assets.bean"},
+            {"type": "blob", "path": "test.bean", "sha": "s1"},
+            {"type": "blob", "path": "accounts/assets.bean", "sha": "s2"},
             {"type": "blob", "path": "README.md"},
             {"type": "tree", "path": "accounts"},
         ]}
         with patch.object(main.HTTP, "get", return_value=resp):
             result = self.bot._list_bean_files()
-        self.assertEqual(result, ("tree123", ["test.bean", "accounts/assets.bean"]))
+        self.assertEqual(result, ("tree123", {"test.bean": "s1", "accounts/assets.bean": "s2"}))
 
     def test_none_on_http_error(self):
         with patch.object(main.HTTP, "get", return_value=MagicMock(status_code=500)):
@@ -1340,8 +1376,9 @@ class TestLedgerQuery(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
-        self.bot._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
-        self.bot.github_download_file = _ledger_download
+        self.addCleanup(self.bot.close)
+        self.bot._list_bean_files = lambda: ("sha1", dict(LEDGER_TREE))
+        self.bot._download_blob = _ledger_download
 
     def test_load_ledger_parses(self):
         entries, options_map = self.bot.load_ledger()
@@ -1354,19 +1391,19 @@ class TestLedgerQuery(unittest.TestCase):
         _, rrows = self.bot.run_bql('SELECT count(date) WHERE account ~ "Chase"')
         self.assertEqual(list(rrows[0])[0], 2)
 
-    def test_falls_back_when_tree_unavailable(self):
+    def test_rejects_when_tree_unavailable(self):
         self.bot._list_bean_files = lambda: None
-        entries, options_map = self.bot.load_ledger()
-        self.assertTrue(entries)
+        with self.assertRaises(ValueError):
+            self.bot.load_ledger()
 
     def test_load_ledger_returns_none_without_journal(self):
-        self.bot.github_download_file = lambda p="x": {"content": "", "sha": ""}
+        self.bot._download_blob = lambda p="x": {"content": "", "sha": ""}
         self.assertIsNone(self.bot.load_ledger())
 
     def test_same_tree_sha_is_served_from_cache(self):
         # First load pays for downloads; a second load with the same tree sha must not.
         dl = MagicMock(side_effect=_ledger_download)
-        self.bot.github_download_file = dl
+        self.bot._download_blob = dl
         self.bot.load_ledger()
         first = dl.call_count
         self.assertGreater(first, 0)
@@ -1375,23 +1412,22 @@ class TestLedgerQuery(unittest.TestCase):
 
     def test_changed_tree_sha_reloads(self):
         dl = MagicMock(side_effect=_ledger_download)
-        self.bot.github_download_file = dl
-        self.bot._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
+        self.bot._download_blob = dl
+        self.bot._list_bean_files = lambda: ("sha1", dict(LEDGER_TREE))
         self.bot.load_ledger()
         first = dl.call_count
-        self.bot._list_bean_files = lambda: ("sha2", list(LEDGER_TREE))  # ledger changed
+        self.bot._list_bean_files = lambda: ("sha2", dict(LEDGER_TREE))  # ledger changed
         self.bot.load_ledger()
         self.assertGreater(dl.call_count, first)  # re-downloaded on new sha
 
-    def test_fallback_path_is_never_cached(self):
-        # No tree sha (trees API down) → must not serve stale data from cache.
+    def test_unavailable_tree_does_not_download_or_cache(self):
         self.bot._list_bean_files = lambda: None
         dl = MagicMock(side_effect=_ledger_download)
-        self.bot.github_download_file = dl
-        self.bot.load_ledger()
-        first = dl.call_count
-        self.bot.load_ledger()
-        self.assertGreater(dl.call_count, first)
+        self.bot._download_blob = dl
+        with self.assertRaises(ValueError):
+            self.bot.load_ledger()
+        dl.assert_not_called()
+        self.assertIsNone(self.bot._ledger_cache["tree_sha"])
 
     def test_run_bql_filters(self):
         _, rrows = self.bot.run_bql('SELECT date WHERE account ~ "Chase" ORDER BY date DESC')
@@ -1412,16 +1448,19 @@ class TestIntentRouting(unittest.TestCase):
 
     def _bot(self, *replies):
         b = make_bot()
+        self.addCleanup(b.close)
         b._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]
         b._call_llm_backends = MagicMock(side_effect=list(replies))
         return b
 
     def test_query(self):
         b = self._bot('{"intent": "query", "bql": "SELECT date"}')
+        self.addCleanup(b.close)
         self.assertEqual(b.route_intent("最近10条", "2026-07-17")["intent"], "query")
 
     def test_entry(self):
         b = self._bot('{"intent": "entry"}')
+        self.addCleanup(b.close)
         self.assertEqual(b.route_intent("星巴克 35", "2026-07-17")["intent"], "entry")
 
     def test_llm_failure_falls_back_to_entry(self):
@@ -1442,33 +1481,38 @@ class TestAnswerQueryRetry(unittest.TestCase):
 
     def _bot(self, *replies):
         b = make_bot()
-        b._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
-        b.github_download_file = _ledger_download
+        self.addCleanup(b.close)
+        b._list_bean_files = lambda: ("sha1", dict(LEDGER_TREE))
+        b._download_blob = _ledger_download
         b._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]
         b._call_llm_backends = MagicMock(side_effect=list(replies))
         return b
 
     def test_good_bql_runs_directly(self):
         b = self._bot()
+        self.addCleanup(b.close)
         _, out = b.answer_query("q", 'SELECT date WHERE account ~ "Chase"', "2026-07-17")
         self.assertIn("2026-07", out)
         self.assertEqual(b._call_llm_backends.call_count, 0)
 
     def test_bad_bql_is_repaired(self):
         b = self._bot('{"intent":"query","bql":"SELECT date WHERE account ~ \\"Chase\\""}')
+        self.addCleanup(b.close)
         bql, out = b.answer_query("q", "SELECT bogus", "2026-07-17")
         self.assertIn("2026-07", out)
         self.assertNotIn("bogus", bql)
 
     def test_retries_bounded(self):
         b = self._bot(*(['{"intent":"query","bql":"SELECT still_bad"}'] * 5))
+        self.addCleanup(b.close)
         with self.assertRaises(ValueError):
             b.answer_query("q", "SELECT bad", "2026-07-17")
         self.assertLessEqual(b._call_llm_backends.call_count, main.MAX_BEANCOUNT_RETRIES)
 
     def test_download_failure_not_retried_at_llm(self):
         b = self._bot()
-        b.github_download_file = lambda p="x": None
+        self.addCleanup(b.close)
+        b._download_blob = MagicMock(side_effect=ValueError("download failed"))
         with self.assertRaises(ValueError):
             b.answer_query("q", "SELECT date", "2026-07-17")
         self.assertEqual(b._call_llm_backends.call_count, 0)
@@ -1477,10 +1521,11 @@ class TestAnswerQueryRetry(unittest.TestCase):
 class TestQueryEndToEnd(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.llm_enabled = True
         self.bot.send_message = MagicMock()
-        self.bot._list_bean_files = lambda: ("sha1", list(LEDGER_TREE))
-        self.bot.github_download_file = _ledger_download
+        self.bot._list_bean_files = lambda: ("sha1", dict(LEDGER_TREE))
+        self.bot._download_blob = _ledger_download
         self.bot.parse_accounts = lambda: ["Expenses:Food", "Liabilities:CreditCard:Chase"]
         self.bot._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]
 
@@ -1509,6 +1554,7 @@ class TestDateParsing(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
         self.bot.llm_enabled = True
         self.bot.send_message = MagicMock()
         # Stub out everything that would make a real network call
@@ -1556,6 +1602,7 @@ class TestConcurrentPendingId(unittest.TestCase):
 
     def test_no_duplicate_ids_under_concurrent_access(self):
         bot = make_bot()
+        self.addCleanup(bot.close)
         ids = []
         lock = threading.Lock()
 
@@ -1578,6 +1625,7 @@ class TestPopPending(unittest.TestCase):
 
     def setUp(self):
         self.bot = make_bot()
+        self.addCleanup(self.bot.close)
 
     def test_returns_entry(self):
         self.bot.pending_llm_entries["10"] = {"chat_id": 1}
@@ -1607,6 +1655,233 @@ class TestPopPending(unittest.TestCase):
 
         non_none = [r for r in results if r is not None]
         self.assertEqual(len(non_none), 1, "Exactly one thread should claim the pending entry")
+
+
+class TestCheckedApproval(unittest.TestCase):
+    """Exercise real bean-check and the review gateway, mocking external I/O only."""
+
+    def setUp(self):
+        self.bot = make_bot()
+        self.addCleanup(self.bot.close)
+        self.bot.llm_enabled = True
+        self.bot.send_message = MagicMock(return_value={"ok": True, "result": {"message_id": 7}})
+        self.bot.edit_message_reply_markup = MagicMock()
+        self.bot.answer_callback_query = MagicMock()
+        self.bot._spawn_handler = lambda fn, update, chat_id: fn(update)
+        self.gh = FakeGitHub()
+        self.gh.content = 'include "accounts.bean"\n'
+        self.accounts = "2020-01-01 open Assets:Cash GBP\n2020-01-01 open Expenses:Food GBP\n"
+        self.bot._download_ledger_snapshot = lambda: (self.gh.sha, {
+            MOCK_CONFIG["FILE_PATH"]: self.gh.download(), "accounts.bean": {"content": self.accounts, "sha": "accounts"}})
+        self.bot._list_bean_files = lambda: (self.gh.sha, {})
+        self.bot._github_put_file = self.gh.put
+        self.bot.parse_accounts = lambda: ["Assets:Cash", "Expenses:Food"]
+        self.bot._accounts_for_prompt = self.bot.parse_accounts
+        self.bot._call_llm_backends = MagicMock(return_value='{"approved":true,"reason":"金额、账户一致"}')
+        self.entry = '2026-07-01 * "Coffee" "咖啡"\n  Assets:Cash -5 GBP\n  Expenses:Food 5 GBP'
+        self.pending = self.bot._make_pending_entry(123, self.entry, "entry", "现金买咖啡 5 GBP", "2026-07-01")
+        self.pending["auto_confirm"] = True  # Simulate a delivered review message.
+        self.bot.pending_llm_entries["1"] = self.pending
+
+    def approve(self, action="approve"):
+        self.bot.handle_callback_query({"callback_query": {
+            "id": "cb", "data": f"{action}:1",
+            "message": {"chat": {"id": 123}, "message_id": 7}}})
+
+    def test_manual_confirmation_checks_and_commits(self):
+        self.approve()
+        self.assertEqual(len(self.gh.commits), 1)
+        self.assertNotIn("1", self.bot.pending_llm_entries)
+        self.bot._call_llm_backends.assert_called_once()
+
+    def test_timeout_uses_same_checks(self):
+        self.pending["created_at"] = 0
+        self.bot.cleanup_expired_drafts()
+        self.assertEqual(len(self.gh.commits), 1)
+        self.assertIn("超时自动确认", self.bot.send_message.call_args.args[1])
+
+    def test_unbalanced_entry_is_blocked_before_review(self):
+        self.pending["appendix"] = self.entry.replace("Food 5", "Food 6")
+        self.approve()
+        self.assertEqual(self.gh.commits, [])
+        self.bot._call_llm_backends.assert_not_called()
+        self.assertFalse(self.bot.pending_llm_entries["1"]["auto_confirm"])
+
+    def test_unknown_account_blocked_by_full_ledger_check(self):
+        self.pending["appendix"] = self.entry.replace("Assets:Cash", "Assets:Unknown")
+        self.approve()
+        self.assertEqual(self.gh.commits, [])
+        self.assertIn("bean-check failed", self.bot.send_message.call_args.args[1])
+
+    def test_existing_ledger_errors_block_commit(self):
+        self.accounts += "2026-06-01 close Assets:Cash\n"
+        self.approve()
+        self.assertEqual(self.gh.commits, [])
+
+    def test_rejected_uncertain_or_malformed_review_never_commits(self):
+        for raw in ['{"approved":false,"reason":"币种错误"}', '{"approved":"true","reason":"ok"}',
+                    'not json', '{"approved":true}', '[]']:
+            with self.subTest(raw=raw):
+                self.bot._call_llm_backends.return_value = raw
+                self.approve()
+                self.assertIn("1", self.bot.pending_llm_entries)
+                self.assertEqual(self.gh.commits, [])
+
+    def test_timeout_failure_does_not_auto_retry(self):
+        self.pending["created_at"] = 0
+        self.bot._call_llm_backends.side_effect = TimeoutError("LLM unavailable")
+        self.bot.cleanup_expired_drafts()
+        self.bot.pending_llm_entries["1"]["created_at"] = 0
+        self.bot.cleanup_expired_drafts()
+        self.bot._call_llm_backends.assert_called_once()
+        self.assertEqual(self.gh.commits, [])
+
+    def test_lost_put_response_reconciles_without_duplicate(self):
+        def lost_response(*args):
+            self.gh.put(*args)
+            raise main.requests.Timeout("response lost")
+        self.bot._github_put_file = lost_response
+        self.approve()
+        self.assertIn("1", self.bot.pending_llm_entries)
+        self.bot._github_put_file = self.gh.put
+        self.approve()
+        self.assertNotIn("1", self.bot.pending_llm_entries)
+        self.assertEqual(len(self.gh.commits), 1)
+        self.assertEqual(self.gh.content.count('"Coffee"'), 1)
+
+    def test_conflict_rechecks_new_snapshot(self):
+        original = self.gh.put
+        def conflict(*args):
+            self.bot._github_put_file = original
+            self.accounts += "2026-06-01 close Assets:Cash\n"
+            self.gh.sha = "changed"
+            return False, 409
+        self.bot._github_put_file = conflict
+        self.approve()
+        self.assertEqual(self.gh.commits, [])
+        self.assertIn("bean-check failed", self.bot.send_message.call_args.args[1])
+
+    def test_feedback_pauses_timeout(self):
+        self.approve("decline_reason")
+        self.pending["created_at"] = 0
+        self.bot.cleanup_expired_drafts()
+        self.assertIn("1", self.bot.pending_llm_entries)
+        self.assertEqual(self.gh.commits, [])
+
+    def test_manual_and_timeout_race_commits_once(self):
+        self.pending["created_at"] = 0
+        threads = [threading.Thread(target=self.approve),
+                   threading.Thread(target=self.bot.cleanup_expired_drafts)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(self.gh.commits), 1)
+
+    def test_undo_action_cannot_be_used_on_llm_draft(self):
+        self.approve("undo_confirm")
+        self.assertIn("1", self.bot.pending_llm_entries)
+        self.assertEqual(self.gh.commits, [])
+
+    def test_missing_photo_blocks_commit(self):
+        self.pending["photo_file_id"] = "missing"
+        self.bot.get_telegram_file_bytes = MagicMock(return_value=None)
+        self.approve()
+        self.bot._call_llm_backends.assert_not_called()
+        self.assertEqual(self.gh.commits, [])
+
+    def test_feedback_survives_regeneration(self):
+        self.pending["photo_file_id"] = "photo"
+        self.bot.call_openai_compatible = MagicMock(return_value=self.entry)
+        self.bot.pending_llm_id = 1
+        self.bot.run_recheck(123, "1", "实际用现金支付")
+        replacement = self.bot.pending_llm_entries["2"]
+        self.assertEqual(replacement["photo_file_id"], "photo")
+        self.assertEqual(replacement["feedback"], ["实际用现金支付"])
+        self.assertTrue(replacement["auto_confirm"])
+
+    def test_failed_recheck_preserves_draft_with_timeout_paused(self):
+        self.bot.call_openai_compatible = MagicMock(side_effect=ValueError("service unavailable"))
+        self.bot.run_recheck(123, "1", "实际用现金支付")
+        self.assertIn("1", self.bot.pending_llm_entries)
+        self.assertFalse(self.pending["auto_confirm"])
+        self.assertFalse(self.pending["rechecking"])
+        self.assertEqual(self.pending["feedback"], ["实际用现金支付"])
+
+    def test_discard_wins_before_timeout(self):
+        self.approve("discard")
+        self.bot.cleanup_expired_drafts()
+        self.assertEqual(self.gh.commits, [])
+
+    def test_photo_and_feedback_reach_reviewer(self):
+        self.pending.update(photo_file_id="photo", feedback=["实际是 5 GBP"])
+        self.bot.get_telegram_file_bytes = MagicMock(return_value=b"photo")
+        self.approve()
+        payload = self.bot._call_llm_backends.call_args.args[0]
+        content = payload["messages"][-1]["content"]
+        self.assertIn("实际是 5 GBP", content[0]["text"])
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertTrue(self.bot._call_llm_backends.call_args.kwargs["vision"])
+
+    def test_failed_delivery_disarms_timeout(self):
+        self.bot.send_message.return_value = {"ok": False}
+        self.bot.send_draft_for_review(123, "draft", self.entry, "1")
+        self.pending["created_at"] = 0
+        self.bot.cleanup_expired_drafts()
+        self.assertEqual(self.gh.commits, [])
+
+    def test_successful_delivery_arms_timeout(self):
+        self.pending["auto_confirm"] = False
+        self.bot.send_draft_for_review(123, "draft", self.entry, "1")
+        self.assertTrue(self.pending["auto_confirm"])
+        self.assertEqual(self.pending["message_id"], 7)
+
+
+class TestCustomPrompt(unittest.TestCase):
+    def test_reloaded_for_text_and_vision_without_mutating_payload(self):
+        bot = make_bot()
+        self.addCleanup(bot.close)
+        payload = {"messages": [{"role": "system", "content": "task"}]}
+        backend = {"base_url": "https://example.invalid", "api_key": "test", "model": "test"}
+        response = MagicMock()
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        with patch.object(main.Path, "exists", return_value=True), \
+             patch.object(main.Path, "read_text", side_effect=["偏好一<!--隐藏示例-->", "偏好二"]), \
+             patch.object(bot.settings, "LLM_BACKENDS", [backend]), \
+             patch.object(main.HTTP, "post", return_value=response) as post:
+            bot._call_llm_backends(payload)
+            bot._call_llm_backends(payload, vision=True)
+        first, second = [call.kwargs["json"]["messages"][0]["content"] for call in post.call_args_list]
+        self.assertIn("偏好一", first)
+        self.assertNotIn("隐藏示例", first)
+        self.assertIn("偏好二", second)
+        self.assertEqual(len(payload["messages"]), 1)
+
+
+class TestIncompleteLedger(unittest.TestCase):
+    def test_partial_download_never_cached(self):
+        bot = make_bot()
+        self.addCleanup(bot.close)
+        bot._list_bean_files = lambda: ("tree", {MOCK_CONFIG["FILE_PATH"]: "root", "accounts.bean": "account"})
+        bot._download_blob = MagicMock(side_effect=ValueError("download failed"))
+        with self.assertRaises(ValueError):
+            bot.load_ledger()
+        self.assertIsNone(bot._ledger_cache["tree_sha"])
+        self.assertIsNone(bot._snapshot_cache[0])
+
+    def test_truncated_tree_is_rejected(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"truncated": True}
+        with patch.object(main.HTTP, "get", return_value=response), self.assertRaises(ValueError):
+            make_bot()._list_bean_files()
+
+    def test_ambiguous_account_requires_full_name(self):
+        bot = make_bot()
+        self.addCleanup(bot.close)
+        bot.parse_accounts = lambda: ["Assets:Bank:A:Current", "Assets:Bank:B:Current"]
+        with self.assertRaisesRegex(main.AccountMatchError, "Assets:Bank:B:Current"):
+            bot.match_account("Current")
+        self.assertEqual(bot.match_account("assets:bank:a:current"), "Assets:Bank:A:Current")
 
 
 if __name__ == "__main__":

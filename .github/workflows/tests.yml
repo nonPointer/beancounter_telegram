@@ -20,7 +20,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       # No pytest: each file is a unittest main() and exits non-zero on failure.
-      # config.json is gitignored — the suites patch builtins.open to import main.
+      # Tests inject settings and use isolated SQLite databases; no credentials needed.
       - name: test_refactor
         run: python tests/test_refactor.py
 
@@ -29,3 +29,6 @@ jobs:
 
       - name: test_fuzz
         run: python tests/test_fuzz.py
+
+      - name: test_runtime
+        run: python tests/test_runtime.py
