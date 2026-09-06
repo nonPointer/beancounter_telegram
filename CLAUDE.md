@@ -45,6 +45,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Use relative imports within `beancounter` and package-qualified imports in tests and tools. Keep root `main.py` lightweight; do not move personal configuration or runtime state into the package. Module names mentioned below refer to this package unless stated otherwise. Avoid hard-wrapping documentation paragraphs.
 
+`handle_message` keeps authorization, raw feedback handling and date parsing before dispatch. `handle_natural_language` in `llm.py` owns routing/query/generation orchestration. `entries.py` owns `build_manual_entry`, `build_directive` and the shared posting/currency checks. Manual FX input must provide a price/cost annotation; only LLM normalization enables automatic FX inference. Both manual and generated same-currency postings are checked for balance, including more than two postings. `open`/`close` keep account-file targets, `pad` uses the selected date, and `balance` defaults to tomorrow unless explicitly dated; `/update` reuses the same template renderer for its pad/balance pair.
+
 ### Config (`config.json`, gitignored)
 Required keys: `GITHUB_TOKEN`, `REPO_OWNER`, `REPO_NAME`, `BRANCH_NAME`, `FILE_PATH`, `TIMEZONE`, `TELEGRAM_BOT_TOKEN`, `CHAT_ID`
 

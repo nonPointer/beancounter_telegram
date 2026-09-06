@@ -261,6 +261,67 @@ class TestExplicitSettings(unittest.TestCase):
                 self.assertNotIn("ledger_check_", message)
 
 
+class TestEntryReuse(unittest.TestCase):
+    def setUp(self):
+        self.bot = Bot(settings=MOCK_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
+        self.accounts = ["Assets:Cash", "Expenses:Food", "Equity:Opening"]
+        self.bot.match_account = MagicMock(side_effect=lambda suffix: {
+            "cash": "Assets:Cash", "food": "Expenses:Food", "opening": "Equity:Opening",
+        }.get(suffix))
+
+    def manual(self, postings):
+        return self.bot.build_manual_entry("Example Shop\nSynthetic purchase\n" + postings,
+                                           "2000-01-02", "2000-01-02T12:00:00+00:00")
+
+    def test_manual_and_generated_entries_share_posting_validation(self):
+        with patch.object(self.bot, "_validate_postings", wraps=self.bot._validate_postings) as validate:
+            self.manual("food 1 GBP\ncash -1 GBP")
+            self.bot.normalize_and_validate_llm_entry('2000-01-02 * "Example"\n  Expenses:Food 1 GBP\n  Assets:Cash -1 GBP', self.accounts)
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(validate.call_args_list[0].kwargs, {})
+        self.assertEqual(validate.call_args_list[1].kwargs, {"infer_fx": True})
+
+    def test_manual_fx_requires_explicit_price_but_llm_can_infer_it(self):
+        with self.assertRaisesRegex(ValueError, "价格"):
+            self.manual("food 2 GBP\ncash -3 USD")
+        entry = self.manual("food 2 GBP @ 1.5 USD\ncash -3 USD")
+        self.assertIn("@ 1.5 USD", entry)
+        generated = self.bot.normalize_and_validate_llm_entry('2000-01-02 * "Example"\n  Expenses:Food 2 GBP\n  Assets:Cash -3 USD', self.accounts)
+        self.assertIn("@ 1.5 USD", generated)
+
+    def test_three_manual_postings_must_balance(self):
+        self.manual("food 1 GBP\nfood 2 GBP\ncash -3 GBP")
+        with self.assertRaises(ValueError):
+            self.manual("food 1 GBP\nfood 2 GBP\ncash -4 GBP")
+
+    def test_directive_targets_and_dates(self):
+        for text, expected, target in [
+            ("open Assets:New GBP", "2000-01-02 open", "accounts/assets.bean"),
+            ("close cash", "2000-01-02 close", "accounts/assets.bean"),
+            ("pad cash opening", "2000-01-02 pad", MOCK_CONFIG["FILE_PATH"]),
+            ("balance cash -41.1 GBP", "2000-01-03 balance", MOCK_CONFIG["FILE_PATH"]),
+        ]:
+            with self.subTest(text=text):
+                entry, path = self.bot.build_directive(text, "2000-01-02", "2000-01-02T12:00:00", "2000-01-03")
+                self.assertIn(expected, entry)
+                self.assertEqual(path, target)
+        entry, _ = self.bot.build_directive("balance cash 1 GBP", "2000-01-02", "stamp", "2000-01-02")
+        self.assertIn("2000-01-02 balance", entry)
+
+    def test_missing_accounts_and_parameters_are_rejected(self):
+        for text in ("open", "close", "balance cash", "pad cash", "close unknown", "pad cash unknown"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.bot.build_directive(text, "2000-01-02", "stamp", "2000-01-03")
+
+    def test_natural_route_preserves_original_and_explicit_date(self):
+        original = "2000-01-02\nExample Shop 1 GBP cash"
+        self.bot.handle_natural_language = MagicMock()
+        self.bot.handle_message({"message": {"text": original, "chat": {"id": 123}}})
+        self.bot.handle_natural_language.assert_called_once_with(
+            123, "Example Shop 1 GBP cash", original, "2000-01-02", current_time="")
+
+
 class TestDraftPublication(unittest.TestCase):
     def setUp(self):
         self.bot = Bot(settings=MOCK_CONFIG, state_path=":memory:")

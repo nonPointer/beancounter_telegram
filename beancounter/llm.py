@@ -15,12 +15,93 @@ import re
 import time
 from .bot_utils import (
     HTTP, MAX_BEANCOUNT_RETRIES, _C_BLUE, _C_RESET, extract_json_object, format_query_result,
-    log, NOT_LOADED,
+    log, NOT_LOADED, TELEGRAM_MESSAGE_LIMIT, _capped_code_block, _is_account_error,
 )
 from .bot_utils import LedgerValidationError
 from .prompts import LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, build_ledger_error_explanation_prompt
 
 class LLMMixin:
+    def handle_natural_language(self, chat_id, text, user_input, date_str, current_time=""):
+        """Route a prepared text input, keeping the original text for final review."""
+        def reply(message):
+            self.send_message(chat_id, message)
+
+        commit_message = 'Add entry by Telegram Bot\n\n'
+        log("Single-line natural language detected, forwarding to LLM")
+        if not self.llm_enabled:
+            reply(self.llm_unavailable_message())
+            return
+
+        accounts = self.parse_accounts()
+        if not accounts:
+            reply("No accounts available. Please check GitHub account parsing first.")
+            return
+
+        route = self.route_intent(text, date_str)
+        if route["intent"] == "query":
+            try:
+                bql, rendered = self.answer_query(text, route["bql"], date_str)
+            except Exception as e:
+                log(f"Query failed: {e}")
+                reply(f"查询未完成：{e}")
+                return
+            # Send only the formatted result. The BQL stays in the console log
+            # (Query BQL from LLM / BQL ok) — it's noise to the person asking.
+            # format_query_result caps by code points; go through the UTF-16-aware
+            # capper so an emoji-heavy table can't still overflow Telegram's cap on
+            # this HTML path (which bypasses send_message's plain-text guard).
+            block, _ = _capped_code_block(rendered, TELEGRAM_MESSAGE_LIMIT)
+            self.send_message(chat_id, block, parse_mode="HTML")
+            return
+
+        # Between the two LLM calls that a text entry already makes (router above,
+        # generator below), do free local lookups to enrich the draft prompt. Load the
+        # ledger once here and hand it to both helpers so they don't each pay a separate
+        # GitHub round trip for the same tree. Best-effort — never blocks.
+        try:
+            loaded_ledger = self.load_ledger()
+        except Exception as e:
+            log(f"Ledger load for payee context failed ({e}); generating without it.")
+            loaded_ledger = None
+
+        # If the router named a payee, feed the user's own past entries for that
+        # merchant to the generator so it matches their account/narration conventions.
+        examples = None
+        payee_raw = route.get("payee")
+        payee_hint = payee_raw.strip() if isinstance(payee_raw, str) else ""
+        if payee_hint:
+            try:
+                examples = self.examples_for_payee(payee_hint, loaded=loaded_ledger)
+                if examples:
+                    log(f"Injecting past entries for payee {payee_hint!r} into the draft prompt.")
+            except Exception as e:
+                log(f"Payee-history lookup failed ({e}); generating without examples.")
+
+        # Also hand the LLM the user's most-used merchant names so it snaps a fuzzy
+        # input onto an existing payee instead of coining a near-duplicate.
+        payees = None
+        try:
+            payees = self.frequent_payees(loaded=loaded_ledger)
+        except Exception as e:
+            log(f"Frequent-payee lookup failed ({e}); generating without payee list.")
+
+        try:
+            appendix = self.call_openai_compatible(text, accounts, date_str, current_time=current_time, examples=examples, payees=payees, loaded=loaded_ledger)
+            self.publish_llm_draft(
+                chat_id, appendix, commit_message, user_input, date_str,
+                header="LLM draft (checked padding):", prompt=text,
+            )
+            return
+        except Exception as e:
+            log(f"LLM generation failed: {e}")
+            error_text = str(e)
+            if isinstance(e, LedgerValidationError) or _is_account_error(error_text):
+                reply(error_text)
+            else:
+                reply(f"LLM generation failed: {e}")
+            return
+
+
     def _draft_ledger_context(self, loaded=NOT_LOADED):
         if loaded is not NOT_LOADED:
             return loaded

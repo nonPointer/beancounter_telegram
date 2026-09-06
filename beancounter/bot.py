@@ -303,12 +303,8 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
                 except ValueError:
                     tomorrow_date = (dt + timedelta(days=1)).strftime('%Y-%m-%d')
 
-                pad_appendix = jinja2.get_template("pad.bean.j2").render(
-                    date=date_str, account=account, pad_account=pad_account, datetime=datetime_str
-                )
-                balance_appendix = jinja2.get_template("balance.bean.j2").render(
-                    date=tomorrow_date, account=account, amount=amount, currency=currency, datetime=datetime_str
-                )
+                pad_appendix = self.render_directive("pad", date_str, datetime_str, account=account, pad_account=pad_account)
+                balance_appendix = self.render_directive("balance", tomorrow_date, datetime_str, account=account, amount=amount, currency=currency)
                 appendix = pad_appendix + "\n\n" + balance_appendix
             elif command == "view":
                 ok, err = self.github_trigger_workflow("monthly-report.yml", {})
@@ -337,254 +333,29 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
                 reply(f"Unknown command: {command}")
                 return
 
-        elif dispatch_word == "open":
-            log("/open command detected")
-            matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
-            if not matches or len(matches[0]) < 2:
-                reply("Invalid open command format.")
+        elif dispatch_word in _directive_commands:
+            log(f"/{dispatch_word} command detected")
+            balance_date = date_str if custom_date else (dt + timedelta(days=1)).strftime('%Y-%m-%d')
+            try:
+                appendix, target_file_path = self.build_directive(text, date_str, datetime_str, balance_date)
+            except ValueError as exc:
+                reply(str(exc))
                 return
-            account = matches[0][0]
-            currency = matches[0][1]
-            if not re.match(r'^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$', account):
-                reply("Invalid account name. Must be colon-separated capitalized segments, e.g. Assets:Bank:Foo")
-                return
-            if not re.match(r'^[A-Z][A-Z0-9]{0,9}$', currency):
-                reply("Invalid currency. Must be 1-10 uppercase alphanumeric characters starting with a letter, e.g. USD, CNY")
-                return
-            prefix = account.split(":")[0].lower()
-            target_file_path = ACCOUNT_TYPE_MAP.get(prefix, self.settings.FILE_PATH)
-            appendix = jinja2.get_template("open.bean.j2").render(
-                date=date_str, account=account, currency=currency, datetime=datetime_str
-            )
-
-        elif dispatch_word == "close":
-            log("/close command detected")
-            matches = re.findall(r'.*?\s+([^\s]+)', text, re.IGNORECASE)
-            if not matches:
-                reply("Invalid close command format. Use: close [account]")
-                return
-            account_input = matches[0]
-            account = self.match_account(account_input)
-            if not account:
-                reply(f"Account not found (no open record): {account_input}")
-                return
-            prefix = account.split(":")[0].lower()
-            target_file_path = ACCOUNT_TYPE_MAP.get(prefix, self.settings.FILE_PATH)
-            appendix = jinja2.get_template("close.bean.j2").render(
-                date=date_str, account=account, datetime=datetime_str
-            )
-
-        elif dispatch_word == "balance":
-            log("/balance command detected")
-            matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
-            if not matches or len(matches[0]) < 3:
-                reply("Invalid balance command format.")
-                return
-            account = self.match_account(matches[0][0])
-            if not account:
-                reply(f"No matching account found for suffix: {matches[0][0]}")
-                return
-            amount = matches[0][1]
-            currency = matches[0][2]
-            # balance assertions take effect on the *opening* of the stated date,
-            # so the default is tomorrow (today + 1 day). Override by prefixing
-            # the message with a YYYY-MM-DD date line.
-            balance_date_str = date_str if custom_date else (dt + timedelta(days=1)).strftime('%Y-%m-%d')
-            appendix = jinja2.get_template("balance.bean.j2").render(
-                date=balance_date_str, account=account, amount=amount, currency=currency, datetime=datetime_str
-            )
-
-        elif dispatch_word == "pad":
-            log("/pad command detected")
-            matches = re.findall(r'.*?\s+([^\s]+)\s+([^\s]+)', text, re.IGNORECASE)
-            if not matches or len(matches[0]) < 2:
-                reply("Invalid pad command format.")
-                return
-            account = self.match_account(matches[0][0])
-            if not account:
-                reply(f"No matching account found for suffix: {matches[0][0]}")
-                return
-            pad_account = self.match_account(matches[0][1])
-            if not pad_account:
-                reply(f"No matching account found for suffix: {matches[0][1]}")
-                return
-            appendix = jinja2.get_template("pad.bean.j2").render(
-                date=date_str, account=account, pad_account=pad_account, datetime=datetime_str
-            )
 
         elif text.strip() and ("\n" not in text.strip()) and (not text.strip().startswith('/')):
-            log("Single-line natural language detected, forwarding to LLM")
-            if not self.llm_enabled:
-                reply(self.llm_unavailable_message())
-                return
-
-            accounts = self.parse_accounts()
-            if not accounts:
-                reply("No accounts available. Please check GitHub account parsing first.")
-                return
-
-            route = self.route_intent(text, date_str)
-            if route["intent"] == "query":
-                try:
-                    bql, rendered = self.answer_query(text, route["bql"], date_str)
-                except Exception as e:
-                    log(f"Query failed: {e}")
-                    reply(f"查询未完成：{e}")
-                    return
-                # Send only the formatted result. The BQL stays in the console log
-                # (Query BQL from LLM / BQL ok) — it's noise to the person asking.
-                # format_query_result caps by code points; go through the UTF-16-aware
-                # capper so an emoji-heavy table can't still overflow Telegram's cap on
-                # this HTML path (which bypasses send_message's plain-text guard).
-                block, _ = _capped_code_block(rendered, TELEGRAM_MESSAGE_LIMIT)
-                self.send_message(chat_id, block, parse_mode="HTML")
-                return
-
-            # Between the two LLM calls that a text entry already makes (router above,
-            # generator below), do free local lookups to enrich the draft prompt. Load the
-            # ledger once here and hand it to both helpers so they don't each pay a separate
-            # GitHub round trip for the same tree. Best-effort — never blocks.
-            try:
-                loaded_ledger = self.load_ledger()
-            except Exception as e:
-                log(f"Ledger load for payee context failed ({e}); generating without it.")
-                loaded_ledger = None
-
-            # If the router named a payee, feed the user's own past entries for that
-            # merchant to the generator so it matches their account/narration conventions.
-            examples = None
-            payee_raw = route.get("payee")
-            payee_hint = payee_raw.strip() if isinstance(payee_raw, str) else ""
-            if payee_hint:
-                try:
-                    examples = self.examples_for_payee(payee_hint, loaded=loaded_ledger)
-                    if examples:
-                        log(f"Injecting past entries for payee {payee_hint!r} into the draft prompt.")
-                except Exception as e:
-                    log(f"Payee-history lookup failed ({e}); generating without examples.")
-
-            # Also hand the LLM the user's most-used merchant names so it snaps a fuzzy
-            # input onto an existing payee instead of coining a near-duplicate.
-            payees = None
-            try:
-                payees = self.frequent_payees(loaded=loaded_ledger)
-            except Exception as e:
-                log(f"Frequent-payee lookup failed ({e}); generating without payee list.")
-
-            try:
-                appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples, payees=payees, loaded=loaded_ledger)
-                self.publish_llm_draft(
-                    chat_id, appendix, commit_message, message["message"]["text"], date_str,
-                    header="LLM draft (checked padding):", prompt=text,
-                )
-                return
-            except Exception as e:
-                log(f"LLM generation failed: {e}")
-                error_text = str(e)
-                if isinstance(e, LedgerValidationError) or _is_account_error(error_text):
-                    reply(error_text)
-                else:
-                    reply(f"LLM generation failed: {e}")
-                return
+            self.handle_natural_language(
+                chat_id, text, message["message"]["text"], date_str,
+                current_time="" if custom_date else time_str,
+            )
+            return
 
         else:
             log("Transaction detected")
-            lines = text.splitlines()
-
-            if len(lines) < 4:
-                reply("Invalid transaction format. Please provide payee, narration and two postings.")
-                return
-
-            payee = lines.pop(0).strip()
-            narration = lines.pop(0).strip()
-
-            tag = None
-            link = None
-            while lines and lines[0].strip():
-                if lines[0].startswith('#'):
-                    tag = lines.pop(0)[1:].strip()
-                elif lines[0].startswith('^'):
-                    link = lines.pop(0)[1:].strip()
-                else:
-                    break
-
-            if len(lines) < 2:
-                reply("A transaction must have at least two postings.")
-                return
-
-            postings = []
-            r_posting = r'([^\s]+)\s*(-?\d+\.?\d*)\s*([^\s]+)\s*(.*?)\s*$'
-            for posting_line in lines:
-                posting_line = posting_line.strip()
-                if not posting_line:
-                    continue
-
-                posting_str, comment = posting_line.split(';', 1) if ';' in posting_line else (posting_line, "")
-                pmatches = re.match(r_posting, posting_str)
-                if not pmatches:
-                    reply(f"Invalid posting format: {posting_str}")
-                    return
-
-                account = self.match_account(pmatches.group(1))
-                if not account:
-                    reply(f"No matching account found for suffix: {pmatches.group(1)}")
-                    return
-                if not account.startswith("Expenses") and not account.startswith("Income"):
-                    commit_message += f"{account}\n"
-
-                amount = pmatches.group(2)
-                currency = pmatches.group(3)
-                rest = pmatches.group(4) or ""
-
-                # beancount commodities are 2-24 chars, start with an uppercase letter and end
-                # with a letter or digit (a leading digit like "3NVD" parses as a number, a
-                # single letter is rejected, and 24 is the max length). Mirror that exactly here
-                # so the user gets a clear error instead of an opaque parser failure at commit.
-                if not re.match(r"^[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]$", currency):
-                    reply(f"货币符号 '{currency}' 无效：需以大写字母开头、字母或数字结尾，2-24 位，例如 USD、CNY、NVD3。")
-                    return
-
-                postings.append({
-                    "account": account,
-                    "amount": amount,
-                    "currency": currency,
-                    "rest": rest,
-                    "comment": comment.strip()
-                })
-
-            if len(postings) == 2:
-                a0, a1 = Decimal(postings[0]["amount"]), Decimal(postings[1]["amount"])
-                c0, c1 = postings[0]["currency"], postings[1]["currency"]
-                r0, r1 = postings[0]["rest"], postings[1]["rest"]
-
-                if a0 * a1 >= 0:
-                    reply("两条 posting 必须一正一负。")
-                    return
-
-                if c0 == c1:
-                    if abs(a0 + a1) > BALANCE_TOLERANCE:
-                        reply(f"同币种 {c0} 的两条 posting 金额不平衡：{a0} + {a1} != 0")
-                        return
-                else:
-                    has_cost_or_price = any(('@' in r or '{' in r) for r in [r0, r1])
-                    if not has_cost_or_price:
-                        reply(f"不同币种 ({c0}/{c1}) 的交易需要标记成本 {{}} 或价格 @。")
-                        return
-
-            # The template drops payee/narration straight between quotes, so a literal " (or
-            # \) would produce a malformed or silently-mangled directive. Escape both the same
-            # way insert_prompt_metadata does (backslash first, then quote) and parse the
-            # rendered result before committing, so a bad manual entry never poisons the ledger
-            # and every downstream reader (/last, /today, /undo, NL→BQL).
-            def _esc(s: str) -> str:
-                return s.replace('\\', '\\\\').replace('"', '\\"')
-            appendix = jinja2.get_template("transaction.bean.j2").render(
-                date=date_str, payee=_esc(payee), narration=_esc(narration),
-                postings=postings, tag=tag, link=link, datetime=datetime_str,
-            )
-            syntax_error = self.validate_beancount_syntax(appendix)
-            if syntax_error:
-                reply(f"生成的分录无法通过 beancount 校验：{syntax_error}")
+            try:
+                appendix = self.build_manual_entry(text, date_str, datetime_str)
+                commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
+            except ValueError as exc:
+                reply(str(exc))
                 return
 
         ok, err = self.append_to_file(appendix, commit_message.strip(), target_file_path)
