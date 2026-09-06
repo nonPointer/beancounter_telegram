@@ -10,6 +10,10 @@
   pip install -r requirements.txt
   ```
 
+支持 Beancount v2 和 v3。v2 使用内置查询模块，v3 使用独立的 `beanquery`（已列入依赖）。升级 Beancount 后请使用启动机器人的同一个 Python 安装依赖，例如 `python3 -m pip install -r requirements.txt`；仅 pull 代码不会安装新依赖。遇到 `No module named 'beancount.query'` 时，需要先更新代码并安装依赖，再启动机器人，无需降级账本环境。
+
+依赖兼容性、生产升级步骤及常见错误见 [`requirements.md`](requirements.md)；pip 安装仍使用 `requirements.txt`。
+
 - 配置
   - 复制 `config.json.example` 为 `config.json`，填写以下字段：
     - `TELEGRAM_BOT_TOKEN`：通过 [BotFather](https://core.telegram.org/bots) 创建机器人并获取

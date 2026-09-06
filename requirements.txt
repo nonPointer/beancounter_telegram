@@ -1,4 +1,5 @@
-beancount>=2.3,<3
+beancount>=2.3.4,<4
+beanquery>=0.2,<0.3
 certifi==2025.11.12
 charset-normalizer==3.4.4
 idna==3.11

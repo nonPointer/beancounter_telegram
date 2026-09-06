@@ -460,7 +460,8 @@ def format_query_result(rtypes, rrows, max_chars: int = QUERY_RESULT_MAX_CHARS) 
     if not rrows:
         return "没有找到匹配的记录。"
 
-    headers = [_friendly_header(name) for name, _ in rtypes]
+    # v2 uses (name, type); beanquery uses DB-API column descriptions.
+    headers = [_friendly_header(column[0]) for column in rtypes]
     rows = [[_format_cell(v) for v in row] for row in rrows]
 
     widths = []

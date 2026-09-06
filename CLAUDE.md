@@ -24,6 +24,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
+Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs all four suites on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
+
 **Python Telegram Bot (`beancounter/bot.py`)** — root `main.py` is a thin, stable launch entry point.
 - Polls Telegram; persists updates before acknowledgment and uses bounded FIFO worker lanes
 - `Bot` class holds all state: pending drafts, account cache, LLM config

@@ -5,7 +5,12 @@ from beancount.core.data import Transaction, Open, Close
 from beancount.parser import parser
 from concurrent.futures import as_completed
 import base64
-from beancount.query import query as beancount_query
+try:
+    from beancount.query import query as beancount_query
+except ModuleNotFoundError as exc:
+    if exc.name != "beancount.query":
+        raise
+    from beanquery import query as beancount_query
 from .ledger_validation import check_ledger, load_ledger_texts
 from pathlib import Path
 import re

@@ -9,15 +9,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+        beancount: ['>=2.3.4,<3', '>=3,<4']
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - run: python -m pip install -r requirements.txt 'beancount${{ matrix.beancount }}'
 
       # No pytest: each file is a unittest main() and exits non-zero on failure.
       # Tests inject settings and use isolated SQLite databases; no credentials needed.

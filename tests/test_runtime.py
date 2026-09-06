@@ -229,12 +229,12 @@ class TestExplicitSettings(unittest.TestCase):
 
     def test_ledger_errors_include_all_locations_without_temporary_paths(self):
         texts = {"main.bean": 'include "nested/bad.bean"\n',
-                 "nested/bad.bean": "2000-01-01 commodity O\n" * 10}
+                 "nested/bad.bean": "2000-01-01 commodity invalid\n" * 10}
         with self.assertRaises(ValueError) as caught:
             check_ledger(texts, "main.bean")
         diagnostic = str(caught.exception)
         self.assertIn("bean-check failed (10 errors)", diagnostic)
-        self.assertEqual(diagnostic.count("Invalid token: 'O'"), 10)
+        self.assertEqual(diagnostic.count("Invalid token: 'invalid'"), 10)
         for line in range(1, 11):
             self.assertIn(f"nested/bad.bean:{line}:", diagnostic)
         self.assertNotIn("ledger_check_", diagnostic)
@@ -247,7 +247,7 @@ class TestExplicitSettings(unittest.TestCase):
         self.assertIn('2000-01-01 * "Unknown account"', str(caught.exception))
 
     def test_draft_and_commit_checks_log_full_diagnostics(self):
-        texts = {"main.bean": "2000-01-01 commodity O\n" * 10}
+        texts = {"main.bean": "2000-01-01 commodity invalid\n" * 10}
         for check in (load_ledger_texts, check_ledger):
             with self.subTest(check=check.__name__), patch("beancounter.ledger_validation.log") as logged:
                 if check is check_ledger:
@@ -256,7 +256,7 @@ class TestExplicitSettings(unittest.TestCase):
                 else:
                     check(texts, "main.bean")
                 message = logged.call_args.args[0]
-                self.assertEqual(message.count("Invalid token: 'O'"), 10)
+                self.assertEqual(message.count("Invalid token: 'invalid'"), 10)
                 self.assertIn("main.bean:10:", message)
                 self.assertNotIn("ledger_check_", message)
 
@@ -424,7 +424,7 @@ class TestPerformance(unittest.TestCase):
     def test_invalid_accounts_do_not_replace_last_complete_cache(self):
         previous = self.bot.parse_accounts()
         self.paths["accounts/nested/assets.beancount"] = "invalid"
-        self.contents["invalid"] = "2000-01-01 open Assets:Cash O\n"
+        self.contents["invalid"] = "2000-01-01 open Assets:Cash invalid\n"
         self.bot._accounts_cache["ts"] = 0
         self.assertIs(self.bot.parse_accounts(), previous)
         self.assertEqual(self.bot._accounts_cache["ts"], 0)

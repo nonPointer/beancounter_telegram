@@ -703,6 +703,14 @@ class TestManualTransactionValidation(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class TestQueryColumnCompatibility(unittest.TestCase):
+    def test_legacy_and_dbapi_columns_render_identically(self):
+        rows = [("2000-01-02", "Example Shop")]
+        legacy = [("date", str), ("payee", str)]
+        dbapi = [("date", 1, None, None, None, None, None), ("payee", 2, None, None, None, None, None)]
+        self.assertEqual(main.format_query_result(legacy, rows), main.format_query_result(dbapi, rows))
+
+
 class TestNormalizeAndValidateLLMEntry(unittest.TestCase):
     def setUp(self):
         self.bot = make_bot()
