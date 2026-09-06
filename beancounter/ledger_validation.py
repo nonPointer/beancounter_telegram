@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from beancount import loader
 from beancount.ops import validation
 from beancount.parser import printer
-from .bot_utils import log
+from .bot_utils import log, timed
 
 
 def _error_details(errors):
@@ -18,17 +18,19 @@ def load_ledger_texts(texts: dict[str, str], root: str, required_file: str | Non
     if root not in texts:
         raise ValueError(f"Missing ledger root: {root}")
     with TemporaryDirectory(prefix="ledger_check_") as directory:
-        for name, content in texts.items():
-            path = PurePosixPath(name)
-            if path.is_absolute() or ".." in path.parts:
-                raise ValueError(f"Invalid ledger path: {name}")
-            target = Path(directory, *path.parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-        entries, errors, options = loader.load_file(
-            str(Path(directory, root)),
-            extra_validations=validation.HARDCORE_VALIDATIONS,
-        )
+        with timed("snapshot materialization"):
+            for name, content in texts.items():
+                path = PurePosixPath(name)
+                if path.is_absolute() or ".." in path.parts:
+                    raise ValueError(f"Invalid ledger path: {name}")
+                target = Path(directory, *path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+        with timed("bean-check parse and validation"):
+            entries, errors, options = loader.load_file(
+                str(Path(directory, root)),
+                extra_validations=validation.HARDCORE_VALIDATIONS,
+            )
         # Keep diagnostics useful after the temporary snapshot is removed.
         for index, error in enumerate(errors):
             source = dict(error.source or {})

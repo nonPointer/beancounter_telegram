@@ -1,8 +1,8 @@
 """Ledger responsibilities of Bot; shared entry points are preserved."""
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from beancount.core.data import Transaction
+from beancount.core.data import Transaction, Open, Close
+from beancount.parser import parser
 from concurrent.futures import as_completed
 import base64
 from beancount.query import query as beancount_query
@@ -11,96 +11,63 @@ from pathlib import Path
 import re
 import time
 from .bot_utils import (
-    AccountMatchError, GITHUB_CONFLICT_RETRIES, GITHUB_URL_BASE, HTTP, log,
+    AccountMatchError, GITHUB_CONFLICT_RETRIES, GITHUB_URL_BASE, HTTP, NOT_LOADED, log, timed,
 )
 
 class LedgerMixin:
     def parse_accounts(self):
+        with self._accounts_refresh_lock:
+            return self._parse_accounts()
+
+    def _parse_accounts(self):
         now = time.time()
         with self._accounts_cache_lock:
             if self._accounts_cache["accounts"] is not None and now - self._accounts_cache["ts"] < self.settings.ACCOUNTS_CACHE_TTL:
                 return self._accounts_cache["accounts"]
-
-        list_headers = {
-            "Authorization": f"token {self.settings.GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        url = f"{GITHUB_URL_BASE}/repos/{self.settings.REPO_OWNER}/{self.settings.REPO_NAME}/contents/accounts?ref={self.settings.BRANCH_NAME}"
-        r = HTTP.get(url, headers=list_headers, timeout=30)
-        if r.status_code != 200:
-            log(f"Error fetching accounts: {r.status_code}")
-            log(r.text)
-            return []
-        bean_items = [item for item in r.json() if item["name"].endswith(".bean")]
-
-        # Conditional refresh: the cheap directory listing already tells us the
-        # sha of every account file. If the full name->sha map is byte-for-byte
-        # identical to what we last parsed, the cached parsed accounts are still
-        # valid, so we skip the per-file downloads + reparse. Full-dict equality
-        # (not per-file sha matching) is required so that file additions AND
-        # deletions both invalidate the cache and we never serve stale accounts.
-        new_map = {item["name"]: item["sha"] for item in bean_items}
-        with self._accounts_cache_lock:
-            if self._accounts_cache["accounts"] is not None and self._accounts_cache.get("sha_map") == new_map:
-                self._accounts_cache["ts"] = now
-                return self._accounts_cache["accounts"]
-
-        def fetch_account_file(item):
-            file_r = HTTP.get(item["url"], headers=list_headers, timeout=30)
-            if file_r.status_code != 200:
-                return {}, [], False
-            content = base64.b64decode(file_r.json()["content"]).decode("utf-8")
-            opened = {}
-            closed = []
-            for line in content.splitlines():
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                date, directive, account = parts[0], parts[1], parts[2]
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
-                    continue
-                if directive == 'open':
-                    # 4th field (if present and looks like a currency code) is default currency
-                    currency = parts[3] if len(parts) >= 4 and re.match(r'^[A-Z][A-Z0-9]{0,9}$', parts[3]) else None
-                    # extract inline comment after ';' as human-readable alias
-                    comment = line.split(';', 1)[1].strip() if ';' in line else None
-                    opened[account] = (currency, comment)
-                elif directive == 'close':
-                    closed.append(account)
-            return opened, closed, True
-
-        all_opened = {}
-        all_closed = set()
-        fetch_ok = True
-        with ThreadPoolExecutor(max_workers=min(8, len(bean_items) or 1)) as pool:
-            futures = {pool.submit(fetch_account_file, item): item for item in bean_items}
-            for future in as_completed(futures):
-                opened, closed, ok = future.result()
-                if not ok:
-                    fetch_ok = False
-                all_opened.update(opened)
-                all_closed.update(closed)
-
-        currencies = {k: v[0] for k, v in all_opened.items() if k not in all_closed and v[0]}
-        comments = {k: v[1] for k, v in all_opened.items() if k not in all_closed and v[1]}
-        accounts = sorted(k for k in all_opened if k not in all_closed)
-        with self._accounts_cache_lock:
-            if not fetch_ok:
-                # Do not replace a complete cache with partial results or refresh its TTL.
+        try:
+            with timed("accounts refresh"), self._snapshot_lock:
+                listed = self._list_bean_files()
+                if listed is None:
+                    raise ValueError("Could not fetch account file tree")
+                paths = {path: sha for path, sha in listed[1].items() if path.startswith("accounts/")}
+                with self._accounts_cache_lock:
+                    if self._accounts_cache["accounts"] is not None and self._accounts_cache.get("sha_map") == paths:
+                        self._accounts_cache["ts"] = now
+                        return self._accounts_cache["accounts"]
+                files = self._download_files(paths)
+                opened, closed = {}, set()
+                for path, file in sorted(files.items()):
+                    directives, errors, _ = parser.parse_string(file["content"])
+                    if errors:
+                        raise ValueError(f"Account definitions invalid in {path}: " + "; ".join(e.message for e in errors))
+                    lines = file["content"].splitlines()
+                    for entry in directives:
+                        if isinstance(entry, Open):
+                            line = lines[entry.meta["lineno"] - 1]
+                            comment = line.split(";", 1)[1].strip() if ";" in line else None
+                            opened[entry.account] = (", ".join(entry.currencies or []), comment)
+                        elif isinstance(entry, Close):
+                            closed.add(entry.account)
+                accounts = sorted(opened.keys() - closed)
+                with self._accounts_cache_lock:
+                    self._accounts_cache = {
+                        "accounts": accounts, "ts": now, "sha_map": paths,
+                        "currencies": {a: opened[a][0] for a in accounts if opened[a][0]},
+                        "comments": {a: opened[a][1] for a in accounts if opened[a][1]},
+                    }
+                self._account_files = files
+                return accounts
+        except Exception as exc:
+            log(f"Account refresh failed ({type(exc).__name__}: {exc}); keeping last complete cache.")
+            with self._accounts_cache_lock:
                 return self._accounts_cache["accounts"] or []
-            self._accounts_cache["accounts"] = accounts
-            self._accounts_cache["currencies"] = currencies
-            self._accounts_cache["comments"] = comments
-            self._accounts_cache["sha_map"] = new_map
-            self._accounts_cache["ts"] = now
-        return accounts
 
     def _accounts_for_prompt(self) -> list[str]:
-        """Return account list with default currency and comment annotations for use in LLM prompts."""
-        accounts = self._accounts_cache.get("accounts") or []
-        currencies = self._accounts_cache.get("currencies") or {}
-        comments = self._accounts_cache.get("comments") or {}
+        """Return every cached account with its declared currencies and inline alias."""
+        cache = self._accounts_cache
+        accounts = cache.get("accounts") or []
+        currencies = cache.get("currencies") or {}
+        comments = cache.get("comments") or {}
         result = []
         for a in accounts:
             entry = a
@@ -131,7 +98,8 @@ class LedgerMixin:
         headers = {"Authorization": f"token {self.settings.GITHUB_TOKEN}",
                    "Accept": "application/vnd.github+json",
                    "X-GitHub-Api-Version": "2022-11-28"}
-        r = HTTP.get(url, headers=headers, timeout=30)
+        with timed("GitHub tree listing"):
+            r = HTTP.get(url, headers=headers, timeout=30)
         if r.status_code != 200:
             log(f"Could not list repo tree: HTTP {r.status_code}")
             return None
@@ -151,24 +119,35 @@ class LedgerMixin:
             raise ValueError("Invalid GitHub blob response")
         return {"content": base64.b64decode(data["content"]).decode("utf-8"), "sha": sha}
 
+    def _download_files(self, paths):
+        """Caller holds _snapshot_lock; reuse immutable blobs from bounded snapshots."""
+        cached = {f["sha"]: f for f in [*(self._snapshot_cache[1] or {}).values(), *self._account_files.values()]}
+        missing = set(paths.values()) - cached.keys()
+        with timed(f"blob downloads: {len(missing)} new / {len(paths)} files"):
+            futures = {self._downloads.submit(self._download_blob, sha): sha for sha in missing}
+            for future in as_completed(futures):
+                cached[futures[future]] = future.result()
+        return {path: cached[sha] for path, sha in paths.items()}
+
     def _download_ledger_snapshot(self, listed=None) -> tuple[str, dict[str, dict]]:
-        listed = listed if listed is not None else self._list_bean_files()
-        if listed is None:
-            raise ValueError("无法获取完整账本目录，请稍后重试。")
-        tree_sha, paths = listed
-        with self._ledger_cache_lock:
+        with self._snapshot_lock:
+            listed = listed if listed is not None else self._list_bean_files()
+            if listed is None:
+                raise ValueError("无法获取完整账本目录，请稍后重试。")
+            tree_sha, paths = listed
             if self._snapshot_cache[0] == tree_sha:
                 return self._snapshot_cache
-        if self.settings.FILE_PATH not in paths:
-            raise ValueError(f"Ledger root missing: {self.settings.FILE_PATH}")
-        with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
-            futures = {pool.submit(self._download_blob, sha): path for path, sha in paths.items()}
-            files = {futures[future]: future.result() for future in as_completed(futures)}
-        with self._ledger_cache_lock:
+            if self.settings.FILE_PATH not in paths:
+                raise ValueError(f"Ledger root missing: {self.settings.FILE_PATH}")
+            files = self._download_files(paths)
             self._snapshot_cache = (tree_sha, files)
-        return tree_sha, files
+            return self._snapshot_cache
 
     def load_ledger(self) -> tuple[list, dict] | None:
+        with self._load_lock, timed("ledger context"):
+            return self._load_ledger()
+
+    def _load_ledger(self) -> tuple[list, dict] | None:
         """Check a complete immutable snapshot; never answer from a partial ledger."""
         listed = self._list_bean_files()
         if listed is None:
@@ -272,7 +251,7 @@ class LedgerMixin:
             lines.append(f"  {p.account}  {amount}".rstrip())
         return "\n".join(lines)
 
-    def examples_for_payee(self, payee: str, limit: int = 10, loaded=None) -> str | None:
+    def examples_for_payee(self, payee: str, limit: int = 10, loaded=NOT_LOADED) -> str | None:
         """Return up to `limit` most recent past transactions whose payee matches,
         rendered as beancount directives, to show the LLM this user's own format for
         that merchant (route A in CLAUDE.md). Best-effort: returns None when the ledger
@@ -283,7 +262,7 @@ class LedgerMixin:
         needle = payee.casefold().strip()
         if not needle:
             return None
-        if loaded is None:
+        if loaded is NOT_LOADED:
             loaded = self.load_ledger()
         if loaded is None:
             return None
@@ -298,7 +277,7 @@ class LedgerMixin:
         matched.sort(key=lambda e: e.date)
         return "\n\n".join(self._format_example_entry(e) for e in matched[-limit:])
 
-    def frequent_payees(self, limit: int = 50, loaded=None) -> list[str]:
+    def frequent_payees(self, limit: int = 50, loaded=NOT_LOADED) -> list[str]:
         """Return up to `limit` payees ordered by how often they appear in the ledger.
 
         Seeds the draft prompt so the LLM reuses the user's existing spelling of a
@@ -307,7 +286,7 @@ class LedgerMixin:
         entry generation. The O(n) count is cached alongside the parsed ledger (keyed by
         tree sha), so it runs once per ledger change rather than once per draft. Callers
         that already hold a `load_ledger()` result pass it as `loaded` to skip a round trip."""
-        if loaded is None:
+        if loaded is NOT_LOADED:
             loaded = self.load_ledger()
         if loaded is None:
             return []

@@ -6,15 +6,16 @@ import requests
 import time
 import uuid
 from .bot_utils import (
-    GITHUB_CONFLICT_RETRIES, _capped_code_block, _code_block, _is_account_error, log,
+    GITHUB_CONFLICT_RETRIES, _capped_code_block, _code_block, _is_account_error, log, timed,
 )
 from .bot_utils import LedgerValidationError
 
 class DraftMixin:
     def _save_pending_locked(self):
-        self.state.set("drafts", {"pending": self.pending_llm_entries, "inflight": self._inflight,
-                                 "counter": self.pending_llm_id, "feedback": self.pending_decline_reasons,
-                                 "timezone": str(self.timezone)})
+        with timed("draft checkpoint"):
+            self.state.set("drafts", {"pending": self.pending_llm_entries, "inflight": self._inflight,
+                                     "counter": self.pending_llm_id, "feedback": self.pending_decline_reasons,
+                                     "timezone": str(self.timezone)})
 
     def _save_pending(self):
         with self._pending_lock:

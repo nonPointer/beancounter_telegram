@@ -10,6 +10,7 @@ import unicodedata
 from decimal import Decimal
 from datetime import date as date_cls, datetime, timedelta
 from pprint import pformat
+from contextlib import contextmanager
 
 import parsedatetime as pdt
 from dateutil.parser import parse as dateutil_parse
@@ -19,6 +20,16 @@ from jinja2 import Environment, FileSystemLoader
 
 
 MAX_BEANCOUNT_RETRIES = 3
+NOT_LOADED = object()
+
+
+@contextmanager
+def timed(stage):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        log(f"Timing [{stage}]: {time.monotonic() - started:.3f}s")
 
 # Rounding slack when checking that a transaction's postings sum to zero.
 BALANCE_TOLERANCE = Decimal("0.0001")

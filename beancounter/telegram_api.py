@@ -2,6 +2,7 @@
 
 import traceback
 import uuid
+import time
 from .bot_utils import (
     AccountMatchError, HTTP, POLL_BACKOFF_BASE, POLL_BACKOFF_MAX, TELEGRAM_MESSAGE_LIMIT,
     _scrub, _utf16_len, log,
@@ -126,8 +127,10 @@ class TelegramMixin:
         name = getattr(fn, "__name__", type(fn).__name__)
         uid = update.get("update_id")
         token = ("update", uid) if uid is not None else ("draft", update.get("_draft_id", uuid.uuid4().hex))
+        queued_at = time.monotonic()
 
         def guarded():
+            log(f"Timing [queue wait {token}]: {time.monotonic() - queued_at:.3f}s")
             self._handler_context.update_id = uid
             if uid is not None:
                 self.state.begin(uid)
@@ -153,13 +156,17 @@ class TelegramMixin:
         return self.dispatcher.submit(chat_id, token, guarded)
 
     def _schedule_inbox(self):
+        blocked_lanes = set()
         for uid, chat_id, update in self.state.queued():
+            lane = int(chat_id) % len(self.dispatcher.queues)
+            if lane in blocked_lanes:
+                continue
             if "callback_query" in update:
                 handler = self.handle_callback_query
             else:
                 handler = self.handle_photo_message if update["message"].get("photo") else self.handle_message
             if self._spawn_handler(handler, update, chat_id) is False:
-                break  # Keep remaining rows durable; retry when workers have capacity.
+                blocked_lanes.add(lane)  # Keep FIFO without blocking unrelated lanes.
 
     def process_updates(self):
         self._schedule_inbox()
@@ -195,6 +202,7 @@ class TelegramMixin:
         if not self._closed:
             self.stop.set()
             self.dispatcher.close()
+            self._downloads.shutdown(wait=True)
             self._save_pending()
             self.state.close()
             self._closed = True

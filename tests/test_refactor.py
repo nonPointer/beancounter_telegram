@@ -1535,120 +1535,37 @@ class TestRelativeDayCountBounded(unittest.TestCase):
 
 
 class TestParseAccountsConditionalRefresh(unittest.TestCase):
-    """M1 — conditional re-parse: skip per-file fetch when the dir sha map is unchanged."""
-
     def setUp(self):
         self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
         self.addCleanup(self.bot.close)
-
-    @staticmethod
-    def _dir_resp(items):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = items
-        return resp
-
-    @staticmethod
-    def _file_resp(content_text):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = {
-            "content": base64.b64encode(content_text.encode("utf-8")).decode("ascii")
-        }
-        return resp
-
-    def _make_get(self, dir_items, file_contents, counter):
-        def fake_get(url, **kwargs):
-            if "contents/accounts" in url:
-                counter["dir"] += 1
-                return self._dir_resp(dir_items)
-            counter["file"] += 1
-            return self._file_resp(file_contents[url])
-        return fake_get
+        self.paths = {"accounts/assets.bean": "sha-a", "accounts/expenses.bean": "sha-e"}
+        self.contents = {"sha-a": "2024-01-01 open Assets:Cash CNY\n",
+                         "sha-e": "2024-01-01 open Expenses:Food CNY\n"}
+        self.bot._list_bean_files = MagicMock(side_effect=lambda: ("tree", dict(self.paths)))
+        self.bot._download_blob = MagicMock(side_effect=lambda sha: {"content": self.contents[sha], "sha": sha})
 
     def test_unchanged_map_skips_reparse(self):
-        dir_items = [
-            {"name": "assets.bean", "sha": "sha-a", "url": "http://files/assets"},
-            {"name": "expenses.bean", "sha": "sha-e", "url": "http://files/expenses"},
-        ]
-        file_contents = {
-            "http://files/assets": "2024-01-01 open Assets:Cash CNY\n",
-            "http://files/expenses": "2024-01-01 open Expenses:Food CNY\n",
-        }
-        counter = {"dir": 0, "file": 0}
-        with patch.object(main.HTTP, "get", side_effect=self._make_get(dir_items, file_contents, counter)):
-            first = self.bot.parse_accounts()
-            self.assertEqual(first, ["Assets:Cash", "Expenses:Food"])
-            self.assertEqual(counter["file"], 2)
-
-            # Force TTL expiry so the next call goes down the refresh path.
-            self.bot._accounts_cache["ts"] = 0
-            second = self.bot.parse_accounts()
-
-        # Directory listing fetched again, but per-file fetch NOT repeated.
-        self.assertEqual(counter["dir"], 2)
-        self.assertEqual(counter["file"], 2)
-        # Output byte-identical (same cached object reused) when nothing changed.
-        self.assertEqual(second, ["Assets:Cash", "Expenses:Food"])
-        self.assertIs(second, first)
+        first = self.bot.parse_accounts()
+        self.assertEqual(first, ["Assets:Cash", "Expenses:Food"])
+        self.bot._accounts_cache["ts"] = 0
+        second = self.bot.parse_accounts()
+        self.assertIs(first, second)
+        self.assertEqual(self.bot._list_bean_files.call_count, 2)
+        self.assertEqual(self.bot._download_blob.call_count, 2)
 
     def test_changed_map_triggers_reparse(self):
-        dir_items = [
-            {"name": "assets.bean", "sha": "sha-a", "url": "http://files/assets"},
-            {"name": "expenses.bean", "sha": "sha-e", "url": "http://files/expenses"},
-        ]
-        file_contents = {
-            "http://files/assets": "2024-01-01 open Assets:Cash CNY\n",
-            "http://files/expenses": "2024-01-01 open Expenses:Food CNY\n",
-        }
-        counter = {"dir": 0, "file": 0}
-        with patch.object(main.HTTP, "get", side_effect=self._make_get(dir_items, file_contents, counter)):
-            first = self.bot.parse_accounts()
-            self.assertEqual(first, ["Assets:Cash", "Expenses:Food"])
-            self.assertEqual(counter["file"], 2)
-
-            # Remove a file from the directory listing -> full map changes.
-            dir_items.pop()  # drop expenses.bean
-            self.bot._accounts_cache["ts"] = 0
-            second = self.bot.parse_accounts()
-
-        # Map changed -> reparse: at least one more per-file fetch happened.
-        self.assertEqual(counter["dir"], 2)
-        self.assertEqual(counter["file"], 3)
-        # Deleted account is gone (full-map equality detects deletions, no stale data).
-        self.assertEqual(second, ["Assets:Cash"])
+        self.bot.parse_accounts()
+        del self.paths["accounts/expenses.bean"]
+        self.bot._accounts_cache["ts"] = 0
+        self.assertEqual(self.bot.parse_accounts(), ["Assets:Cash"])
+        # Deletion updates parsed accounts without re-downloading unchanged blobs.
+        self.assertEqual(self.bot._download_blob.call_count, 2)
 
     def test_partial_fetch_failure_not_cached(self):
-        dir_items = [
-            {"name": "assets.bean", "sha": "sha-a", "url": "http://files/assets"},
-            {"name": "expenses.bean", "sha": "sha-e", "url": "http://files/expenses"},
-        ]
-        ok_content = "2024-01-01 open Assets:Cash CNY\n"
-
-        def fake_get(url, **kwargs):
-            if "contents/accounts" in url:
-                resp = MagicMock()
-                resp.status_code = 200
-                resp.json.return_value = dir_items
-                return resp
-            if url.endswith("/expenses"):
-                resp = MagicMock()
-                resp.status_code = 500
-                resp.text = "boom"
-                return resp
-            resp = MagicMock()
-            resp.status_code = 200
-            resp.json.return_value = {
-                "content": base64.b64encode(ok_content.encode("utf-8")).decode("ascii")
-            }
-            return resp
-
-        with patch.object(main.HTTP, "get", side_effect=fake_get):
-            self.bot.parse_accounts()
-            self.assertEqual(self.bot.parse_accounts(), [])
-
-        # A partial fetch must NOT lock a sha map in for the whole TTL.
-        self.assertIsNone(self.bot._accounts_cache.get("sha_map"))
+        self.bot._download_blob.side_effect = ValueError("synthetic download failure")
+        self.assertEqual(self.bot.parse_accounts(), [])
+        self.assertEqual(self.bot.parse_accounts(), [])
+        self.assertIsNone(self.bot._accounts_cache["sha_map"])
         self.assertEqual(self.bot._accounts_cache["ts"], 0)
         self.assertIsNone(self.bot._accounts_cache["accounts"])
 

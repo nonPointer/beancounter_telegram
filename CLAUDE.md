@@ -69,7 +69,7 @@ with `_scrub()` to remove terminal control characters.
 
 ### Beancount storage (GitHub)
 - `FILE_PATH` — journal being appended; `LEDGER_ROOT` selects the full ledger including it
-- `accounts/{assets,liabilities,equity,income,expenses}.bean` — account definitions; fetched in parallel via `ThreadPoolExecutor` and cached for `ACCOUNTS_CACHE_TTL` seconds
+- `accounts/` and its subdirectories — `.bean` / `.beancount` account definitions parsed using Beancount `Open` / `Close` objects; every declared currency is included in prompt annotations, with inline comments retained. Definitions outside this directory are not collected. Parsed accounts remain cached for `ACCOUNTS_CACHE_TTL` seconds.
 - `ACCOUNT_TYPE_MAP` module constant maps lowercase prefix → bean file path
 
 ### LLM backend fallback
@@ -107,7 +107,7 @@ renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
 
 ### Payee context for drafts
 
-When the router classifies input as an entry, two best-effort lookups enrich the draft prompt so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes the result to both helpers via `loaded=`. A successful load is reused; `None` currently causes helpers to attempt loading again, so a failure can produce repeated diagnostics. Context lookup failures log and fall back to generating without that context; the mandatory pre-commit check remains.
+When the router classifies input as an entry, two best-effort lookups enrich the draft prompt so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes the result to both helpers via `loaded=`. Omitted context uses `NOT_LOADED` and triggers loading; explicit `None` means unavailable and must not trigger another load in that generation request. The next request can retry; the mandatory pre-commit check remains.
 
 - **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's most recent past transactions (up to 10, loose case-folded substring match, either direction) are rendered back to beancount text via `_format_example_entry` (header + postings only, no metadata) and shown so the LLM reuses the account/narration/currency conventions.
 - **Frequent-payee list** (`frequent_payees`): the top 50 payees by frequency across the whole ledger are handed to the LLM so it snaps a fuzzy input onto an existing merchant spelling instead of coining a near-duplicate. The ranked list is cached in `_ledger_cache["payees"]` keyed by tree sha (recomputed only when the ledger changes, guarded by an `entries is entries` identity check against a concurrent reload). Interior whitespace is collapsed so a multi-line payee stays a single `、`-joined token.
@@ -190,12 +190,18 @@ Accounts are sent to the LLM with annotations: `Assets:Bank:CMB (CNY) ; 招商�
 If a date is detected, it overrides today's date and the first line is stripped from the input before LLM call.
 
 ### Thread safety (Python bot)
+
 - `_pending_lock` — protects `pending_llm_entries` and `pending_decline_reasons` dicts
 - `_accounts_cache_lock` — protects `_accounts_cache` read/write (network calls run outside the lock)
+- `_accounts_refresh_lock` — coalesces concurrent account refreshes; `_load_lock` serializes ledger context loads so successful parsing is reused by tree SHA
+- `_snapshot_lock` — protects snapshot construction and shared immutable blob reuse across account and full-ledger reads; `_downloads` is one reusable pool of at most 8 workers per Bot, drained on close
+- Snapshot cache holds the latest complete ledger plus the latest complete account files, not an unbounded history of blob versions. Only missing SHAs are downloaded; failed refreshes never replace the complete snapshot. Each request still checks the remote tree, and every pre-commit candidate gets a full local validation.
 - `print_lock` — serializes log output
-- Fixed worker lanes preserve per-chat order, including timeout approval. Capacity is bounded.
+- Fixed worker lanes preserve per-chat order, including timeout approval. Capacity is bounded. A full lane is skipped for the rest of the scheduling pass, without blocking other lanes or letting later jobs in that lane overtake it.
 - SQLite inbox acknowledgment follows durable enqueue; interrupted jobs replay on startup.
 - `_ThreadHTTP` keeps one requests.Session per thread; sessions are never shared across workers.
+
+`Timing [...]` logs expose queue wait, tree listing, blob download count/time, account refresh, ledger context, snapshot materialization, parser/validation and draft checkpoints. Stages overlap, so their durations are not additive. Full LLM output and full validation diagnostics remain available; never remove the mandatory validation/review gates as a speed optimization.
 
 ### Input validation
 - `/open` validates account name against beancount pattern (`^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$`) and currency against `^[A-Z][A-Z0-9]{0,9}$`

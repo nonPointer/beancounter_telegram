@@ -261,5 +261,175 @@ class TestExplicitSettings(unittest.TestCase):
                 self.assertNotIn("ledger_check_", message)
 
 
+class TestPerformance(unittest.TestCase):
+    def setUp(self):
+        self.bot = Bot(settings=MOCK_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
+        self.paths = {"test.bean": "journal", "accounts/nested/assets.beancount": "accounts"}
+        self.contents = {"journal": 'include "accounts/nested/assets.beancount"\n',
+                         "accounts": '2000-01-01 open Assets:Cash GBP, USD, O.US ; sample wallet\n'}
+        self.bot._list_bean_files = MagicMock(side_effect=lambda: ("tree", dict(self.paths)))
+        self.bot._download_blob = MagicMock(side_effect=lambda sha: {"sha": sha, "content": self.contents[sha]})
+
+    def test_only_changed_blobs_downloaded(self):
+        self.bot._download_ledger_snapshot(("first", self.paths))
+        self.contents["journal2"] = "; changed\n"
+        second = {**self.paths, "test.bean": "journal2"}
+        self.bot._download_blob.reset_mock()
+        _, files = self.bot._download_ledger_snapshot(("second", second))
+        self.bot._download_blob.assert_called_once_with("journal2")
+        self.assertEqual(files["test.bean"]["content"], "; changed\n")
+
+    def test_deleted_renamed_and_duplicate_blobs(self):
+        self.bot._download_ledger_snapshot(("first", self.paths))
+        self.bot._download_blob.reset_mock()
+        paths = {"test.bean": "journal", "renamed.bean": "accounts", "copy.bean": "accounts"}
+        _, files = self.bot._download_ledger_snapshot(("second", paths))
+        self.bot._download_blob.assert_not_called()
+        self.assertEqual(set(files), set(paths))
+
+    def test_duplicate_blob_downloaded_once_on_cold_snapshot(self):
+        self.bot._download_ledger_snapshot(("first", {"test.bean": "journal", "copy.bean": "journal"}))
+        self.bot._download_blob.assert_called_once_with("journal")
+
+    def test_failed_refresh_preserves_complete_snapshot(self):
+        old = self.bot._download_ledger_snapshot(("first", self.paths))
+        self.bot._download_blob.side_effect = ValueError("synthetic failure")
+        with self.assertRaises(ValueError):
+            self.bot._download_ledger_snapshot(("second", {**self.paths, "test.bean": "new"}))
+        self.assertIs(self.bot._snapshot_cache, old)
+
+    def test_accounts_include_all_currencies_and_share_blobs(self):
+        self.assertEqual(self.bot.parse_accounts(), ["Assets:Cash"])
+        self.assertEqual(self.bot._accounts_for_prompt(), ["Assets:Cash (GBP, USD, O.US) ; sample wallet"])
+        self.bot._download_blob.reset_mock()
+        self.bot._download_ledger_snapshot()
+        self.bot._download_blob.assert_called_once_with("journal")
+
+    def test_snapshot_blobs_reused_by_account_refresh(self):
+        self.bot._download_ledger_snapshot()
+        self.bot._download_blob.reset_mock()
+        self.assertEqual(self.bot.parse_accounts(), ["Assets:Cash"])
+        self.bot._download_blob.assert_not_called()
+
+    def test_invalid_accounts_do_not_replace_last_complete_cache(self):
+        previous = self.bot.parse_accounts()
+        self.paths["accounts/nested/assets.beancount"] = "invalid"
+        self.contents["invalid"] = "2000-01-01 open Assets:Cash O\n"
+        self.bot._accounts_cache["ts"] = 0
+        self.assertIs(self.bot.parse_accounts(), previous)
+        self.assertEqual(self.bot._accounts_cache["ts"], 0)
+
+    def test_explicit_failed_context_never_reloads(self):
+        self.bot.load_ledger = MagicMock(side_effect=AssertionError("must not reload"))
+        self.assertIsNone(self.bot.examples_for_payee("Example", loaded=None))
+        self.assertEqual(self.bot.frequent_payees(loaded=None), [])
+        self.assertIsNone(self.bot._draft_ledger_context(None))
+        self.bot.load_ledger.assert_not_called()
+
+    def test_unsupplied_context_still_loads(self):
+        self.bot.load_ledger = MagicMock(return_value=None)
+        self.bot.examples_for_payee("Example")
+        self.bot.frequent_payees()
+        self.bot._draft_ledger_context()
+        self.assertEqual(self.bot.load_ledger.call_count, 3)
+
+    def test_generator_does_not_retry_explicit_failed_context(self):
+        self.bot.llm_enabled = True
+        self.bot.load_ledger = MagicMock(side_effect=AssertionError("must not reload"))
+        self.bot._call_llm_backends = MagicMock(return_value='2000-01-02 * "Example"\n  Expenses:Food  1 GBP\n  Assets:Cash  -1 GBP')
+        self.bot.validate_entry_against_ledger = MagicMock(side_effect=AssertionError("no context"))
+        entry = self.bot.call_openai_compatible("synthetic input", ["Assets:Cash", "Expenses:Food"], "2000-01-02", loaded=None)
+        self.assertIn("Expenses:Food", entry)
+        self.bot.load_ledger.assert_not_called()
+        self.bot.validate_entry_against_ledger.assert_not_called()
+
+    def test_account_tree_download_uses_verified_blob_responses(self):
+        import base64
+        del self.bot._list_bean_files
+        del self.bot._download_blob
+        def response(url, **kwargs):
+            result = MagicMock(status_code=200)
+            if "/git/trees/" in url:
+                result.json.return_value = {"sha": "tree", "tree": [
+                    {"path": p, "sha": sha, "type": "blob"} for p, sha in self.paths.items()]}
+            else:
+                sha = url.rsplit("/", 1)[1]
+                result.json.return_value = {"sha": sha, "encoding": "base64",
+                    "content": base64.b64encode(self.contents[sha].encode()).decode()}
+            return result
+        with patch("beancounter.ledger.HTTP.get", side_effect=response) as get:
+            self.assertEqual(self.bot.parse_accounts(), ["Assets:Cash"])
+            self.assertEqual(get.call_count, 2)
+        self.assertEqual(self.bot._accounts_cache["currencies"]["Assets:Cash"], "GBP, USD, O.US")
+
+    def test_concurrent_snapshot_downloads_reuse_single_refresh(self):
+        from concurrent.futures import ThreadPoolExecutor
+        gate = threading.Barrier(2)
+        def load():
+            gate.wait(timeout=5)
+            return self.bot._download_ledger_snapshot(("tree", self.paths))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.submit(load), pool.submit(load)
+            self.assertIs(first.result(5), second.result(5))
+        self.assertEqual(self.bot._download_blob.call_count, 2)
+
+    def test_account_refreshes_are_coalesced_and_closed_accounts_excluded(self):
+        from concurrent.futures import ThreadPoolExecutor
+        self.contents["accounts"] += "2000-01-01 open Assets:Old\n2000-02-01 close Assets:Old\n"
+        gate = threading.Barrier(2)
+        def load():
+            gate.wait(timeout=5)
+            return self.bot.parse_accounts()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.submit(load), pool.submit(load)
+            self.assertEqual(first.result(5), ["Assets:Cash"])
+            self.assertEqual(second.result(5), ["Assets:Cash"])
+        self.bot._list_bean_files.assert_called_once()
+        self.bot._download_blob.assert_called_once_with("accounts")
+
+    def test_download_pool_is_closed_with_bot(self):
+        self.bot._download_ledger_snapshot()
+        self.bot.close()
+        with self.assertRaises(RuntimeError):
+            self.bot._downloads.submit(lambda: None)
+
+    def test_concurrent_context_loads_parse_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        entered, release = threading.Event(), threading.Event()
+        result = ([], {})
+        def checked(*args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("release timeout")
+            return result
+        with patch("beancounter.ledger.check_ledger", side_effect=checked) as check, ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.bot.load_ledger)
+            self.assertTrue(entered.wait(5))
+            second = pool.submit(self.bot.load_ledger)
+            release.set()
+            self.assertEqual(first.result(5), result)
+            self.assertEqual(second.result(5), result)
+        check.assert_called_once()
+        self.assertEqual(self.bot._download_blob.call_count, 2)
+
+    def test_full_lane_does_not_block_other_lanes_or_reorder_its_own(self):
+        self.bot.state.queued = MagicMock(return_value=[
+            (1, 4, {"message": {"text": "first"}}),
+            (2, 8, {"message": {"text": "same lane"}}),
+            (3, 5, {"message": {"text": "other lane"}}),
+        ])
+        self.bot._spawn_handler = MagicMock(side_effect=[False, True])
+        self.bot._schedule_inbox()
+        self.assertEqual([c.args[2] for c in self.bot._spawn_handler.call_args_list], [4, 5])
+
+    def test_stage_timings_logged_even_on_failure(self):
+        from beancounter.bot_utils import timed
+        with patch("beancounter.bot_utils.log") as logged:
+            with self.assertRaises(ValueError), timed("synthetic stage"):
+                raise ValueError("synthetic failure")
+        self.assertIn("Timing [synthetic stage]", logged.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

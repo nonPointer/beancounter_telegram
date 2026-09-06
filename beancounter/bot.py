@@ -1,6 +1,7 @@
 """Bot composition and command handlers, started by the root main.py entry point."""
 
 from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor
 from .dispatch import Dispatcher
 from pathlib import Path
 from .settings import Settings
@@ -68,6 +69,11 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
         self._ledger_cache = {"tree_sha": None, "entries": None, "options_map": None}
         self._ledger_cache_lock = threading.Lock()
         self._snapshot_cache = (None, None)
+        self._account_files = {}
+        self._snapshot_lock = threading.RLock()
+        self._accounts_refresh_lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self._downloads = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ledger-download")
         self.llm_enabled = bool(self.settings.LLM_BACKENDS)
 
     def is_authorized(self, chat_id) -> bool:

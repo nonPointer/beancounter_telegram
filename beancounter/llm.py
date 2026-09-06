@@ -15,14 +15,14 @@ import re
 import time
 from .bot_utils import (
     HTTP, MAX_BEANCOUNT_RETRIES, _C_BLUE, _C_RESET, extract_json_object, format_query_result,
-    log,
+    log, NOT_LOADED,
 )
 from .bot_utils import LedgerValidationError
 from .prompts import LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, build_ledger_error_explanation_prompt
 
 class LLMMixin:
-    def _draft_ledger_context(self, loaded=None):
-        if loaded is not None:
+    def _draft_ledger_context(self, loaded=NOT_LOADED):
+        if loaded is not NOT_LOADED:
             return loaded
         try:
             return self.load_ledger()
@@ -178,7 +178,7 @@ class LLMMixin:
         current_time: str = "",
         examples: str | None = None,
         payees: list[str] | None = None,
-        loaded=None,
+        loaded=NOT_LOADED,
     ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
