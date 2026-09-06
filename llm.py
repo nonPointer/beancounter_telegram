@@ -36,7 +36,7 @@ class LLMMixin:
             advice = self._call_llm_backends({"temperature": 0.2, "messages": [
                 {"role": "system", "content": LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT},
                 {"role": "user", "content": build_ledger_error_explanation_prompt(entry_text, error)},
-            ]}, " ledger-error")
+            ]}, "账本校验错误解释")
             if advice.strip():
                 return f"{header}\n{advice.strip()}"
         except Exception:
@@ -69,7 +69,7 @@ class LLMMixin:
             ],
         }
         try:
-            raw = self._call_llm_backends(payload, " router")
+            raw = self._call_llm_backends(payload, "意图识别、payee 提取及查询语句生成")
         except Exception as e:
             log(f"Intent router failed ({e}); treating input as an entry.")
             return {"intent": "entry"}
@@ -119,7 +119,7 @@ class LLMMixin:
                         user_input, accounts, today, previous_bql=bql, bql_error=error)},
                 ],
             }
-            raw = self._call_llm_backends(payload, " bql-retry")
+            raw = self._call_llm_backends(payload, f"查询语句纠错（重试 {attempt + 1}）")
             parsed = extract_json_object(raw)
             if not parsed or not parsed.get("bql"):
                 break
@@ -128,6 +128,7 @@ class LLMMixin:
         raise ValueError(f"Could not build a working query. Last error:\n{error}")
 
     def _call_llm_backends(self, payload: dict, log_prefix: str = "", vision: bool = False) -> str:
+        log_prefix = f" [用途：{log_prefix.strip() or '分录生成'}]"
         # Read on every logical request so editing user.md needs no restart.
         path = self.settings.USER_PROMPT_PATH
         custom_prompt = path.read_text(encoding="utf-8").strip() if path.exists() else ""
@@ -149,6 +150,7 @@ class LLMMixin:
                     "Content-Type": "application/json",
                 }
                 started = time.monotonic()
+                log(f"LLM{log_prefix} requesting [{model}] @ {backend['base_url']}")
                 response = HTTP.post(url, headers=headers, json={**payload, "model": model}, timeout=60)
                 response.raise_for_status()
                 data = response.json()
@@ -204,7 +206,10 @@ class LLMMixin:
                 ],
             }
 
-            raw_text = self._call_llm_backends(payload)
+            purpose = "根据用户反馈修改分录" if previous_draft is not None else "文本分录生成"
+            if attempt:
+                purpose += f" / 校验纠错（重试 {attempt}）"
+            raw_text = self._call_llm_backends(payload, purpose)
 
             if raw_text.upper().startswith("NEED_ACCOUNT:"):
                 guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
@@ -275,7 +280,8 @@ class LLMMixin:
                 ],
             }
 
-            raw_text = self._call_llm_backends(payload, f" {log_label}", vision=True)
+            purpose = log_label + (f" / 校验纠错（纯文本重试 {attempt}）" if attempt else "")
+            raw_text = self._call_llm_backends(payload, purpose, vision=True)
 
             try:
                 entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
@@ -298,14 +304,14 @@ class LLMMixin:
         return self._call_vision_with_retry(
             image_bytes, accounts, INVEST_ORDER_SYSTEM_PROMPT,
             build_invest_order_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
-            temperature=0.1, log_label="vision",
+            temperature=0.1, log_label="投资截图识别与分录生成",
         )
 
     def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, EXPENSE_SCREENSHOT_SYSTEM_PROMPT,
             build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
-            temperature=0.2, log_label="vision-expense",
+            temperature=0.2, log_label="消费截图识别与分录生成",
         )
 
     def review_journal(self, pending: dict, appendix: str):
@@ -332,7 +338,7 @@ class LLMMixin:
                 {"role": "system", "content": JOURNAL_REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": content},
             ],
-        }, " journal-review", vision=bool(photo))
+        }, "保存前分录与原始输入一致性审核", vision=bool(photo))
         # A strict positive verdict is required; malformed or uncertain output blocks writes.
         verdict = json.loads(raw)
         if not isinstance(verdict, dict) or verdict.get("approved") is not True:

@@ -100,9 +100,11 @@ class TestCallLlmBackends(unittest.TestCase):
             for prefix in ("", " router", " bql-retry", " review", " ledger-error", " vision"):
                 self.bot._call_llm_backends({}, prefix, vision=prefix == " vision")
                 message = logged.call_args.args[0]
-                self.assertIn(f"LLM{prefix} answered by", message)
+                self.assertIn(f"LLM [用途：{prefix.strip() or '分录生成'}] answered by", message)
                 self.assertIn("Response content:\n" + content, message)
-            self.assertEqual(logged.call_count, 6)
+                self.assertIn("requesting", logged.call_args_list[-2].args[0])
+                self.assertIn(f"[用途：{prefix.strip() or '分录生成'}]", logged.call_args_list[-2].args[0])
+            self.assertEqual(logged.call_count, 12)
 
     def test_falls_through_to_second_backend(self):
         good_resp = MagicMock()
