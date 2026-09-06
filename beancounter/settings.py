@@ -6,7 +6,7 @@ from pathlib import Path
 
 class Settings:
     def __init__(self, values: dict, base_dir: Path | None = None):
-        self.base_dir = Path(base_dir or Path(__file__).parent).resolve()
+        self.base_dir = Path(base_dir or Path(__file__).resolve().parent.parent).resolve()
         for key in ("GITHUB_TOKEN", "REPO_OWNER", "REPO_NAME", "BRANCH_NAME", "FILE_PATH",
                     "TIMEZONE", "TELEGRAM_BOT_TOKEN"):
             if not isinstance(values.get(key), str) or not values[key].strip():
@@ -37,7 +37,7 @@ class Settings:
 
     @classmethod
     def load(cls, path: str | Path | None = None):
-        path = Path(path) if path else Path(__file__).with_name("config.json")
+        path = Path(path) if path else Path(__file__).resolve().parent.parent / "config.json"
         with path.open(encoding="utf-8") as source:
             return cls(json.load(source), path.resolve().parent)
 

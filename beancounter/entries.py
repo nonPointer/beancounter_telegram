@@ -3,7 +3,7 @@
 from decimal import Decimal
 from beancount.parser import parser as beancount_parser
 import re
-from bot_utils import (
+from .bot_utils import (
     BALANCE_TOLERANCE, _is_txn_header,
 )
 

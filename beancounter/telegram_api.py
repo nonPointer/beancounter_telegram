@@ -2,7 +2,7 @@
 
 import traceback
 import uuid
-from bot_utils import (
+from .bot_utils import (
     AccountMatchError, HTTP, POLL_BACKOFF_BASE, POLL_BACKOFF_MAX, TELEGRAM_MESSAGE_LIMIT,
     _scrub, _utf16_len, log,
 )

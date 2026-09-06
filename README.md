@@ -29,6 +29,25 @@
   python main.py
   ```
 
+## 项目结构
+
+```text
+main.py                 # 稳定启动入口：python main.py [debug]
+beancounter/            # 业务代码包
+  bot.py                # Bot 组装、消息和命令处理
+  ledger.py             # 账本读取、账户及 GitHub 写入
+  llm.py / prompts.py   # LLM 调用与提示构建
+  drafts.py             # 草稿、确认与审核流程
+  templates/            # Beancount 分录模板
+  ...                   # 配置、校验、Telegram、调度和持久化模块
+scripts/preview_llm.py   # 手动 LLM 预览工具，需显式 --live
+tests/                  # 离线自动测试及测试数据规范
+config.json.example     # 配置模板
+user.md.example         # 用户 prompt 模板
+```
+
+个人 `config.json`、`user.md` 和运行状态 `data/` 留在项目根目录且不被 Git 跟踪。整理目录不改变它们的路径，也不改变 `python main.py` 的启动方式；模板随业务代码放在 `beancounter/templates/`，不依赖启动时的工作目录。Python 调用方使用 `from beancounter.bot import Bot`，原有 `from main import Bot` 仍可用。
+
 ## 功能
 
 - [x] `open`、`close`、`balance`、`pad` 指令

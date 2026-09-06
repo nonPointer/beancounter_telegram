@@ -1,6 +1,6 @@
 """Unit tests for main.py Bot logic."""
 
-# Run from anywhere: put the repo root on the path so `import main` resolves.
+# Run from anywhere: put the repo root on the path so `from beancounter import bot as main` resolves.
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,8 +24,8 @@ MOCK_CONFIG = {
 }
 
 # Importing main is side-effect free; tests pass their own settings.
-import main
-from main import Bot
+from beancounter import bot as main
+from beancounter.bot import Bot
 
 
 def make_bot() -> Bot:
@@ -306,21 +306,21 @@ class TestBuildUserPromptExamples(unittest.TestCase):
     """Route A: examples injected into the generation prompt, before the declined draft."""
 
     def test_examples_injected(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         p = build_user_prompt("2026-07-21", ["Expenses:X"], "示例甲 20",
                               examples='2026-06-20 * "示例甲" "拿铁"\n  Expenses:X  16 CNY')
         self.assertIn("参考", p)
         self.assertIn('"示例甲"', p)
 
     def test_no_examples_leaves_prompt_unchanged(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         self.assertNotIn("参考", build_user_prompt("2026-07-21", ["Expenses:X"], "打车 20"))
         self.assertNotIn("参考", build_user_prompt("2026-07-21", ["Expenses:X"], "打车 20", examples=""))
 
     def test_examples_precede_declined_draft(self):
         # The 参考 block must come before the previous declined draft so the correction
         # context is the last thing the model reads.
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         p = build_user_prompt("2026-07-21", ["Expenses:X"], "示例甲 20",
                               previous_draft="OLD_DRAFT", examples="EXAMPLE_BLOCK")
         self.assertLess(p.index("EXAMPLE_BLOCK"), p.index("OLD_DRAFT"))
@@ -1175,7 +1175,7 @@ class TestApproveCommitWindow(unittest.TestCase):
         self.bot._list_bean_files = lambda: (self.gh.sha, {})
         self.bot.parse_accounts = lambda: ["Assets:Cash"]
         self.bot.review_journal = MagicMock()
-        validation = patch("drafts.check_ledger")
+        validation = patch("beancounter.drafts.check_ledger")
         validation.start()
         self.addCleanup(validation.stop)
 

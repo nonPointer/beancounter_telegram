@@ -13,11 +13,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from main import Bot
-from settings import Settings
-from dispatch import Dispatcher
-from state_store import StateStore
-from ledger_validation import check_ledger, load_ledger_texts
+from beancounter.bot import Bot
+from beancounter.settings import Settings
+from beancounter.dispatch import Dispatcher
+from beancounter.state_store import StateStore
+from beancounter.ledger_validation import check_ledger, load_ledger_texts
 from test_bot import MOCK_CONFIG, FakeGitHub
 
 
@@ -159,7 +159,7 @@ class TestDispatcher(unittest.TestCase):
     def test_one_failed_job_does_not_kill_a_worker(self):
         dispatcher = Dispatcher(1, 4)
         seen = []
-        with patch("dispatch.traceback.print_exc"):
+        with patch("beancounter.dispatch.traceback.print_exc"):
             dispatcher.submit(123, 1, lambda: 1 / 0)
             dispatcher.submit(123, 2, lambda: seen.append(2))
             dispatcher.close()
@@ -169,17 +169,42 @@ class TestDispatcher(unittest.TestCase):
 class TestExplicitSettings(unittest.TestCase):
     def test_import_does_not_load_configuration(self):
         result = subprocess.run([sys.executable, "-c",
-            "import settings; settings.Settings.load = lambda *a: (_ for _ in ()).throw(AssertionError('config read')); import main"],
+            "from beancounter import settings; settings.Settings.load = lambda *a: (_ for _ in ()).throw(AssertionError('config read')); from beancounter import bot as main"],
             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_interactive_preview_requires_opt_in_before_loading_config(self):
-        with patch.object(sys, "argv", ["test_llm.py"]), patch("sys.stderr"), \
+        with patch.object(sys, "argv", ["preview_llm.py"]), patch("sys.stderr"), \
              patch.object(Settings, "load") as load_config:
             with self.assertRaises(SystemExit) as caught:
-                runpy.run_path(str(Path(__file__).with_name("test_llm.py")), run_name="__main__")
+                runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "preview_llm.py"), run_name="__main__")
         self.assertEqual(caught.exception.code, 2)
         load_config.assert_not_called()
+
+    def test_package_move_preserves_default_personal_paths(self):
+        root = Path(__file__).resolve().parents[1]
+        with patch("beancounter.settings.Path.open"), \
+             patch("beancounter.settings.json.load", return_value=MOCK_CONFIG):
+            settings = Settings.load()
+        self.assertEqual(settings.base_dir, root)
+        self.assertEqual(settings.USER_PROMPT_PATH, root / "user.md")
+        self.assertEqual(Path(settings.STATE_PATH), root / "data" / "bot.sqlite3")
+        self.assertEqual(Settings(MOCK_CONFIG).base_dir, root)
+
+    def test_entrypoint_and_templates_work_outside_repository(self):
+        root = Path(__file__).resolve().parents[1]
+        code = (
+            "import sys, runpy; from unittest.mock import patch; "
+            f"sys.path.insert(0, {str(root)!r}); "
+            "import main; from beancounter.bot import Bot; "
+            "from beancounter.bot_utils import jinja2; "
+            "assert main.Bot is Bot; jinja2.get_template('transaction.bean.j2'); "
+            "guard = patch('beancounter.bot.run'); mocked = guard.start(); "
+            "runpy.run_path(main.__file__, run_name='__main__'); mocked.assert_called_once()"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, "-c", code], cwd=directory, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_instances_do_not_share_credentials_or_whitelists(self):
         first = Bot(settings=MOCK_CONFIG, state_path=":memory:")
@@ -224,7 +249,7 @@ class TestExplicitSettings(unittest.TestCase):
     def test_draft_and_commit_checks_log_full_diagnostics(self):
         texts = {"main.bean": "2000-01-01 commodity O\n" * 10}
         for check in (load_ledger_texts, check_ledger):
-            with self.subTest(check=check.__name__), patch("ledger_validation.log") as logged:
+            with self.subTest(check=check.__name__), patch("beancounter.ledger_validation.log") as logged:
                 if check is check_ledger:
                     with self.assertRaises(ValueError):
                         check(texts, "main.bean")

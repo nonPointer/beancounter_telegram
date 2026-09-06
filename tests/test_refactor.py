@@ -1,5 +1,5 @@
 """Tests for 1.1 / 1.3 / 1.4 / 5.6 refactoring in main.py."""
-# Run from anywhere: put the repo root on the path so `import main` resolves.
+# Run from anywhere: put the repo root on the path so `from beancounter import bot as main` resolves.
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,7 +29,7 @@ FAKE_CONFIG = {
     "CHAT_ID": "1,42,99",
 }
 
-import main
+from beancounter import bot as main
 
 
 class TestAccountTypeMap(unittest.TestCase):
@@ -96,7 +96,7 @@ class TestCallLlmBackends(unittest.TestCase):
         content = "  synthetic response\nsecond line  "
         response.json.return_value = {"choices": [{"message": {"content": content}}]}
         with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]), \
-             patch.object(main.HTTP, "post", return_value=response), patch("llm.log") as logged:
+             patch.object(main.HTTP, "post", return_value=response), patch("beancounter.llm.log") as logged:
             for prefix in ("", " router", " bql-retry", " review", " ledger-error", " vision"):
                 self.bot._call_llm_backends({}, prefix, vision=prefix == " vision")
                 message = logged.call_args.args[0]
@@ -755,24 +755,24 @@ class TestBuildUserPromptCurrentTime(unittest.TestCase):
     """Tests for current_time parameter in build_user_prompt."""
 
     def test_without_current_time(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         result = build_user_prompt("2026-03-13", ["Assets:Cash"], "lunch 50")
         self.assertNotIn("current time", result)
         self.assertIn("Transaction date is 2026-03-13", result)
 
     def test_with_empty_current_time(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         result = build_user_prompt("2026-03-13", ["Assets:Cash"], "lunch 50", current_time="")
         self.assertNotIn("current time", result)
 
     def test_with_current_time(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         result = build_user_prompt("2026-03-13", ["Assets:Cash"], "lunch 50", current_time="14:30")
         self.assertIn("(current time: 14:30)", result)
         self.assertIn("Transaction date is 2026-03-13", result)
 
     def test_with_previous_draft_and_time(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         result = build_user_prompt(
             "2026-03-13", ["Assets:Cash"], "lunch 50",
             previous_draft="old draft", current_time="08:00",
@@ -781,7 +781,7 @@ class TestBuildUserPromptCurrentTime(unittest.TestCase):
         self.assertIn("Previous declined draft:", result)
 
     def test_with_decline_reason_and_time(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         result = build_user_prompt(
             "2026-03-13", ["Assets:Cash"], "lunch 50",
             decline_reason="wrong account", current_time="19:45",
@@ -790,7 +790,7 @@ class TestBuildUserPromptCurrentTime(unittest.TestCase):
         self.assertIn("Decline reason from user:", result)
 
     def test_with_all_optional_params(self):
-        from prompts import build_user_prompt
+        from beancounter.prompts import build_user_prompt
         result = build_user_prompt(
             "2026-03-13", ["Assets:Cash", "Expenses:Food"], "dinner 80",
             previous_draft="draft v1", decline_reason="fix payee",
@@ -807,18 +807,18 @@ class TestBuildInvestOrderPromptCurrentTime(unittest.TestCase):
     """Tests for current_datetime parameter in build_invest_order_prompt."""
 
     def test_without_current_datetime(self):
-        from prompts import build_invest_order_prompt
+        from beancounter.prompts import build_invest_order_prompt
         result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"])
         self.assertNotIn("current datetime", result)
         self.assertIn("Reference date (today): 2026-03-13.", result)
 
     def test_with_empty_current_datetime(self):
-        from prompts import build_invest_order_prompt
+        from beancounter.prompts import build_invest_order_prompt
         result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_datetime="")
         self.assertNotIn("current datetime", result)
 
     def test_with_current_datetime(self):
-        from prompts import build_invest_order_prompt
+        from beancounter.prompts import build_invest_order_prompt
         result = build_invest_order_prompt("2026-03-13", ["Assets:Broker:Cash"], current_datetime="2026-03-13T09:30:00+08:00")
         self.assertIn("(current datetime: 2026-03-13T09:30:00+08:00)", result)
         self.assertIn("Reference date (today): 2026-03-13", result)

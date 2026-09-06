@@ -6,11 +6,11 @@ from beancount.core.data import Transaction
 from concurrent.futures import as_completed
 import base64
 from beancount.query import query as beancount_query
-from ledger_validation import check_ledger, load_ledger_texts
+from .ledger_validation import check_ledger, load_ledger_texts
 from pathlib import Path
 import re
 import time
-from bot_utils import (
+from .bot_utils import (
     AccountMatchError, GITHUB_CONFLICT_RETRIES, GITHUB_URL_BASE, HTTP, log,
 )
 

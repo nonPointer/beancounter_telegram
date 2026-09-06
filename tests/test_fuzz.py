@@ -1,5 +1,5 @@
 """Fuzzing / edge-case tests for all parsing functions in main.py."""
-# Run from anywhere: put the repo root on the path so `import main` resolves.
+# Run from anywhere: put the repo root on the path so `from beancounter import bot as main` resolves.
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,7 +19,7 @@ FAKE_CONFIG = {
     "CHAT_ID": "123",
 }
 
-import main
+from beancounter import bot as main
 
 
 ACCOUNTS = [

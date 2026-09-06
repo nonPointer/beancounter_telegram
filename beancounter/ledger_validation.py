@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from beancount import loader
 from beancount.ops import validation
 from beancount.parser import printer
-from bot_utils import log
+from .bot_utils import log
 
 
 def _error_details(errors):

@@ -1,24 +1,24 @@
 """Llm responsibilities of Bot; shared entry points are preserved."""
 
-from prompts import BEANCOUNT_SYSTEM_PROMPT
-from prompts import EXPENSE_SCREENSHOT_SYSTEM_PROMPT
-from prompts import INVEST_ORDER_SYSTEM_PROMPT
-from prompts import JOURNAL_REVIEW_SYSTEM_PROMPT
-from prompts import QUERY_ROUTER_SYSTEM_PROMPT
+from .prompts import BEANCOUNT_SYSTEM_PROMPT
+from .prompts import EXPENSE_SCREENSHOT_SYSTEM_PROMPT
+from .prompts import INVEST_ORDER_SYSTEM_PROMPT
+from .prompts import JOURNAL_REVIEW_SYSTEM_PROMPT
+from .prompts import QUERY_ROUTER_SYSTEM_PROMPT
 import base64
-from prompts import build_expense_screenshot_prompt
-from prompts import build_invest_order_prompt
-from prompts import build_query_router_prompt
-from prompts import build_user_prompt
+from .prompts import build_expense_screenshot_prompt
+from .prompts import build_invest_order_prompt
+from .prompts import build_query_router_prompt
+from .prompts import build_user_prompt
 import json
 import re
 import time
-from bot_utils import (
+from .bot_utils import (
     HTTP, MAX_BEANCOUNT_RETRIES, _C_BLUE, _C_RESET, extract_json_object, format_query_result,
     log,
 )
-from bot_utils import LedgerValidationError
-from prompts import LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, build_ledger_error_explanation_prompt
+from .bot_utils import LedgerValidationError
+from .prompts import LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, build_ledger_error_explanation_prompt
 
 class LLMMixin:
     def _draft_ledger_context(self, loaded=None):

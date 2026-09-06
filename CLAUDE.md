@@ -19,26 +19,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/bin/python tests/test_runtime.py    # SQLite restart, bounded queues, configuration
 
 # Interactive LLM test tool (real services; use synthetic input and a test ledger)
-.venv/bin/python tests/test_llm.py --live
+.venv/bin/python scripts/preview_llm.py --live
 ```
 
 ## Architecture
 
-**Python Telegram Bot (`main.py`)** — the only backend
+**Python Telegram Bot (`beancounter/bot.py`)** — root `main.py` is a thin, stable launch entry point.
 - Polls Telegram; persists updates before acknowledgment and uses bounded FIFO worker lanes
 - `Bot` class holds all state: pending drafts, account cache, LLM config
 - Per-message flow: text → LLM → pending draft → user confirm/decline → GitHub commit
 - Photo messages (investment screenshots) go through a vision LLM path (`call_openai_vision_invest`)
 
 ### Key modules
-- `main.py` — Bot composition, initialization and command handlers
-- `settings.py` — explicit per-instance configuration; no import-time credential reads
-- `entries.py`, `ledger.py`, `llm.py`, `drafts.py`, `telegram_api.py` — focused Bot mixins preserving method entry points
-- `bot_utils.py` — formatting/date helpers, constants, thread-local HTTP connection pools
-- `dispatch.py`, `state_store.py` — bounded workers and SQLite state/inbox
-- `ledger_validation.py` — complete local bean-check equivalent
-- `prompts.py` — LLM system prompts and user prompt builders for both text and vision paths
-- `templates/*.bean.j2` — Jinja2 templates for beancount directives (`open`, `close`, `balance`, `pad`, `transaction`)
+
+- `main.py` — stable startup wrapper; also exports `Bot` for existing callers
+- `beancounter/bot.py` — Bot composition, initialization and command handlers
+- `beancounter/settings.py` — explicit per-instance configuration; root config, user prompt and state paths remain unchanged
+- `beancounter/entries.py`, `ledger.py`, `llm.py`, `drafts.py`, `telegram_api.py` — focused Bot mixins (all inside the package)
+- `beancounter/bot_utils.py` — formatting/date helpers, constants, thread-local HTTP connection pools
+- `beancounter/dispatch.py`, `state_store.py` — bounded workers and SQLite state/inbox
+- `beancounter/ledger_validation.py` — complete local bean-check equivalent
+- `beancounter/prompts.py` — LLM system prompts and user prompt builders
+- `beancounter/templates/*.bean.j2` — Jinja2 templates located relative to the package, not the working directory
+- `scripts/preview_llm.py` — opt-in live integration preview, separate from offline `tests/`
+
+Use relative imports within `beancounter` and package-qualified imports in tests and tools. Keep root `main.py` lightweight; do not move personal configuration or runtime state into the package. Module names mentioned below refer to this package unless stated otherwise. Avoid hard-wrapping documentation paragraphs.
 
 ### Config (`config.json`, gitignored)
 Required keys: `GITHUB_TOKEN`, `REPO_OWNER`, `REPO_NAME`, `BRANCH_NAME`, `FILE_PATH`, `TIMEZONE`, `TELEGRAM_BOT_TOKEN`, `CHAT_ID`
