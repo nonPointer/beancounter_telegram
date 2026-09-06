@@ -107,6 +107,8 @@ renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
 
 ### Payee context for drafts
 
+Text generation, screenshot generation and feedback regeneration all use `publish_llm_draft` in `drafts.py` to annotate the journal, build its commit message, persist the pending draft and present it. Replacements check the original object's identity under the pending lock and retain feedback/image references. Automatic confirmation remains disabled until delivery succeeds. `/last` and `/today` share `_show_journal_records` for loading, filtering, escaping and length-limited display; keep their existing public command entry points.
+
 When the router classifies input as an entry, two best-effort lookups enrich the draft prompt so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes the result to both helpers via `loaded=`. Omitted context uses `NOT_LOADED` and triggers loading; explicit `None` means unavailable and must not trigger another load in that generation request. The next request can retry; the mandatory pre-commit check remains.
 
 - **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's most recent past transactions (up to 10, loose case-folded substring match, either direction) are rendered back to beancount text via `_format_example_entry` (header + postings only, no metadata) and shown so the LLM reuses the account/narration/currency conventions.

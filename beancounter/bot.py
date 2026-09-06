@@ -129,19 +129,10 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
                 draft_label, user_input = "Expense screenshot draft", caption or "(expense screenshot)"
                 commit_prefix = 'Add entry by Telegram Bot\n\n'
 
-            if caption:
-                appendix = self.insert_prompt_metadata(appendix, caption)
-            commit_message = self.add_non_pnl_accounts_to_commit_message(commit_prefix, appendix)
-
-            pending_id = self.next_pending_id()
-            with self._pending_lock:
-                self.pending_llm_entries[pending_id] = self._make_pending_entry(
-                    chat_id, appendix, commit_message, user_input, date_str
-                )
-                self.pending_llm_entries[pending_id]["photo_file_id"] = file_id
-
-            log(f"{draft_label}:\n" + appendix)
-            self.send_draft_for_review(chat_id, f"{draft_label}:", appendix, pending_id)
+            self.publish_llm_draft(
+                chat_id, appendix, commit_prefix, user_input, date_str,
+                header=f"{draft_label}:", prompt=caption, photo_file_id=file_id,
+            )
         except Exception as e:
             log(f"Photo processing failed: {e}")
             reply(str(e) if isinstance(e, LedgerValidationError) else f"Failed to process screenshot: {e}")
@@ -185,49 +176,29 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
         )
 
     def handle_last(self, chat_id: int, count: int = 5):
-        count = min(count, 50)
-        f = self.github_download_file()
-        if not f:
-            self.send_message(chat_id, "Failed to download main.bean from GitHub.")
-            return
-        blocks = extract_all_directive_blocks(f["content"])
-        if not blocks:
-            self.send_message(chat_id, "main.bean 中没有找到任何记录。")
-            return
-        last_blocks = blocks[-count:]
-        text = "\n\n".join(block_text for _, block_text in last_blocks)
-        prefix = f"最近 {len(last_blocks)} 条记录：\n"
-        notice = "\n（内容过长，已截断显示）"
-        block, truncated = _capped_code_block(
-            text, TELEGRAM_MESSAGE_LIMIT - _utf16_len(prefix) - _utf16_len(notice))
-        msg = prefix + block + (notice if truncated else "")
-        self.send_message(
-            chat_id,
-            msg,
-            parse_mode="HTML",
-        )
+        self._show_journal_records(chat_id, count=min(count, 50))
 
     def handle_today(self, chat_id: int):
-        f = self.github_download_file()
-        if not f:
+        self._show_journal_records(chat_id, date=datetime.now(self.timezone).strftime('%Y-%m-%d'))
+
+    def _show_journal_records(self, chat_id, *, count=None, date=None):
+        file = self.github_download_file()
+        if not file:
             self.send_message(chat_id, "Failed to download main.bean from GitHub.")
             return
-        today = datetime.now(self.timezone).strftime('%Y-%m-%d')
-        blocks = extract_all_directive_blocks(f["content"])
-        today_blocks = [(d, t) for d, t in blocks if d == today]
-        if not today_blocks:
-            self.send_message(chat_id, f"今天（{today}）没有记录。")
+        blocks = extract_all_directive_blocks(file["content"])
+        blocks = [(d, text) for d, text in blocks if d == date] if date else blocks[-count:]
+        if not blocks:
+            empty = f"今天（{date}）没有记录。" if date else "main.bean 中没有找到任何记录。"
+            self.send_message(chat_id, empty)
             return
-        text = "\n\n".join(block_text for _, block_text in today_blocks)
-        prefix = f"今天（{today}）共 {len(today_blocks)} 条记录：\n"
+        prefix = f"今天（{date}）共 {len(blocks)} 条记录：\n" if date else f"最近 {len(blocks)} 条记录：\n"
         notice = "\n（内容过长，已截断显示）"
         block, truncated = _capped_code_block(
-            text, TELEGRAM_MESSAGE_LIMIT - _utf16_len(prefix) - _utf16_len(notice))
-        self.send_message(
-            chat_id,
-            prefix + block + (notice if truncated else ""),
-            parse_mode="HTML",
+            "\n\n".join(text for _, text in blocks),
+            TELEGRAM_MESSAGE_LIMIT - _utf16_len(prefix) - _utf16_len(notice),
         )
+        self.send_message(chat_id, prefix + block + (notice if truncated else ""), parse_mode="HTML")
 
     def handle_message(self, message):
         text = message["message"]["text"]
@@ -502,17 +473,10 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
 
             try:
                 appendix = self.call_openai_compatible(text, accounts, date_str, current_time="" if custom_date else time_str, examples=examples, payees=payees, loaded=loaded_ledger)
-                appendix = self.insert_prompt_metadata(appendix, text)
-                commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
-
-                pending_id = self.next_pending_id()
-                with self._pending_lock:
-                    self.pending_llm_entries[pending_id] = self._make_pending_entry(
-                        chat_id, appendix, commit_message, message["message"]["text"], date_str
-                    )
-
-                log("LLM draft:\n" + appendix)
-                self.send_draft_for_review(chat_id, "LLM draft (checked padding):", appendix, pending_id)
+                self.publish_llm_draft(
+                    chat_id, appendix, commit_message, message["message"]["text"], date_str,
+                    header="LLM draft (checked padding):", prompt=text,
+                )
                 return
             except Exception as e:
                 log(f"LLM generation failed: {e}")

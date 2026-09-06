@@ -261,6 +261,54 @@ class TestExplicitSettings(unittest.TestCase):
                 self.assertNotIn("ledger_check_", message)
 
 
+class TestDraftPublication(unittest.TestCase):
+    def setUp(self):
+        self.bot = Bot(settings=MOCK_CONFIG, state_path=":memory:")
+        self.addCleanup(self.bot.close)
+        self.entry = '2000-01-02 * "Example Shop"\n  Expenses:Food  1 GBP\n  Assets:Cash  -1 GBP'
+        self.bot.send_draft_for_review = MagicMock()
+
+    def publish(self, **kwargs):
+        return self.bot.publish_llm_draft(123, self.entry, "entry", "original synthetic input",
+                                          "2000-01-02", header="Synthetic draft:", **kwargs)
+
+    def test_persisted_before_delivery_with_original_input_preserved(self):
+        def delivered(chat, header, appendix, pid):
+            saved = self.bot.state.get("drafts")["pending"][pid]
+            self.assertEqual(saved["user_input"], "original synthetic input")
+            self.assertFalse(saved["auto_confirm"])
+            self.assertEqual(saved["appendix"], appendix)
+            self.assertEqual(appendix.count('prompt: "processed synthetic input"'), 1)
+            self.assertIn("Assets:Cash", saved["commit_message"])
+        self.bot.send_draft_for_review.side_effect = delivered
+        self.publish(prompt="processed synthetic input")
+        self.bot.send_draft_for_review.assert_called_once()
+
+    def test_captionless_photo_preserves_image_without_placeholder_metadata(self):
+        pid = self.publish(prompt="", photo_file_id="synthetic-photo")
+        pending = self.bot.pending_llm_entries[pid]
+        self.assertEqual(pending["photo_file_id"], "synthetic-photo")
+        self.assertNotIn("prompt:", pending["appendix"])
+
+    def test_replacement_preserves_feedback_and_image_in_persisted_state(self):
+        original_id = self.publish(photo_file_id="synthetic-photo")
+        original = self.bot.pending_llm_entries[original_id]
+        original["feedback"] = ["synthetic correction"]
+        pid = self.publish(replaces=(original_id, original))
+        saved = self.bot.state.get("drafts")["pending"]
+        self.assertNotIn(original_id, saved)
+        self.assertEqual(saved[pid]["feedback"], ["synthetic correction"])
+        self.assertEqual(saved[pid]["photo_file_id"], "synthetic-photo")
+
+    def test_discarded_original_is_not_resurrected(self):
+        original_id = self.publish()
+        original = self.bot.pending_llm_entries.pop(original_id)
+        self.bot.send_draft_for_review.reset_mock()
+        self.assertIsNone(self.publish(replaces=(original_id, original)))
+        self.assertEqual(self.bot.pending_llm_entries, {})
+        self.bot.send_draft_for_review.assert_not_called()
+
+
 class TestPerformance(unittest.TestCase):
     def setUp(self):
         self.bot = Bot(settings=MOCK_CONFIG, state_path=":memory:")

@@ -11,6 +11,31 @@ from .bot_utils import (
 from .bot_utils import LedgerValidationError
 
 class DraftMixin:
+    def publish_llm_draft(self, chat_id, appendix, commit_message, user_input, date_str,
+                          *, header, prompt=None, photo_file_id=None, replaces=None):
+        """Prepare, persist and show a draft; replacement must still own the original."""
+        prompt = user_input if prompt is None else prompt
+        if prompt:
+            appendix = self.insert_prompt_metadata(appendix, prompt)
+        commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
+        pending_id = self.next_pending_id()
+        with self._pending_lock:
+            if replaces and self.pending_llm_entries.get(replaces[0]) is not replaces[1]:
+                return None
+            pending = self._make_pending_entry(chat_id, appendix, commit_message, user_input, date_str)
+            if replaces:
+                previous_id, previous = replaces
+                pending["feedback"] = previous.get("feedback", [])
+                photo_file_id = previous.get("photo_file_id")
+                self.pending_llm_entries.pop(previous_id)
+            if photo_file_id:
+                pending["photo_file_id"] = photo_file_id
+            self.pending_llm_entries[pending_id] = pending
+            self._save_pending_locked()
+        log(f"{header}\n{appendix}")
+        self.send_draft_for_review(chat_id, header, appendix, pending_id)
+        return pending_id
+
     def _save_pending_locked(self):
         with timed("draft checkpoint"):
             self.state.set("drafts", {"pending": self.pending_llm_entries, "inflight": self._inflight,
@@ -240,26 +265,11 @@ class DraftMixin:
                 decline_reason="\n".join(pending.get("feedback", [])) or None,
                 current_time=datetime.now(self.timezone).strftime('%H:%M'),
             )
-            new_appendix = self.insert_prompt_metadata(new_appendix, pending["user_input"])
-            new_commit_message = self.add_non_pnl_accounts_to_commit_message(
-                'Add entry by Telegram Bot\n\n', new_appendix
+            self.publish_llm_draft(
+                chat_id, new_appendix, 'Add entry by Telegram Bot\n\n',
+                pending["user_input"], pending["date_str"],
+                header="LLM rechecked draft:", replaces=(pending_id, pending),
             )
-
-            new_pending_id = self.next_pending_id()
-            with self._pending_lock:
-                if self.pending_llm_entries.get(pending_id) is not pending:
-                    return  # User discarded the original while generation was running.
-                self.pending_llm_entries[new_pending_id] = self._make_pending_entry(
-                    chat_id, new_appendix, new_commit_message, pending["user_input"], pending["date_str"]
-                )
-                replacement = self.pending_llm_entries[new_pending_id]
-                replacement["feedback"] = pending.get("feedback", [])
-                if pending.get("photo_file_id"):
-                    replacement["photo_file_id"] = pending["photo_file_id"]
-                self.pending_llm_entries.pop(pending_id, None)
-
-            log("LLM rechecked draft:\n" + new_appendix)
-            self.send_draft_for_review(chat_id, "LLM rechecked draft:", new_appendix, new_pending_id)
         except Exception as e:
             pending["rechecking"] = False
             self._save_pending()
