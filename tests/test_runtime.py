@@ -17,7 +17,7 @@ from main import Bot
 from settings import Settings
 from dispatch import Dispatcher
 from state_store import StateStore
-from ledger_validation import check_ledger
+from ledger_validation import check_ledger, load_ledger_texts
 from test_bot import MOCK_CONFIG, FakeGitHub
 
 
@@ -220,6 +220,20 @@ class TestExplicitSettings(unittest.TestCase):
             check_ledger(texts, "main.bean")
         self.assertIn("main.bean:1:", str(caught.exception))
         self.assertIn('2000-01-01 * "Unknown account"', str(caught.exception))
+
+    def test_draft_and_commit_checks_log_full_diagnostics(self):
+        texts = {"main.bean": "2000-01-01 commodity O\n" * 10}
+        for check in (load_ledger_texts, check_ledger):
+            with self.subTest(check=check.__name__), patch("ledger_validation.log") as logged:
+                if check is check_ledger:
+                    with self.assertRaises(ValueError):
+                        check(texts, "main.bean")
+                else:
+                    check(texts, "main.bean")
+                message = logged.call_args.args[0]
+                self.assertEqual(message.count("Invalid token: 'O'"), 10)
+                self.assertIn("main.bean:10:", message)
+                self.assertNotIn("ledger_check_", message)
 
 
 if __name__ == "__main__":

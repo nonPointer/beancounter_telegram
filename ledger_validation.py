@@ -6,6 +6,11 @@ from tempfile import TemporaryDirectory
 from beancount import loader
 from beancount.ops import validation
 from beancount.parser import printer
+from bot_utils import log
+
+
+def _error_details(errors):
+    return "\n".join(printer.format_error(error).rstrip() for error in errors)
 
 
 def load_ledger_texts(texts: dict[str, str], root: str, required_file: str | None = None):
@@ -33,6 +38,8 @@ def load_ledger_texts(texts: dict[str, str], root: str, required_file: str | Non
                 except ValueError:
                     pass
             errors[index] = error._replace(source=source)
+        if errors:
+            log(f"bean-check failed for {root} ({len(errors)} errors):\n{_error_details(errors)}")
         if required_file and str(Path(directory, required_file)) not in options.get("include", []):
             raise ValueError(f"Ledger root {root} does not include journal {required_file}.")
         return entries, errors, options
@@ -42,6 +49,6 @@ def check_ledger(texts: dict[str, str], root: str, required_file: str | None = N
     """Mandatory commit/query gate: every bean-check error blocks the operation."""
     entries, errors, options = load_ledger_texts(texts, root, required_file)
     if errors:
-        details = "\n".join(printer.format_error(error).rstrip() for error in errors)
+        details = _error_details(errors)
         raise ValueError(f"bean-check failed ({len(errors)} errors):\n{details}")
     return entries, options

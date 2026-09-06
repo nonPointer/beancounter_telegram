@@ -159,7 +159,7 @@ class LLMMixin:
                 if content is None:
                     raise ValueError(f"LLM returned null content: {data}")
                 elapsed = time.monotonic() - started
-                log(f"LLM{log_prefix} answered by {_C_BLUE}[{model}]{_C_RESET} @ {backend['base_url']} ({elapsed:.1f}s)")
+                log(f"LLM{log_prefix} answered by {_C_BLUE}[{model}]{_C_RESET} @ {backend['base_url']} ({elapsed:.1f}s)\nResponse content:\n{content}")
                 return content.strip()
             except Exception as e:
                 log(f"LLM backend '{model}'{log_prefix} failed: {e}, trying next...")

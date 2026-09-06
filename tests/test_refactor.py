@@ -91,6 +91,19 @@ class TestCallLlmBackends(unittest.TestCase):
                 result = self.bot._call_llm_backends({})
         self.assertEqual(result, "hello")
 
+    def test_logs_raw_content_for_every_llm_purpose(self):
+        response = MagicMock()
+        content = "  synthetic response\nsecond line  "
+        response.json.return_value = {"choices": [{"message": {"content": content}}]}
+        with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]), \
+             patch.object(main.HTTP, "post", return_value=response), patch("llm.log") as logged:
+            for prefix in ("", " router", " bql-retry", " review", " ledger-error", " vision"):
+                self.bot._call_llm_backends({}, prefix, vision=prefix == " vision")
+                message = logged.call_args.args[0]
+                self.assertIn(f"LLM{prefix} answered by", message)
+                self.assertIn("Response content:\n" + content, message)
+            self.assertEqual(logged.call_count, 6)
+
     def test_falls_through_to_second_backend(self):
         good_resp = MagicMock()
         good_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}

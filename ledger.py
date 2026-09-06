@@ -198,7 +198,8 @@ class LedgerMixin:
         if loaded is None:
             try:
                 loaded = self.load_ledger()
-            except Exception:
+            except Exception as exc:
+                log(f"Draft bean-check skipped: ledger unavailable ({type(exc).__name__}: {exc}).")
                 return None
         if loaded is None:
             return None
@@ -213,7 +214,8 @@ class LedgerMixin:
         candidate[self.settings.FILE_PATH] = (base + "\n\n" if base else "") + entry_text + "\n"
         try:
             _, errors, _ = self._load_ledger_texts(candidate, self._ledger_root(candidate))
-        except Exception:
+        except Exception as exc:
+            log(f"Draft bean-check could not run ({type(exc).__name__}: {exc}); commit validation remains mandatory.")
             return None  # Generation can continue; the pre-commit gate cannot be skipped.
         new_errors = []
         for error in errors:

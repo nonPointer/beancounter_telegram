@@ -89,6 +89,7 @@ class DraftMixin:
         try:
             appendix = self.commit_llm_entry(pending)
         except Exception as exc:
+            log(f"Draft {pending_id} save failed ({type(exc).__name__}: {exc}); draft retained.")
             pending["auto_confirm"] = False
             self._restore_pending(pending_id, pending)
             self.send_message(chat_id, f"未能确认保存：{exc}\n草稿已保留，自动确认已暂停。可点击 ✅ 重试或 🔧 修改。",
