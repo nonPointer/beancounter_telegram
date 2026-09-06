@@ -1,6 +1,7 @@
 """Interactive generation using the production LLM path, without ledger writes."""
 
 import sys
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -9,6 +10,11 @@ from main import Bot
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--live", action="store_true",
+                        help="Read real config, ledger and user.md; send input/context to the configured LLM.")
+    if not parser.parse_args().live:
+        parser.error("Interactive preview requires --live; use only synthetic input and a test ledger.")
     bot = Bot(state_path=":memory:")
     try:
         accounts = bot.parse_accounts()

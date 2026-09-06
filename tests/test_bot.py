@@ -215,18 +215,18 @@ class TestExamplesForPayee(unittest.TestCase):
 
     LEDGER = (
         "2026-01-01 open Expenses:Food:Coffee\n"
-        "2026-01-01 open Assets:WeChat:Current\n"
+        "2026-01-01 open Assets:WalletA:Current\n"
         "2026-01-01 open Assets:Cash\n\n"
-        '2026-03-10 * "瑞幸咖啡" "生椰拿铁"\n'
-        '  prompt: "瑞幸 18"\n'
+        '2026-03-10 * "示例甲咖啡" "生椰拿铁"\n'
+        '  prompt: "示例甲 18"\n'
         "  Expenses:Food:Coffee   18.00 CNY\n"
-        "  Assets:WeChat:Current\n\n"
-        '2026-05-02 * "星巴克" "美式"\n'
+        "  Assets:WalletA:Current\n\n"
+        '2026-05-02 * "示例乙" "美式"\n'
         "  Expenses:Food:Coffee   30.00 CNY\n"
         "  Assets:Cash\n\n"
-        '2026-06-20 * "瑞幸" "拿铁"\n'
+        '2026-06-20 * "示例甲" "拿铁"\n'
         "  Expenses:Food:Coffee   16.00 CNY\n"
-        "  Assets:WeChat:Current\n"
+        "  Assets:WalletA:Current\n"
     )
 
     def setUp(self):
@@ -237,23 +237,23 @@ class TestExamplesForPayee(unittest.TestCase):
         self.bot.load_ledger = lambda: (entries, opts)
 
     def test_loose_substring_match(self):
-        # "瑞幸" matches both "瑞幸" and "瑞幸咖啡"; "星巴克" is excluded.
-        out = self.bot.examples_for_payee("瑞幸")
-        self.assertIn('"瑞幸咖啡"', out)
-        self.assertIn('"瑞幸"', out)
-        self.assertNotIn("星巴克", out)
+        # "示例甲" matches both "示例甲" and "示例甲咖啡"; "示例乙" is excluded.
+        out = self.bot.examples_for_payee("示例甲")
+        self.assertIn('"示例甲咖啡"', out)
+        self.assertIn('"示例甲"', out)
+        self.assertNotIn("示例乙", out)
 
     def test_sorted_ascending_and_limited(self):
-        out = self.bot.examples_for_payee("瑞幸")
+        out = self.bot.examples_for_payee("示例甲")
         self.assertLess(out.index("2026-03-10"), out.index("2026-06-20"))
-        self.assertEqual(self.bot.examples_for_payee("瑞幸", limit=1).count("Expenses:Food:Coffee"), 1)
+        self.assertEqual(self.bot.examples_for_payee("示例甲", limit=1).count("Expenses:Food:Coffee"), 1)
 
     def test_metadata_stripped(self):
         # The prompt/datetime metadata this pipeline injects must not leak into examples.
-        self.assertNotIn("prompt:", self.bot.examples_for_payee("瑞幸"))
+        self.assertNotIn("prompt:", self.bot.examples_for_payee("示例甲"))
 
     def test_no_match_returns_none(self):
-        self.assertIsNone(self.bot.examples_for_payee("麦当劳"))
+        self.assertIsNone(self.bot.examples_for_payee("示例丙"))
 
     def test_empty_payee_returns_none(self):
         self.assertIsNone(self.bot.examples_for_payee(""))
@@ -261,7 +261,7 @@ class TestExamplesForPayee(unittest.TestCase):
 
     def test_ledger_unavailable_returns_none(self):
         self.bot.load_ledger = lambda: None
-        self.assertIsNone(self.bot.examples_for_payee("瑞幸"))
+        self.assertIsNone(self.bot.examples_for_payee("示例甲"))
 
     def test_limit_boundary(self):
         # 11 matching entries, default limit keeps the 10 most recent (drops the oldest).
@@ -307,10 +307,10 @@ class TestBuildUserPromptExamples(unittest.TestCase):
 
     def test_examples_injected(self):
         from prompts import build_user_prompt
-        p = build_user_prompt("2026-07-21", ["Expenses:X"], "瑞幸 20",
-                              examples='2026-06-20 * "瑞幸" "拿铁"\n  Expenses:X  16 CNY')
+        p = build_user_prompt("2026-07-21", ["Expenses:X"], "示例甲 20",
+                              examples='2026-06-20 * "示例甲" "拿铁"\n  Expenses:X  16 CNY')
         self.assertIn("参考", p)
-        self.assertIn('"瑞幸"', p)
+        self.assertIn('"示例甲"', p)
 
     def test_no_examples_leaves_prompt_unchanged(self):
         from prompts import build_user_prompt
@@ -321,7 +321,7 @@ class TestBuildUserPromptExamples(unittest.TestCase):
         # The 参考 block must come before the previous declined draft so the correction
         # context is the last thing the model reads.
         from prompts import build_user_prompt
-        p = build_user_prompt("2026-07-21", ["Expenses:X"], "瑞幸 20",
+        p = build_user_prompt("2026-07-21", ["Expenses:X"], "示例甲 20",
                               previous_draft="OLD_DRAFT", examples="EXAMPLE_BLOCK")
         self.assertLess(p.index("EXAMPLE_BLOCK"), p.index("OLD_DRAFT"))
 
@@ -332,12 +332,12 @@ class TestFrequentPayees(unittest.TestCase):
     LEDGER = (
         "2026-01-01 open Expenses:Food:Coffee\n"
         "2026-01-01 open Assets:Cash\n\n"
-        '2026-03-10 * "瑞幸咖啡" "a"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
-        '2026-03-11 * "瑞幸咖啡" "b"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
-        '2026-03-12 * "瑞幸咖啡" "c"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
-        '2026-05-02 * "星巴克" "d"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
-        '2026-05-03 * "星巴克" "e"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
-        '2026-06-20 * "麦当劳" "f"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n'
+        '2026-03-10 * "示例甲咖啡" "a"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-03-11 * "示例甲咖啡" "b"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-03-12 * "示例甲咖啡" "c"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-05-02 * "示例乙" "d"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-05-03 * "示例乙" "e"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n\n'
+        '2026-06-20 * "示例丙" "f"\n  Expenses:Food:Coffee  1 CNY\n  Assets:Cash\n'
     )
 
     def _load(self, ledger):
@@ -352,11 +352,11 @@ class TestFrequentPayees(unittest.TestCase):
         self.bot.load_ledger = lambda: (self.entries, self.opts)
 
     def test_sorted_by_frequency(self):
-        # 瑞幸咖啡 x3 > 星巴克 x2 > 麦当劳 x1
-        self.assertEqual(self.bot.frequent_payees(), ["瑞幸咖啡", "星巴克", "麦当劳"])
+        # 示例甲咖啡 x3 > 示例乙 x2 > 示例丙 x1
+        self.assertEqual(self.bot.frequent_payees(), ["示例甲咖啡", "示例乙", "示例丙"])
 
     def test_limit_slices_top_n(self):
-        self.assertEqual(self.bot.frequent_payees(limit=2), ["瑞幸咖啡", "星巴克"])
+        self.assertEqual(self.bot.frequent_payees(limit=2), ["示例甲咖啡", "示例乙"])
 
     def test_ledger_unavailable_returns_empty(self):
         self.bot.load_ledger = lambda: None
@@ -405,7 +405,7 @@ class TestFrequentPayees(unittest.TestCase):
             return (self.entries, self.opts)
         self.bot.load_ledger = counting_load
         self.bot.frequent_payees(loaded=(self.entries, self.opts))
-        self.bot.examples_for_payee("瑞幸", loaded=(self.entries, self.opts))
+        self.bot.examples_for_payee("示例甲", loaded=(self.entries, self.opts))
         self.assertEqual(calls["n"], 0)
 
 
@@ -661,7 +661,7 @@ class TestManualTransactionValidation(unittest.TestCase):
         self.bot.handle_message({"message": {"text": text, "chat": {"id": 123}}})
 
     def test_quote_in_payee_is_escaped_and_parses(self):
-        self._send('星巴克"VIP"\n咖啡\ncoffee 30 CNY\ncash -30 CNY')
+        self._send('示例乙"VIP"\n咖啡\ncoffee 30 CNY\ncash -30 CNY')
         appendix = self.appended.get("appendix", "")
         self.assertIn('\\"VIP\\"', appendix)
         import beancount.parser.parser as parser
@@ -1311,21 +1311,21 @@ class TestQueryRendering(unittest.TestCase):
 LEDGER_ACCOUNTS = (
     "1970-01-01 open Expenses:Food GBP\n"
     "1970-01-01 open Expenses:Education GBP\n"
-    "1970-01-01 open Assets:Bank:HSBC:Current GBP\n"
-    "1970-01-01 open Liabilities:CreditCard:Chase GBP\n"
+    "1970-01-01 open Assets:Bank:SampleBank:Current GBP\n"
+    "1970-01-01 open Liabilities:CreditCard:DemoBank GBP\n"
 )
 LEDGER_JOURNAL = '''
-2026-06-20 * "Tesco" "上月买菜"
+2026-06-20 * "ExampleShop" "上月买菜"
   Expenses:Food           30.00 GBP
-  Liabilities:CreditCard:Chase
+  Liabilities:CreditCard:DemoBank
 
-2026-07-01 * "Starbucks" "咖啡"
+2026-07-01 * "ExampleCafe" "咖啡"
   Expenses:Food            3.50 GBP
-  Liabilities:CreditCard:Chase
+  Liabilities:CreditCard:DemoBank
 
-2026-07-05 * "Amazon" "书"
+2026-07-05 * "ExampleBooks" "书"
   Expenses:Education      15.00 GBP
-  Assets:Bank:HSBC:Current
+  Assets:Bank:SampleBank:Current
 '''
 
 
@@ -1388,7 +1388,7 @@ class TestLedgerQuery(unittest.TestCase):
     def test_include_glob_is_resolved(self):
         # The account opens live in an included file; without resolving the include the
         # journal's postings would be against undeclared accounts and error out.
-        _, rrows = self.bot.run_bql('SELECT count(date) WHERE account ~ "Chase"')
+        _, rrows = self.bot.run_bql('SELECT count(date) WHERE account ~ "DemoBank"')
         self.assertEqual(list(rrows[0])[0], 2)
 
     def test_rejects_when_tree_unavailable(self):
@@ -1430,7 +1430,7 @@ class TestLedgerQuery(unittest.TestCase):
         self.assertIsNone(self.bot._ledger_cache["tree_sha"])
 
     def test_run_bql_filters(self):
-        _, rrows = self.bot.run_bql('SELECT date WHERE account ~ "Chase" ORDER BY date DESC')
+        _, rrows = self.bot.run_bql('SELECT date WHERE account ~ "DemoBank" ORDER BY date DESC')
         self.assertEqual(len(rrows), 2)
 
     def test_run_bql_aggregates(self):
@@ -1461,7 +1461,7 @@ class TestIntentRouting(unittest.TestCase):
     def test_entry(self):
         b = self._bot('{"intent": "entry"}')
         self.addCleanup(b.close)
-        self.assertEqual(b.route_intent("星巴克 35", "2026-07-17")["intent"], "entry")
+        self.assertEqual(b.route_intent("示例乙 35", "2026-07-17")["intent"], "entry")
 
     def test_llm_failure_falls_back_to_entry(self):
         self.assertEqual(self._bot(RuntimeError("down")).route_intent("x", "2026-07-17"),
@@ -1491,12 +1491,12 @@ class TestAnswerQueryRetry(unittest.TestCase):
     def test_good_bql_runs_directly(self):
         b = self._bot()
         self.addCleanup(b.close)
-        _, out = b.answer_query("q", 'SELECT date WHERE account ~ "Chase"', "2026-07-17")
+        _, out = b.answer_query("q", 'SELECT date WHERE account ~ "DemoBank"', "2026-07-17")
         self.assertIn("2026-07", out)
         self.assertEqual(b._call_llm_backends.call_count, 0)
 
     def test_bad_bql_is_repaired(self):
-        b = self._bot('{"intent":"query","bql":"SELECT date WHERE account ~ \\"Chase\\""}')
+        b = self._bot('{"intent":"query","bql":"SELECT date WHERE account ~ \\"DemoBank\\""}')
         self.addCleanup(b.close)
         bql, out = b.answer_query("q", "SELECT bogus", "2026-07-17")
         self.assertIn("2026-07", out)
@@ -1526,26 +1526,26 @@ class TestQueryEndToEnd(unittest.TestCase):
         self.bot.send_message = MagicMock()
         self.bot._list_bean_files = lambda: ("sha1", dict(LEDGER_TREE))
         self.bot._download_blob = _ledger_download
-        self.bot.parse_accounts = lambda: ["Expenses:Food", "Liabilities:CreditCard:Chase"]
+        self.bot.parse_accounts = lambda: ["Expenses:Food", "Liabilities:CreditCard:DemoBank"]
         self.bot._accounts_for_prompt = lambda: ["Expenses:Food (GBP)"]
 
     def test_query_answers_without_a_draft(self):
         self.bot._call_llm_backends = MagicMock(return_value=(
             '{"intent": "query", "bql": "SELECT date, payee, position '
-            'WHERE account ~ \\"Chase\\" ORDER BY date DESC LIMIT 10"}'))
-        self.bot.handle_message({"message": {"text": "列出最近的 chase 记录", "chat": {"id": 123}}})
+            'WHERE account ~ \\"DemoBank\\" ORDER BY date DESC LIMIT 10"}'))
+        self.bot.handle_message({"message": {"text": "列出最近的 demobank 记录", "chat": {"id": 123}}})
         sent = "\n".join(str(c) for c in self.bot.send_message.call_args_list)
-        self.assertIn("Tesco", sent)          # the result reaches the user
+        self.assertIn("ExampleShop", sent)          # the result reaches the user
         self.assertNotIn("SELECT", sent)      # the raw BQL does not
         self.assertEqual(len(self.bot.pending_llm_entries), 0)
 
     def test_entry_still_creates_a_draft(self):
         self.bot._call_llm_backends = MagicMock(return_value='{"intent": "entry"}')
         self.bot.call_openai_compatible = MagicMock(
-            return_value='2026-07-17 * "S" "咖啡"\n  Expenses:Food  3.50 GBP\n  Liabilities:CreditCard:Chase')
+            return_value='2026-07-17 * "S" "咖啡"\n  Expenses:Food  3.50 GBP\n  Liabilities:CreditCard:DemoBank')
         self.bot.add_non_pnl_accounts_to_commit_message = lambda m, a: m
         self.bot.build_review_buttons = lambda p: {}
-        self.bot.handle_message({"message": {"text": "星巴克 3.5", "chat": {"id": 123}}})
+        self.bot.handle_message({"message": {"text": "示例乙 3.5", "chat": {"id": 123}}})
         self.assertEqual(len(self.bot.pending_llm_entries), 1)
 
 

@@ -228,10 +228,10 @@ class TestNormalizeAndValidate(unittest.TestCase):
         self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
         self.addCleanup(self.bot.close)
         self.accounts = [
-            "Assets:WeChat:Current",
+            "Assets:WalletA:Current",
             "Expenses:Food",
             "Assets:Cash",
-            "Liabilities:CreditCard:Chase",
+            "Liabilities:CreditCard:DemoBank",
         ]
 
     def _valid_entry(self):
@@ -280,14 +280,14 @@ class TestNormalizeAndValidate(unittest.TestCase):
         self.assertNotIn("```", result)
 
     def test_prefer_current_applied(self):
-        # Input uses Assets:WeChat without :Current; list has Assets:WeChat:Current
+        # Input uses Assets:WalletA without :Current; list has Assets:WalletA:Current
         entry = (
             '2024-01-15 * "Shop" "Lunch"\n'
             "  Expenses:Food  20 USD\n"
-            "  Assets:WeChat  -20 USD"
+            "  Assets:WalletA  -20 USD"
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
-        self.assertIn("Assets:WeChat:Current", result)
+        self.assertIn("Assets:WalletA:Current", result)
 
     def test_cross_currency_at_at_when_rate_has_many_decimals(self):
         # 100 CNY / 13 USD → rate ≈ 7.692... (>2 decimals) → @@
@@ -303,7 +303,7 @@ class TestNormalizeAndValidate(unittest.TestCase):
         # 3000 GBP / 26700 CNY → rate = 8.9 (1 decimal) → @
         entry = (
             '2024-01-15 * "FX" "Exchange"\n'
-            "  Assets:WeChat:Current  3000 GBP\n"
+            "  Assets:WalletA:Current  3000 GBP\n"
             "  Assets:Cash  -26700 CNY"
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
@@ -314,7 +314,7 @@ class TestNormalizeAndValidate(unittest.TestCase):
         # Valid 3-posting split bill
         entry = (
             '2024-01-15 * "Restaurant" "Dinner"\n'
-            "  Liabilities:CreditCard:Chase  -90 USD\n"
+            "  Liabilities:CreditCard:DemoBank  -90 USD\n"
             "  Assets:Cash  45 USD\n"
             "  Expenses:Food  45 USD"
         )
@@ -340,12 +340,12 @@ class TestNormalizeAndValidate(unittest.TestCase):
     def test_paren_currency_annotation_stripped(self):
         """Parenthesized currency annotations from account list are stripped."""
         entry = (
-            '2026-04-06 * "Chase" "Sainsbury\'s"\n'
+            '2026-04-06 * "DemoBank" "Sainsbury\'s"\n'
             '  Expenses:Food                     5.50 GBP\n'
-            '  Liabilities:CreditCard:Chase (GBP)  -5.50 GBP'
+            '  Liabilities:CreditCard:DemoBank (GBP)  -5.50 GBP'
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, self.accounts)
-        self.assertIn("Liabilities:CreditCard:Chase", result)
+        self.assertIn("Liabilities:CreditCard:DemoBank", result)
         self.assertNotIn("(GBP)", result)
 
     def test_non_directive_header_rejected(self):
@@ -440,16 +440,16 @@ class TestMatchAccount(unittest.TestCase):
         self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
         self.addCleanup(self.bot.close)
         self.bot._accounts_cache["accounts"] = [
-            "Assets:WeChat:Current",
-            "Assets:Alipay:Current",
+            "Assets:WalletA:Current",
+            "Assets:WalletB:Current",
             "Expenses:Food",
-            "Liabilities:CreditCard:Chase",
+            "Liabilities:CreditCard:DemoBank",
         ]
 
     def test_match_by_suffix(self):
         with patch.object(self.bot, "parse_accounts", return_value=self.bot._accounts_cache["accounts"]):
-            result = self.bot.match_account("Alipay:Current")
-        self.assertEqual(result, "Assets:Alipay:Current")
+            result = self.bot.match_account("WalletB:Current")
+        self.assertEqual(result, "Assets:WalletB:Current")
 
     def test_case_insensitive(self):
         with patch.object(self.bot, "parse_accounts", return_value=self.bot._accounts_cache["accounts"]):
@@ -468,28 +468,28 @@ class TestPreferCurrentAccount(unittest.TestCase):
         self.addCleanup(self.bot.close)
 
     def test_exact_match_returned(self):
-        accounts = ["Assets:WeChat:Current", "Expenses:Food"]
+        accounts = ["Assets:WalletA:Current", "Expenses:Food"]
         self.assertEqual(self.bot.prefer_current_account("Expenses:Food", accounts), "Expenses:Food")
 
     def test_adds_current_suffix(self):
-        accounts = ["Assets:WeChat:Current", "Expenses:Food"]
-        self.assertEqual(self.bot.prefer_current_account("Assets:WeChat", accounts), "Assets:WeChat:Current")
+        accounts = ["Assets:WalletA:Current", "Expenses:Food"]
+        self.assertEqual(self.bot.prefer_current_account("Assets:WalletA", accounts), "Assets:WalletA:Current")
 
     def test_liabilities_not_extended(self):
-        accounts = ["Liabilities:CreditCard:Chase", "Liabilities:CreditCard:Chase:Current"]
+        accounts = ["Liabilities:CreditCard:DemoBank", "Liabilities:CreditCard:DemoBank:Current"]
         # Liabilities accounts should NOT get :Current added
-        result = self.bot.prefer_current_account("Liabilities:CreditCard:Chase", accounts)
-        self.assertEqual(result, "Liabilities:CreditCard:Chase")
+        result = self.bot.prefer_current_account("Liabilities:CreditCard:DemoBank", accounts)
+        self.assertEqual(result, "Liabilities:CreditCard:DemoBank")
 
     def test_already_has_current_not_doubled(self):
-        accounts = ["Assets:WeChat:Current"]
-        result = self.bot.prefer_current_account("Assets:WeChat:Current", accounts)
-        self.assertEqual(result, "Assets:WeChat:Current")
+        accounts = ["Assets:WalletA:Current"]
+        result = self.bot.prefer_current_account("Assets:WalletA:Current", accounts)
+        self.assertEqual(result, "Assets:WalletA:Current")
 
     def test_unknown_account_returned_as_is(self):
-        accounts = ["Assets:WeChat:Current"]
-        result = self.bot.prefer_current_account("Assets:HSBC", accounts)
-        self.assertEqual(result, "Assets:HSBC")
+        accounts = ["Assets:WalletA:Current"]
+        result = self.bot.prefer_current_account("Assets:SampleBank", accounts)
+        self.assertEqual(result, "Assets:SampleBank")
 
 
 class TestExtractAccountsFromEntry(unittest.TestCase):
@@ -537,20 +537,20 @@ class TestAccountsForPrompt(unittest.TestCase):
         self.addCleanup(self.bot.close)
 
     def test_annotates_accounts_with_currency(self):
-        self.bot._accounts_cache["accounts"] = ["Assets:WeChat:Current", "Expenses:Food"]
-        self.bot._accounts_cache["currencies"] = {"Assets:WeChat:Current": "CNY"}
+        self.bot._accounts_cache["accounts"] = ["Assets:WalletA:Current", "Expenses:Food"]
+        self.bot._accounts_cache["currencies"] = {"Assets:WalletA:Current": "CNY"}
         self.bot._accounts_cache["comments"] = {}
         result = self.bot._accounts_for_prompt()
-        self.assertIn("Assets:WeChat:Current (CNY)", result)
+        self.assertIn("Assets:WalletA:Current (CNY)", result)
         self.assertIn("Expenses:Food", result)
         self.assertEqual(next(x for x in result if "Food" in x), "Expenses:Food")
 
     def test_annotates_accounts_with_comment(self):
-        self.bot._accounts_cache["accounts"] = ["Assets:Bank:CMB"]
-        self.bot._accounts_cache["currencies"] = {"Assets:Bank:CMB": "CNY"}
-        self.bot._accounts_cache["comments"] = {"Assets:Bank:CMB": "招商银行"}
+        self.bot._accounts_cache["accounts"] = ["Assets:Bank:Demo"]
+        self.bot._accounts_cache["currencies"] = {"Assets:Bank:Demo": "CNY"}
+        self.bot._accounts_cache["comments"] = {"Assets:Bank:Demo": "示例银行"}
         result = self.bot._accounts_for_prompt()
-        self.assertEqual(result, ["Assets:Bank:CMB (CNY) ; 招商银行"])
+        self.assertEqual(result, ["Assets:Bank:Demo (CNY) ; 示例银行"])
 
     def test_comment_without_currency(self):
         self.bot._accounts_cache["accounts"] = ["Assets:Bank:Foo"]
@@ -586,10 +586,10 @@ class TestAddNonPnlAccountsToCommitMessage(unittest.TestCase):
         entry = (
             '2024-01-15 * "Shop" "Lunch"\n'
             "  Expenses:Food  20 USD\n"
-            "  Liabilities:CreditCard:Chase  -20 USD"
+            "  Liabilities:CreditCard:DemoBank  -20 USD"
         )
         result = self.bot.add_non_pnl_accounts_to_commit_message("prefix\n\n", entry)
-        self.assertIn("Liabilities:CreditCard:Chase", result)
+        self.assertIn("Liabilities:CreditCard:DemoBank", result)
 
     def test_does_not_add_income(self):
         entry = (
@@ -1146,10 +1146,10 @@ class TestParseNaturalDate(unittest.TestCase):
     # --- Decimal amounts must NOT be consumed as dates ---
 
     def test_decimal_amount_not_parsed_as_date(self):
-        """'6.16' should not become June 16."""
-        date, custom, remaining = self._parse("Uber 礼品卡打车消费 6.16 gbp")
+        """'4.25' should not become April 25."""
+        date, custom, remaining = self._parse("ExampleTaxi 礼品卡打车消费 4.25 gbp")
         self.assertFalse(custom)
-        self.assertIn("6.16", remaining)
+        self.assertIn("4.25", remaining)
 
     def test_various_decimal_amounts(self):
         cases = [
@@ -1157,7 +1157,7 @@ class TestParseNaturalDate(unittest.TestCase):
             "午饭 12.00 cny",
             "taxi 9.99 gbp",
             "book 1.23 eur",
-            "Uber 礼品卡 6.16 gbp",
+            "ExampleTaxi 礼品卡 4.25 gbp",
         ]
         for text in cases:
             date, custom, remaining = self._parse(text)
@@ -1184,10 +1184,10 @@ class TestParseNaturalDate(unittest.TestCase):
         self.assertEqual(remaining, "买咖啡")
 
     def test_chinese_last_night(self):
-        date, custom, remaining = self._parse("昨晚 7 点 在 Tesco 用 cash 9.75 GBP 买红酒和可颂")
+        date, custom, remaining = self._parse("昨晚 7 点 在 ExampleShop 用 cash 8.50 GBP 买测试商品")
         self.assertTrue(custom)
         self.assertEqual(date, "2026-03-25")
-        self.assertIn("Tesco", remaining)
+        self.assertIn("ExampleShop", remaining)
 
     def test_chinese_time_of_day_variants(self):
         variants = {

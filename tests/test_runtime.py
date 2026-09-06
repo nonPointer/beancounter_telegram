@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import subprocess
+import runpy
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -171,6 +172,14 @@ class TestExplicitSettings(unittest.TestCase):
             "import settings; settings.Settings.load = lambda *a: (_ for _ in ()).throw(AssertionError('config read')); import main"],
             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_interactive_preview_requires_opt_in_before_loading_config(self):
+        with patch.object(sys, "argv", ["test_llm.py"]), patch("sys.stderr"), \
+             patch.object(Settings, "load") as load_config:
+            with self.assertRaises(SystemExit) as caught:
+                runpy.run_path(str(Path(__file__).with_name("test_llm.py")), run_name="__main__")
+        self.assertEqual(caught.exception.code, 2)
+        load_config.assert_not_called()
 
     def test_instances_do_not_share_credentials_or_whitelists(self):
         first = Bot(settings=MOCK_CONFIG, state_path=":memory:")

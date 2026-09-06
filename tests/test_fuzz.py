@@ -24,16 +24,16 @@ import main
 
 ACCOUNTS = [
     "Assets:Cash",
-    "Assets:Bank:Chase",
-    "Assets:Bank:Chase:Current",
-    "Assets:WeChat:Current",
-    "Assets:Alipay:Current",
+    "Assets:Bank:DemoBank",
+    "Assets:Bank:DemoBank:Current",
+    "Assets:WalletA:Current",
+    "Assets:WalletB:Current",
     "Expenses:Food",
     "Expenses:Health",
     "Expenses:Transport",
     "Expenses:Others",
     "Income:Salary",
-    "Liabilities:CreditCard:Chase",
+    "Liabilities:CreditCard:DemoBank",
     "Equity:OpenBalance",
 ]
 
@@ -287,7 +287,7 @@ class TestNormalizeAndValidateFuzz(unittest.TestCase):
         entry = (
             '2024-01-01 * "Restaurant" "Dinner"\n'
             '  Assets:Cash  -90 USD\n'
-            '  Assets:WeChat:Current  45 USD\n'
+            '  Assets:WalletA:Current  45 USD\n'
             '  Expenses:Food  45 USD'
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, ACCOUNTS)
@@ -297,7 +297,7 @@ class TestNormalizeAndValidateFuzz(unittest.TestCase):
         entry = (
             '2024-01-01 * "Restaurant" "Dinner"\n'
             '  Assets:Cash  -90 USD\n'
-            '  Assets:WeChat:Current  45 USD\n'
+            '  Assets:WalletA:Current  45 USD\n'
             '  Expenses:Food  44 USD'
         )
         with self.assertRaises(ValueError):
@@ -366,19 +366,19 @@ class TestNormalizeAndValidateFuzz(unittest.TestCase):
         entry = (
             '2024-01-01 * "A" "B"\n'
             '  Expenses:Food  10 USD\n'
-            '  Assets:WeChat  -10 USD'
+            '  Assets:WalletA  -10 USD'
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, ACCOUNTS)
-        self.assertIn("Assets:WeChat:Current", result)
+        self.assertIn("Assets:WalletA:Current", result)
 
     def test_liabilities_no_current_suffix(self):
         entry = (
             '2024-01-01 * "A" "B"\n'
             '  Expenses:Food  10 USD\n'
-            '  Liabilities:CreditCard:Chase  -10 USD'
+            '  Liabilities:CreditCard:DemoBank  -10 USD'
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, ACCOUNTS)
-        self.assertIn("Liabilities:CreditCard:Chase", result)
+        self.assertIn("Liabilities:CreditCard:DemoBank", result)
         self.assertNotIn(":Current", result)
 
     # --- posting with inline comment / rest ---
@@ -395,7 +395,7 @@ class TestNormalizeAndValidateFuzz(unittest.TestCase):
         entry = (
             '2024-01-01 * "Broker" "Buy"\n'
             '  Assets:Cash  10 GOOGL @@ 3000 USD\n'
-            '  Assets:Bank:Chase:Current  -3000 USD'
+            '  Assets:Bank:DemoBank:Current  -3000 USD'
         )
         result = self.bot.normalize_and_validate_llm_entry(entry, ACCOUNTS)
         self.assertIn("@@", result)
@@ -700,14 +700,14 @@ class TestPreferCurrentAccountFuzz(unittest.TestCase):
 
     def test_adds_current(self):
         self.assertEqual(
-            self.bot.prefer_current_account("Assets:WeChat", ACCOUNTS),
-            "Assets:WeChat:Current",
+            self.bot.prefer_current_account("Assets:WalletA", ACCOUNTS),
+            "Assets:WalletA:Current",
         )
 
     def test_liabilities_no_current(self):
         self.assertEqual(
-            self.bot.prefer_current_account("Liabilities:CreditCard:Chase", ACCOUNTS),
-            "Liabilities:CreditCard:Chase",
+            self.bot.prefer_current_account("Liabilities:CreditCard:DemoBank", ACCOUNTS),
+            "Liabilities:CreditCard:DemoBank",
         )
 
     def test_unknown_returned_as_is(self):
@@ -718,8 +718,8 @@ class TestPreferCurrentAccountFuzz(unittest.TestCase):
 
     def test_already_has_current(self):
         self.assertEqual(
-            self.bot.prefer_current_account("Assets:WeChat:Current", ACCOUNTS),
-            "Assets:WeChat:Current",
+            self.bot.prefer_current_account("Assets:WalletA:Current", ACCOUNTS),
+            "Assets:WalletA:Current",
         )
 
     def test_equity_gets_current_if_exists(self):
@@ -803,9 +803,9 @@ class TestAddNonPnlAccountsFuzz(unittest.TestCase):
         self.assertNotIn("Expenses:Food", result)
 
     def test_liabilities_added(self):
-        entry = '2024-01-01 * "A" "B"\n  Expenses:Food  10 USD\n  Liabilities:CreditCard:Chase  -10 USD'
+        entry = '2024-01-01 * "A" "B"\n  Expenses:Food  10 USD\n  Liabilities:CreditCard:DemoBank  -10 USD'
         result = self.bot.add_non_pnl_accounts_to_commit_message("msg\n\n", entry)
-        self.assertIn("Liabilities:CreditCard:Chase", result)
+        self.assertIn("Liabilities:CreditCard:DemoBank", result)
 
     def test_equity_added(self):
         entry = '2024-01-01 * "A" "B"\n  Expenses:Food  10 USD\n  Equity:OpenBalance  -10 USD'
