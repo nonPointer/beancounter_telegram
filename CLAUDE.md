@@ -101,31 +101,13 @@ syntax validation (a download failure is not retried). Queries are read-only (no
 renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
 
 ### Payee context for drafts
-When the router classifies input as an entry, two best-effort lookups enrich the draft prompt
-so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes
-the result to both helpers via `loaded=`. A successful load is reused; `None` currently causes
-helpers to attempt loading again, so a failure can produce repeated diagnostics. Context lookup
-failures log and fall back to generating without that context; the mandatory pre-commit check remains.
-- **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's
-  most recent past transactions (up to 10, loose case-folded substring match, either
-  direction) are rendered back to beancount text via `_format_example_entry` (header + postings
-  only, no metadata) and shown so the LLM reuses the account/narration/currency conventions.
-- **Frequent-payee list** (`frequent_payees`): the top 50 payees by frequency across the whole
-  ledger are handed to the LLM so it snaps a fuzzy input onto an existing merchant spelling
-  instead of coining a near-duplicate. The ranked list is cached in `_ledger_cache["payees"]`
-  keyed by tree sha (recomputed only when the ledger changes, guarded by an `entries is entries`
-  identity check against a concurrent reload). Interior whitespace is collapsed so a multi-line
-  payee stays a single `、`-joined token.
 
-Both feed into `build_user_prompt(..., examples, payees)`, threaded through `call_openai_compatible`.
-The router's payee is only a retrieval hint, not a fixed field in the final entry. The generation
-call still receives the complete transaction input and selects the final payee itself. For example,
-the fictional hint `Demo Cafe` can retrieve `Demo Cafe 42`; the program does not append `42` itself.
-Substring retrieval is not typo matching: there is no edit-distance correction, and a short hint can
-retrieve several distinct merchants. A misspelling such as `sainsburry` will not normally match
-`Sainsbury's` directly. Either LLM stage may resolve the spelling using its input/context, but this
-is best-effort, not guaranteed. The frequent list is limited to 50 names and may omit a rare merchant.
-The history-injection log shows the retrieval hint, not the matched names or final payee.
+When the router classifies input as an entry, two best-effort lookups enrich the draft prompt so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes the result to both helpers via `loaded=`. A successful load is reused; `None` currently causes helpers to attempt loading again, so a failure can produce repeated diagnostics. Context lookup failures log and fall back to generating without that context; the mandatory pre-commit check remains.
+
+- **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's most recent past transactions (up to 10, loose case-folded substring match, either direction) are rendered back to beancount text via `_format_example_entry` (header + postings only, no metadata) and shown so the LLM reuses the account/narration/currency conventions.
+- **Frequent-payee list** (`frequent_payees`): the top 50 payees by frequency across the whole ledger are handed to the LLM so it snaps a fuzzy input onto an existing merchant spelling instead of coining a near-duplicate. The ranked list is cached in `_ledger_cache["payees"]` keyed by tree sha (recomputed only when the ledger changes, guarded by an `entries is entries` identity check against a concurrent reload). Interior whitespace is collapsed so a multi-line payee stays a single `、`-joined token.
+
+Both feed into `build_user_prompt(..., examples, payees)`, threaded through `call_openai_compatible`. The router's payee is only a retrieval hint, not a fixed field in the final entry. The generation call still receives the complete transaction input and selects the final payee itself. For example, the fictional hint `Demo Cafe` can retrieve `Demo Cafe 42`; the program does not append `42` itself. Substring retrieval is not typo matching: there is no edit-distance correction, and a short hint can retrieve several distinct merchants. A misspelling such as `sainsburry` will not normally match `Sainsbury's` directly. Either LLM stage may resolve the spelling using its input/context, but this is best-effort, not guaranteed. The frequent list is limited to 50 names and may omit a rare merchant. The history-injection log shows the retrieval hint, not the matched names or final payee.
 
 ### Beancount syntax validation
 After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
@@ -149,10 +131,10 @@ restart. A journal write uses its stable operation/update ID to reconcile replay
 feedback stays paused. Undo still expires by canceling. Never delete production state on deploy.
 
 ### User customization
-`_call_llm_backends` reloads root `user.md` for every logical request and includes it on every
-backend attempt, covering routing, generation, retries, vision and review. HTML comments are
-excluded. Missing/empty files add no prompt. Preferences cannot bypass the task's output
-contract or mandatory validation.
+
+Only `user.md.example` is tracked; copy it to gitignored `user.md` for personal preferences. Never force-add the personal file or copy its contents into the template. Existing deployments must back up `user.md` outside the repository before pulling the untracking change and restore it afterward. Untracking does not erase Git history.
+
+`_call_llm_backends` reloads root `user.md` for every logical request and includes it on every backend attempt, covering routing, generation, retries, vision and review. HTML comments are excluded. Missing/empty files add no prompt; the template is not a fallback. Preferences cannot bypass the task's output contract or mandatory validation.
 
 Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish them from LLM draft entries. They store `new_content` and `file_sha` pre-computed at show-time.
 

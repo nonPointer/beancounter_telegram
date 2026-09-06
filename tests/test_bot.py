@@ -1838,6 +1838,21 @@ class TestCheckedApproval(unittest.TestCase):
 
 
 class TestCustomPrompt(unittest.TestCase):
+    def test_missing_personal_prompt_does_not_load_template(self):
+        bot = make_bot()
+        self.addCleanup(bot.close)
+        payload = {"messages": [{"role": "system", "content": "synthetic task"}]}
+        backend = {"base_url": "https://example.invalid", "api_key": "test", "model": "test"}
+        response = MagicMock()
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        with patch.object(main.Path, "exists", return_value=False), \
+             patch.object(main.Path, "read_text") as read, \
+             patch.object(bot.settings, "LLM_BACKENDS", [backend]), \
+             patch.object(main.HTTP, "post", return_value=response) as post:
+            bot._call_llm_backends(payload)
+        read.assert_not_called()
+        self.assertEqual(post.call_args.kwargs["json"]["messages"], payload["messages"])
+
     def test_reloaded_for_text_and_vision_without_mutating_payload(self):
         bot = make_bot()
         self.addCleanup(bot.close)
