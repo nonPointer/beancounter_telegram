@@ -27,7 +27,7 @@ class LLMMixin:
         try:
             return self.load_ledger()
         except Exception as exc:
-            log(f"Draft context unavailable ({type(exc).__name__}); commit validation remains mandatory.")
+            log(f"Draft context unavailable ({type(exc).__name__}: {exc}); commit validation remains mandatory.")
             return None
 
     def explain_ledger_error(self, entry_text: str, error: str) -> str:

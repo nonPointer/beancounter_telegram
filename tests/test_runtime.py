@@ -193,6 +193,25 @@ class TestExplicitSettings(unittest.TestCase):
         texts["main.bean"] = 'include "test.bean"\n'
         check_ledger(texts, "main.bean", "test.bean")
 
+    def test_ledger_errors_include_all_locations_without_temporary_paths(self):
+        texts = {"main.bean": 'include "nested/bad.bean"\n',
+                 "nested/bad.bean": "2000-01-01 commodity O\n" * 10}
+        with self.assertRaises(ValueError) as caught:
+            check_ledger(texts, "main.bean")
+        diagnostic = str(caught.exception)
+        self.assertIn("bean-check failed (10 errors)", diagnostic)
+        self.assertEqual(diagnostic.count("Invalid token: 'O'"), 10)
+        for line in range(1, 11):
+            self.assertIn(f"nested/bad.bean:{line}:", diagnostic)
+        self.assertNotIn("ledger_check_", diagnostic)
+
+    def test_ledger_errors_include_related_entry(self):
+        texts = {"main.bean": '2000-01-01 * "Unknown account"\n  Assets:Missing  1 USD\n  Equity:Missing  -1 USD\n'}
+        with self.assertRaises(ValueError) as caught:
+            check_ledger(texts, "main.bean")
+        self.assertIn("main.bean:1:", str(caught.exception))
+        self.assertIn('2000-01-01 * "Unknown account"', str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
