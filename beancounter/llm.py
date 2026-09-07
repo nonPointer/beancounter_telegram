@@ -398,10 +398,21 @@ class LLMMixin:
     def review_journal(self, pending: dict, appendix: str):
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
+        # Derive provenance from the persisted draft, including drafts created before
+        # this field existed and retries with an already persisted commit_appendix.
+        datetime_pattern = r'^\s*datetime\s*:\s*".*"\s*$'
+        draft_datetimes = {
+            line.strip() for line in pending["appendix"].splitlines()
+            if re.match(datetime_pattern, line)
+        }
         context = {
             "original_input": pending["user_input"],
             "feedback": pending.get("feedback", []),
             "resolved_date": pending["date_str"],
+            "system_generated_datetime_metadata": [
+                line.strip() for line in appendix.splitlines()
+                if re.match(datetime_pattern, line) and line.strip() not in draft_datetimes
+            ],
             "accounts": self._accounts_for_prompt(),
             "journal": appendix,
         }

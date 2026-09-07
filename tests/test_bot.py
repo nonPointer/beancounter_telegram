@@ -1702,6 +1702,50 @@ class TestCheckedApproval(unittest.TestCase):
         self.assertNotIn("1", self.bot.pending_llm_entries)
         self.bot._call_llm_backends.assert_called_once()
 
+    def test_relative_date_review_distinguishes_save_timestamp(self):
+        import json
+        from datetime import datetime
+        from beancounter.bot_utils import parse_natural_date
+
+        original = "yesterday\nExample Shop refund 5 GBP cash"
+        date_str, custom, _ = parse_natural_date(original, datetime(2026, 7, 2, 12))
+        self.assertTrue(custom)
+        self.assertEqual(date_str, "2026-07-01")
+        self.pending.update(user_input=original, date_str=date_str)
+        self.pending["appendix"] = (
+            '2026-07-01 * "Example Shop" "Refund"\n'
+            '  Assets:Cash 5 GBP\n  Expenses:Food -5 GBP'
+        )
+        stamp = "2026-07-02T12:00:00+00:00"
+        with patch("beancounter.drafts.datetime") as clock:
+            clock.now.return_value.isoformat.return_value = stamp
+            self.approve()
+        payload = self.bot._call_llm_backends.call_args.args[0]
+        context = json.loads(payload["messages"][1]["content"][0]["text"])
+        self.assertEqual(context["original_input"], original)
+        self.assertEqual(context["resolved_date"], date_str)
+        self.assertEqual(context["system_generated_datetime_metadata"], [f'datetime: "{stamp}"'])
+        self.assertTrue(context["journal"].startswith(date_str))
+        self.assertIn("禁止再次加减天数", payload["messages"][0]["content"])
+        self.assertIn("不是交易发生时间", payload["messages"][0]["content"])
+        self.assertEqual(len(self.gh.commits), 1)
+
+        # Retrying a persisted payload must preserve the same provenance.
+        self.bot.review_journal(self.pending, self.pending["commit_appendix"])
+        retry = self.bot._call_llm_backends.call_args.args[0]
+        self.assertEqual(json.loads(retry["messages"][1]["content"][0]["text"]), context)
+
+    def test_existing_transaction_datetime_remains_subject_to_review(self):
+        import json
+        stamp = '  datetime: "2026-07-01T09:00:00+00:00"'
+        self.pending["appendix"] = self.entry.replace('\n', '\n' + stamp + '\n', 1)
+        self.approve()
+        payload = self.bot._call_llm_backends.call_args.args[0]
+        context = json.loads(payload["messages"][1]["content"][0]["text"])
+        self.assertEqual(context["system_generated_datetime_metadata"], [])
+        self.assertIn(stamp, context["journal"])
+        self.assertEqual(len(self.gh.commits), 1)
+
     def test_timeout_uses_same_checks(self):
         self.pending["created_at"] = 0
         self.bot.cleanup_expired_drafts()
