@@ -1,306 +1,75 @@
 # beancounter_telegram
 
-追加记账记录到特定 GitHub 仓库的特定文件，随时随地用 Telegram 也可以记录生活消费，且不影响现有的 Beancount 工作流。
+通过 Telegram 记账、查询和分析 GitHub 上的 Beancount 账本，支持 Beancount v2 / v3。
 
-## Quick Start
-
-- 依赖
-
-  ```bash
-  pip install -r requirements.txt
-  ```
-
-支持 Beancount v2 和 v3。v2 使用内置查询模块，v3 使用独立的 `beanquery`（已列入依赖）。升级 Beancount 后请使用启动机器人的同一个 Python 安装依赖，例如 `python3 -m pip install -r requirements.txt`；仅 pull 代码不会安装新依赖。遇到 `No module named 'beancount.query'` 时，需要先更新代码并安装依赖，再启动机器人，无需降级账本环境。
-
-每次交易保存成功后，机器人通过 BQL 发送两张代码块表格：当前自然月的分类开支，以及本笔交易涉及的 Assets／Liabilities 账户余额。月份按机器人时区确定，补录历史交易也显示当前月；开支合并 `Expenses:Food:*` 等二级类别，按成本计价，退款冲减开支，各币种分别列示并合计。余额包含账本全部日期的记录，按实际涉及的完整账户精确查询，不并入子账户；保留负债符号和股票等持仓单位，不按市价折算。展示省略 `Expenses:`、`Assets:`／`Liabilities:` 及银行账户的 `Bank:` 前缀，简写重名时恢复必要前缀。过长表格会注明截断；统计失败不影响已保存交易，也无需重复记账。
-
-两项统计共用一次账本加载。LLM 保存前完整校验的结果在保存成功后保留；确认远端账本文件内容一致后，统计和后续查询可直接复用该结果。远端账本发生变化时仍重新校验。手工交易保存后的统计需要加载并校验一次完整账本。统计使用进程内查询接口，不额外启动两个 `bean-query` 进程；无需配置 GitHub Actions。若账本仓库已启用 `notify-on-push.yml` 通知，两边可能分别发送统计消息。
-
-完整账本校验保留解析、成本归集、插件及全部基本／严格校验，但不为一次性临时账本写入磁盘 pickle 缓存。严格校验在基本校验后显式执行，避免受影响的 Beancount 版本将额外校验反复追加到全局列表。`Timing [bean-check hardcore validation]` 是总校验耗时中的严格校验部分，不能与总耗时重复相加。草稿与提交前的完整校验仍保留。
-
-可运行 `python scripts/benchmark_ledger.py --transactions 100000 --repeats 3` 比较原调用方式和优化后的完整校验。基准只生成合成账本，不读取配置或真实账本、不访问外部服务；分别在独立进程运行，输出版本、平台、耗时中位数、磁盘缓存写入次数和校验列表长度。每次测量均恢复相同的基本校验列表，避免列表累积夸大性能差异。小账本不触发原磁盘缓存时，收益可能很小；实际收益取决于账本规模、插件和机器性能。
-
-依赖兼容性、生产升级步骤及常见错误见 [`requirements.md`](requirements.md)；pip 安装仍使用 `requirements.txt`。
-
-- 配置
-  - 复制 `config.json.example` 为 `config.json`，填写以下字段：
-    - `TELEGRAM_BOT_TOKEN`：通过 [BotFather](https://core.telegram.org/bots) 创建机器人并获取
-    - `GITHUB_TOKEN`、`REPO_OWNER`、`REPO_NAME`、`BRANCH_NAME`、`FILE_PATH`：目标仓库信息
-    - `CHAT_ID`：向机器人发一条消息后访问 `https://api.telegram.org/bot<TOKEN>/getUpdates` 获取
-    - `TIMEZONE`：时区，如 `Asia/Shanghai`、`Europe/London`
-    - `LLM_BACKENDS`：兼容 OpenAI API 的 LLM 后端列表，用于自然语言记账（可选）。按顺序尝试，前一个失败自动 fallback 到下一个：
-      ```json
-      "LLM_BACKENDS": [
-          { "LLM_API_BASE_URL": "https://api.openai.com/v1", "LLM_API_KEY": "sk-...", "LLM_MODEL": "gpt-4o-mini" },
-          { "LLM_API_BASE_URL": "https://api.example.com/v1", "LLM_API_KEY": "sk-...", "LLM_MODEL": "gpt-4o" }
-      ]
-      ```
-
-- 运行
-  ```bash
-  python main.py
-  ```
-
-## 项目结构
-
-```text
-main.py                 # 稳定启动入口：python main.py [debug]
-beancounter/            # 业务代码包
-  bot.py                # Bot 组装、消息和命令处理
-  ledger.py             # 账本读取、账户及 GitHub 写入
-  llm.py / prompts.py   # LLM 调用与提示构建
-  drafts.py             # 草稿、确认与审核流程
-  templates/            # Beancount 分录模板
-  ...                   # 配置、校验、Telegram、调度和持久化模块
-scripts/preview_llm.py   # 手动 LLM 预览工具，需显式 --live
-tests/                  # 离线自动测试及测试数据规范
-config.json.example     # 配置模板
-user.md.example         # 用户 prompt 模板
-```
-
-个人 `config.json`、`user.md` 和运行状态 `data/` 留在项目根目录且不被 Git 跟踪。整理目录不改变它们的路径，也不改变 `python main.py` 的启动方式；模板随业务代码放在 `beancounter/templates/`，不依赖启动时的工作目录。Python 调用方使用 `from beancounter.bot import Bot`，原有 `from main import Bot` 仍可用。
-
-## 功能
-
-- [x] `open`、`close`、`balance`、`pad` 指令
-- [x] `/update [account] [account for pad] [amount] [currency]`：修正账户余额，今天插入 `pad`，明天插入 `balance`
-- [x] 手动记账，根据后缀自动匹配对应账户（账户列表从仓库 `accounts/` 及子目录的 `.bean`、`.beancount` 文件中解析 `open` / `close` 指令获取，支持多币种和 `O.US` 等合法商品代码）
-- [x] `/tz <timezone>` 设置时区
-- [x] **自然语言记账（LLM）**：单行输入自动调用 LLM 生成 beancount 条目，支持审核、重新生成、反馈修正
-- [x] **自然语言查询（LLM + BQL）**：直接提问即可检索账本，无需命令前缀。如「列出最近 10 条 chase 记录」「这个月吃饭花了多少」「各账户余额」。只读，不产生草稿
-- [x] `/view` 触发当月 Sankey 图生成（调用账本仓库的 `monthly-report.yml` workflow）
-- [x] `/undo` 撤回 `main.bean` 中的最后一条指令（支持 transaction、balance、pad、open、close 等任意顶层指令）
-- [x] `/last [N]` 查看 `main.bean` 中最近 N 条记录（默认 5 条）
-- [x] `/today` 查看今天的所有记录（根据 bot 时区判断）
-
-## 账本仓库 GitHub Actions
-
-`.github/workflows/` 下提供了两个可选的 workflow 示例文件，需复制到**账本仓库**（即 `REPO_NAME` 所指向的仓库）并去掉 `.example` 后缀后使用。
-
-在账本仓库的 **Settings → Secrets and variables → Actions** 中配置以下 secrets：
-
-| Secret | 说明 |
-|--------|------|
-| `TELEGRAM_TOKEN` | Telegram Bot Token |
-| `TELEGRAM_CHAT_ID` | 接收通知的 Chat ID |
-
-### monthly-report.yml
-
-每天 08:00 UTC 自动运行，查询当月 `Expenses:*` 账户支出，生成 Sankey 图并发送到 Telegram。也可通过 `/view` 指令或手动 `workflow_dispatch` 触发，支持传入 `year_month`（`YYYY-MM`）指定月份。
-
-### notify-on-push.yml
-
-每次 push 到 `main` 分支时触发，发送两条通知：
-
-1. 当月各 `Expenses` 子账户明细及总计
-2. 本次 commit message body 中列出的账户的当前余额
-
-## LLM 自然语言记账
-
-发送一行自然语言描述，机器人会调用 LLM 生成草稿并发送审核按钮：
-
-| 按钮 | 操作 |
-|------|------|
-| ✅ | 保存到仓库 |
-| 🔧 | 输入反馈后重新生成 |
-| ❌ | 丢弃 |
-
-草稿成功发送后开始计时，默认 **120 秒无操作自动确认**（`config.json` 的
-`DRAFT_TTL_SECONDS` 可调整；实际处理会受轮询间隔影响）。点击 🔧 后暂停自动确认，
-修改后的新草稿重新计时。`/undo` 超时仍取消，不会自动撤回。
-
-手动确认和超时确认均在提交前执行：
-
-1. 下载同一 GitHub 版本的完整账本，将 journal 追加到本地临时副本，以 `LEDGER_ROOT`
-   为入口运行与 `bean-check` 相同的校验（包括 `HARDCORE_VALIDATIONS`）。不配置时优先
-   使用仓库中的 `main.bean`，否则使用 `FILE_PATH`；入口必须 include 写入的 journal。
-2. 另发一次 LLM 审核请求，核对 journal 与原始输入、修改反馈和原图（截图记账）的
-   金额、币种、账户、日期及交易含义是否一致。
-
-两项均通过才保存。账本已有错误、下载不完整、审核拒绝或服务不可用时，保留草稿并暂停
-自动确认，可点击 ✅ 重试或 🔧 修改。若 GitHub 提交响应丢失，重试会通过唯一操作标记
-核对是否已经保存，避免重复追加。草稿、截图引用、修改反馈、时区及待处理消息保存到 SQLite，
-重启后恢复。已进入修改或检查失败的草稿保持自动确认暂停；已发送且超时的草稿恢复后继续检查。
-
-### 商家（payee）识别与模糊匹配
-
-自然语言记账分两阶段：第一次 LLM 调用识别意图并提取 payee **检索线索**，第二次收到完整记账输入、匹配的历史分录和常用商家列表，生成最终分录。第一次的 payee不会直接锁定最终商家名，也不是程序随后通过固定规则补全名称。
-
-- 历史检索忽略大小写，支持双向子串匹配。例如虚构商家 `Demo Cafe` 可以匹配 `Demo Cafe 42`，最多提供最近 10 条匹配分录。短名称也可能匹配多个不同商家。
-- 生成阶段还会参考账本中前 50 个常用 payee；输入指向已有商家时，提示 LLM 沿用原名。
-- 程序没有编辑距离等拼写纠错算法。`sainsburry` 通常不能直接匹配 `Sainsbury's`； 路由 LLM 可能先纠正拼写，或生成 LLM 根据原始输入和常用商家列表识别它，但不保证成功。
-- 历史上下文加载失败时仍可生成草稿；保存前的完整账本校验和输入一致性审核不会跳过。
-
-请检查草稿中的商家名；有误可点击 🔧 修正，也可在 `user.md` 中写入明确的商家别名偏好。日志中的 `Injecting past entries for payee ...` 表示检索线索，不代表最终 payee，也不列出具体匹配的商家；最终名称以生成阶段的 LLM 返回正文和草稿为准。
-
-### 并发、状态与部署
-
-账本快照按文件 blob SHA 复用未变化的内容；新增或变化的文件才下载，删除或重命名也会按最新目录反映。账户文件与完整账本共享缓存，每个 Bot 共用最多 8 个下载线程，缓存仅保留最近完整快照和账户文件，不累积所有历史版本。同版本并发加载复用已完成的解析结果；同一次生成请求中，已失败的历史上下文不会重复加载，下次请求仍可重试。网络失败不会把部分下载结果发布为完整快照；提交前仍检查最新版本并执行完整 bean-check 和独立 LLM 审核。
-
-账户提示包含解析到的全部未关闭账户及其声明币种（例如 `Assets:Cash (GBP, USD)`），保留同行注释作为别名；不递归加载 `accounts/` 以外的开户文件。账户缓存仍遵循 `ACCOUNTS_CACHE_TTL`，刷新失败保留上次完整结果且不延长有效期。某个工作队列满时，其他队列继续接收任务，同一队列不插队。
-
-- `WORKERS`：固定工作线程数，默认 4。同一聊天按消息顺序执行；超时确认也使用同一队列。
-- `QUEUE_SIZE`：每条工作队列容量，默认 64。持久化收件箱总容量为两者乘积，满时停止推进
-  Telegram 接收游标，等待处理后继续，不会无限创建线程。
-- `STATE_PATH`：默认 `data/bot.sqlite3`，相对配置文件目录解析。请把该目录放在持久存储上，
-  发布时保留。进程锁防止同一状态文件被两个实例同时使用；不同 bot/账本需使用不同文件。
-- 导入 `main` 不读取配置；启动时加载 `config.json`。测试可显式传入 `Bot(settings=..., state_path=":memory:")`。
-- 收件箱先落盘再确认接收，中断中的任务重启后重放。journal 写入使用稳定操作标记去重；
-  生成请求、Telegram 通知或 `/view` 工作流在进程意外中断后可能再次执行。
-- `SIGTERM` 会停止轮询并等待已排队任务结束。强制终止后仍可从 SQLite 恢复。
-
-生产更新前先备份代码、`config.json`、`user.md` 和状态目录，再运行五套测试：
+## 启动
 
 ```bash
-python tests/test_refactor.py
-python tests/test_bot.py
-python tests/test_fuzz.py
-python tests/test_runtime.py
-python tests/test_reports.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp config.json.example config.json
+# 编辑 config.json 后再启动
+python main.py
 ```
 
-更换代码时保留配置和状态文件，首次升级前先处理完旧版本内存中的草稿。服务管理器应给
-正常退出留足时间（例如 systemd 的 `TimeoutStopSec=300`）。回滚前停止新实例并备份 SQLite；
-旧版本不识别新状态库，需先核对待处理草稿和账本，避免重复记账。
+启动前填写 `config.json`；已有配置请勿覆盖：
 
-### 自定义提示：user.md
+| 配置 | 用途 |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | [BotFather](https://t.me/BotFather) 创建的机器人 |
+| `CHAT_ID` | 允许访问的聊天 ID，必填；多个用逗号分隔 |
+| `GITHUB_TOKEN` | 目标账本仓库的读写权限 |
+| `REPO_OWNER` / `REPO_NAME` / `BRANCH_NAME` | 账本仓库和分支 |
+| `FILE_PATH` | 交易写入文件 |
+| `LEDGER_ROOT` | 完整账本入口，必须 include 写入文件；默认优先 `main.bean` |
+| `TIMEZONE` | 如 `Asia/Shanghai` 或 `Europe/London` |
+| `LLM_BACKENDS` | 可选的 OpenAI Chat Completions 兼容后端，按顺序故障切换 |
 
-首次使用时，将 [`user.md.example`](user.md.example) 复制为项目根目录的 `user.md`（已有文件请勿覆盖），再写入账户别名、常用分类、语言偏好等。仓库只跟踪模板，个人 `user.md` 已加入 `.gitignore`，后续更新不会合并或覆盖它。模板本身不会被程序读取。
+LLM 的地址、密钥和模型配置见 [配置模板](config.json.example)。截图可单独指定 `LLM_VISION_MODEL`。账户定义放在账本仓库的 `accounts/` 及其子目录。
 
-每次 LLM 调用都会重新读取 `user.md`，保存后无需重启，适用于意图路由、文本和截图记账、纠错重试及提交前审核。HTML 注释中的说明和示例不会发送；文件不存在或留空时不添加提示。自定义偏好不会跳过本地校验或改变审核要求。内容会发送给配置的 LLM 服务。
+## 使用
 
-**旧版本首次迁移：请先把现有 `user.md` 备份到仓库外，再 pull，最后恢复为本地 `user.md`。** 本次更新会删除 Git 中原来跟踪的文件；未修改的副本可能随 pull 被移除，存在本地修改时 pull 可能被阻止。若被阻止，确认备份可用后再将旧跟踪文件恢复至当前提交的版本，然后重新 pull 并恢复备份。迁移完成后 `git ls-files -- user.md` 应无输出，`git check-ignore user.md` 应显示该文件。不要使用 `git add -f user.md`；取消跟踪不会清除旧 Git 历史。
+- 记账：发送 `星巴克 35 CNY，支付宝支付`，或发送账单截图。信息不足时会要求补充。
+- 查询：发送 `这个月吃饭花了多少`、`招行余额` 或 `最近 10 条 Chase 记录`，直接返回表格。
+- 分析：发送 `分析最近三个月消费趋势`、`为什么这个月比上个月花得多`。模型可连续查询，再给出带查询来源的解释和代码块表格。
+- 草稿：✅ 保存、🔧 修改、❌ 丢弃。默认 **120 秒无操作自动确认**；修改或检查失败后暂停自动确认，可用 `DRAFT_TTL_SECONDS` 调整时长。
 
-例如（请替换为你的真实账户）：
+LLM 草稿保存前必须通过完整账本校验和独立 LLM 一致性审核。保存交易后自动展示**当前自然月分类开支**及**本笔涉及的资产／负债账户余额**，表格省略冗余账户前缀。开支按成本分币种统计，余额包含全部账本日期、保留持仓单位和负债符号；统计失败不影响已保存交易。
+
+### 分析边界
+
+首次分析会自动探测各后端模型的工具调用及结果回传能力，不需要开关。明确支持或不支持的结果缓存一小时；不支持时自动使用 JSON 查询协议。返回普通文本而未调用工具时，本次使用 JSON，但不认定永久不支持；鉴权、限流和网络错误走后端故障切换，不缓存为不支持。
+
+每次分析只加载一次完整账本，最多 4 轮查询、8 条 BQL，再进行一次总结。仅开放只读 SELECT，每次返回最多 100 行，过长结果明确标注截断。单条 BQL 超过 15 秒会终止查询进程；账本加载后的流程预算为 180 秒，HTTP 超时最多 60 秒（不是整次请求的严格墙钟上限）。预算耗尽时只返回已取得的结果，不修改账本。模型解释仍需核对，不能将其推测当作事实。
+
+### 常用命令
+
+| 输入 | 操作 |
+| --- | --- |
+| `/last [N]` / `/today` | 最近 N 条（默认 5）／今天的记录 |
+| `/undo` | 预览并确认撤回最后一条指令 |
+| `/tz Europe/London` | 设置时区 |
+| `open Assets:Cash GBP` / `close Assets:Cash` | 开户／销户 |
+| `balance Cash 200 GBP` | 余额断言，默认次日开盘生效 |
+| `pad Cash Opening-Balances` | 补差指令 |
+| `/update Cash Opening-Balances 200 GBP` | 今天 pad，明天 balance |
+| `/view` | 触发账本仓库的月度 Sankey 工作流 |
+
+多行文本走手动记账，可用账户后缀匹配；日期、tag 和 link 可选：
 
 ```text
-“工资”归入 Income:Salary。
-咖啡消费归入 Expenses:Food:Coffee。
-商家名称沿用原文，narration 使用中文。
+2026-09-10
+KFC
+午餐
+Food 20 GBP
+Cash -20 GBP
 ```
 
-**支持的输入示例：**
+## 个性化与运维
 
-```beancount
-; 微信消费 5 块（微信账户开户时声明了 CNY，自动推断货币）
-YYYY-MM-DD * "商家" "餐饮"
-  Assets:WeChat:Current     -5 CNY
-  Expenses:Food              5 CNY
-
-; KFC 花了 20 USD 微信支付
-YYYY-MM-DD * "KFC" "餐饮"
-  Assets:Bank:WeChat     -20 USD
-  Expenses:Food           20 USD
-
-; 和 John Wick 吃晚餐萨莉亚 96 GBP，刷的 chase 信用卡，他给我 48 GBP 现金
-YYYY-MM-DD * "萨莉亚" "晚餐"
-  Liabilities:CreditCard:Chase     -96 GBP
-  Assets:Cash                       48 GBP
-  Expenses:Food                     48 GBP
-
-; 支付宝买了杯咖啡 35 CNY
-YYYY-MM-DD * "咖啡店" "咖啡"
-  Assets:Bank:Alipay:Current     -35 CNY
-  Expenses:Food                   35 CNY
-```
-
-**规则说明：**
-- 单行文本自动走 LLM 流程；多行文本走手动记账流程
-- 输入里需要至少暗示扣款账户（如 `微信` / `支付宝` / `现金` / `HSBC`）；信息不足时机器人会提示补充
-- 未说明货币时，优先使用扣款账户在 `open` 指令中声明的默认货币（如 `open Assets:WeChat:Current CNY` → 默认 CNY）；若账户无默认货币且全文只出现一种货币则以此为默认
-- 未说明支付方式时，默认使用微信/支付宝余额账户（非理财子账户）
-- 分摊消费：付全款、他人转账回来的金额从支付账户正向抵消，`Expenses` 仅记录自己的净份额
-- 人名默认首字母大写；narration 默认中文（英文输入时用英文）
-
-# Example
-
-- open
-
-  ```
-  open Assets:Bank:HSBC:Current GBP
-  ```
-
-- close
-
-  ```
-  close Assets:Bank:HSBC:Current
-  ```
-
-- balance
-
-  默认日期为**次日**（beancount balance 断言在所述日期的开盘时生效，因此填次日表示"今日收盘后余额"）。如需指定日期，在消息第一行写 `YYYY-MM-DD`。
-
-  ```
-  balance Alipay 200 CNY
-  ```
-
-- pad
-
-  ```
-  pad Alipay Opening-Balances
-  ```
-
-- 手动记账：date、link 和 tag 可选。
-
-  ```
-  KFC
-  玩原神玩的
-  ^testlink
-  #taggggg
-  Food 20 CNY
-  WeChat -20 CNY
-  ```
-
-- 手动记账：当没有 payee，仅 narration 时，填写 payee，将 narration 留空。
-
-  ```
-  test only narration
-
-  HSBC:current 200 GBP
-  assets:cash -200 GBP
-  ```
-
-- 设置时区
-
-  ```
-  /tz Asia/Shanghai
-  ```
-
-- update（今天插入 pad，明天插入 balance）
-
-  ```
-  /update Alipay Food 200 CNY
-  ```
-
-- 触发当月 Sankey 报告生成
-
-  ```
-  /view
-  ```
-
-- 撤回最后一条指令（预览后确认）
-
-  ```
-  /undo
-  ```
-
-- 查看最近 5 条记录（默认），或指定数量
-
-  ```
-  /last
-  /last 10
-  ```
-
-- 查看今天的所有记录
-
-  ```
-  /today
-  ```
-
-### 诊断日志与隐私
-
-每次 LLM 调用都会记录模型、用途、耗时及完整返回正文（包括路由、生成、重试和审核）。
-请求开始、返回及失败日志均带有用途标签；首次路由调用负责意图识别、payee 提取及查询语句生成，后续分别标注文本/截图分录生成、用户反馈修改、校验纠错或保存前一致性审核。
-本地 bean-check 失败时记录全部错误、文件名、行号和相关分录；生成阶段无法执行检查及保存失败也会记录原因。
-`Timing [...]` 日志分别记录任务排队、GitHub 目录请求、blob 下载数量及耗时、账户刷新、账本上下文加载、临时文件写入、Beancount 解析校验和草稿持久化耗时；部分阶段相互包含，不能直接相加。下载优化不等于跳过完整校验，实际延迟仍取决于账本规模、插件及网络。
-日志可能包含私人交易和模型回显的输入，请限制日志访问，不要直接上传到公开 issue 或提交到 Git。
+- 将 [user.md.example](user.md.example) 复制为本地 `user.md`，填写账户别名、分类和语言偏好；每次业务 LLM 请求重新读取，无需重启。已有文件请勿覆盖。
+- `config.json`、`user.md` 和 `data/` 不提交到 Git。更新前停止旧实例并备份它们，保留 SQLite 状态，不要同时运行两个实例。旧版本若仍跟踪 `user.md`，先备份到仓库外，更新后再恢复。
+- 用户输入、账户信息、必要查询结果和偏好会发送到配置的 LLM 服务；分析不开放交易元数据查询。日志包含模型返回和交易信息，请限制访问。
+- 可选工作流模板见 [.github/workflows](.github/workflows)：复制到**账本仓库**并去掉 `.example`，设置 `TELEGRAM_TOKEN` 和 `TELEGRAM_CHAT_ID` secrets。`/view` 需要 `monthly-report.yml`；`notify-on-push.yml` 可能与保存后的统计重复通知。
+- [依赖与升级](requirements.md) · [开发与测试](CLAUDE.md) · [完整校验性能基准](scripts/benchmark_ledger.py)

@@ -30,9 +30,10 @@ from .llm import LLMMixin
 from .drafts import DraftMixin
 from .telegram_api import TelegramMixin
 from .reports import ReportMixin
+from .analysis import AnalysisMixin
 
 
-class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMixin):
+class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMixin, AnalysisMixin):
     def __init__(self, debug: bool = False, settings: Settings | dict | None = None,
                  state_path: str | None = None):
         self.settings = Settings(settings) if isinstance(settings, dict) else settings or Settings.load()
@@ -76,6 +77,8 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         self._load_lock = threading.Lock()
         self._downloads = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ledger-download")
         self.llm_enabled = bool(self.settings.LLM_BACKENDS)
+        self._tool_capabilities = {}
+        self._tool_capabilities_lock = threading.Lock()
 
     def is_authorized(self, chat_id) -> bool:
         return str(chat_id) in self.settings.ALLOWED_CHATS

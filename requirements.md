@@ -31,6 +31,8 @@ python3 tests/test_refactor.py
 python3 tests/test_bot.py
 python3 tests/test_fuzz.py
 python3 tests/test_runtime.py
+python3 tests/test_reports.py
+python3 tests/test_analysis.py
 python3 main.py
 ```
 

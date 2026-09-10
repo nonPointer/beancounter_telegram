@@ -25,16 +25,21 @@ system_generated_datetime_metadata 列出保存阶段由程序补入的 datetime
 或 {"approved": false, "reason": "具体不一致或不确定之处"}。
 """
 
-QUERY_ROUTER_SYSTEM_PROMPT = (
-    "你是一个记账机器人的意图路由器。判断用户输入是【记一笔账】还是【查询账本】，"
+_QUERY_ROUTING_RULES = (
+    "你是一个记账机器人的意图路由器。判断用户输入是【记一笔账】、【查询账本】还是【分析账本】，"
     "如果是查询，生成一条 beancount BQL 语句。\n\n"
     "【判断规则】\n"
     "- 记账 (entry)：描述一笔已发生的消费/收入/转账。如「星巴克 35」「打车 20 微信」「昨天买菜 30」。\n"
     "- 查询 (query)：询问、检索、统计已有记录。如「最近10条 chase 记录」「这个月吃饭花了多少」"
     "「招行余额」「上个月总支出」「列出所有 Uber 消费」。\n"
+    "- 分析 (analysis)：需要多步查询、比较、趋势或异常解释。如「分析最近三个月消费趋势」"
+    "「为什么这个月比上个月花得多」「找出异常大额开支」。只返回 intent，不必生成 BQL。\n"
     "- 查询或非记账请求绝不可当作已发生的交易；不能确定时不要编造交易。\n"
     "- 判为 entry 时，顺便提取 payee（商家/服务对象，不是支付渠道）：「星巴克 35」→「星巴克」，"
     "「微信充值原神 100」→「原神」；没有明确商家（如「打车 20」「买菜 30」）时 payee 留空字符串。\n\n"
+)
+
+BQL_REFERENCE = (
     "【BQL 语法】\n"
     "只用一种结构：SELECT <列/函数> WHERE <条件> [GROUP BY ...] [ORDER BY ...] [LIMIT n]。\n"
     "绝对不要写 FROM 子句，也不要用 JOURNAL、BALANCES、PRINT 这些关键字——它们不能和 "
@@ -64,10 +69,14 @@ QUERY_ROUTER_SYSTEM_PROMPT = (
     "- 列出流水时默认带上 date, payee, narration, position，并 ORDER BY date DESC。\n"
     "- 用户没说数量时，列表类查询加 LIMIT 20，避免刷屏。\n"
     "- 统计类查询用 sum(position)，不要用 sum(number)（会把不同币种加在一起）。\n\n"
+)
+
+QUERY_ROUTER_SYSTEM_PROMPT = _QUERY_ROUTING_RULES + BQL_REFERENCE + (
     "【输出格式】\n"
     "只输出 JSON，不要 markdown 代码块，不要任何解释：\n"
     '记账：{"intent": "entry", "payee": "商家名，无则空字符串"}\n'
     '查询：{"intent": "query", "bql": "SELECT ..."}\n'
+    '分析：{"intent": "analysis"}\n'
 )
 
 

@@ -38,6 +38,14 @@ class LLMMixin:
             return
 
         route = self.route_intent(text, date_str)
+        if route["intent"] == "analysis":
+            try:
+                for message in self.analyze_ledger(text, date_str):
+                    self.send_message(chat_id, message, parse_mode="HTML")
+            except Exception as e:
+                log(f"Analysis failed: {type(e).__name__}")
+                reply("分析未完成，账本未修改。请稍后重试。")
+            return
         if route["intent"] == "query":
             try:
                 bql, rendered = self.answer_query(text, route["bql"], date_str)
@@ -134,12 +142,9 @@ class LLMMixin:
         )
 
     def route_intent(self, user_input: str, today: str) -> dict:
-        """Classify the input as entry-vs-query and, for a query, produce a BQL.
+        """Classify entry, simple query or multi-step analysis.
 
-        Returns {"intent": "entry"} or {"intent": "query", "bql": "..."}. Falls back to
-        entry on any failure: a misrouted entry costs the user one tap on ❌, while a
-        misrouted query would just be a confusing draft — both recoverable, unlike
-        blocking the bot's primary purpose because the router hiccuped.
+        Returns entry (optional payee), query (with BQL), or analysis. Retains the existing entry fallback on router failure; any resulting draft still requires the normal checks before saving.
         """
         payload = {
             "temperature": 0,
@@ -156,7 +161,7 @@ class LLMMixin:
             return {"intent": "entry"}
 
         parsed = extract_json_object(raw)
-        if not parsed or parsed.get("intent") not in ("entry", "query"):
+        if not parsed or parsed.get("intent") not in ("entry", "query", "analysis"):
             log(f"Intent router returned unusable output {raw!r}; treating input as an entry.")
             return {"intent": "entry"}
         if parsed["intent"] == "query" and not parsed.get("bql"):
@@ -208,8 +213,7 @@ class LLMMixin:
 
         raise ValueError(f"Could not build a working query. Last error:\n{error}")
 
-    def _call_llm_backends(self, payload: dict, log_prefix: str = "", vision: bool = False) -> str:
-        log_prefix = f" [用途：{log_prefix.strip() or '分录生成'}]"
+    def _with_user_preferences(self, payload: dict) -> dict:
         # Read on every logical request so editing user.md needs no restart.
         path = self.settings.USER_PROMPT_PATH
         custom_prompt = path.read_text(encoding="utf-8").strip() if path.exists() else ""
@@ -221,31 +225,45 @@ class LLMMixin:
                     "审核职责或通过条件：\n" + custom_prompt)},
                 *payload.get("messages", []),
             ]}
+        return payload
+
+    def _request_llm_message(self, backend, payload, purpose, *, vision=False, timeout=60):
+        """Transport shared by text responses and Chat Completions tool messages."""
+        model = backend.get("vision_model", backend["model"]) if vision else backend["model"]
+        label = f" [用途：{purpose.strip() or '分录生成'}]"
+        started = time.monotonic()
+        log(f"LLM{label} requesting [{model}] @ {backend['base_url']}")
+        response = HTTP.post(
+            f"{backend['base_url']}/chat/completions",
+            headers={"Authorization": f"Bearer {backend['api_key']}", "Content-Type": "application/json"},
+            json={**payload, "model": model}, timeout=timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        try:
+            message = data["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError("message must be an object")
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError("Malformed LLM response") from e
+        content = message.get("content")
+        shown = content if content is not None else json.dumps(message.get("tool_calls"), ensure_ascii=False)
+        log(f"LLM{label} answered by {_C_BLUE}[{model}]{_C_RESET} @ {backend['base_url']} ({time.monotonic() - started:.1f}s)\nResponse content:\n{shown}")
+        return message
+
+    def _call_llm_backends(self, payload: dict, log_prefix: str = "", vision: bool = False) -> str:
+        payload = self._with_user_preferences(payload)
         last_error: Exception | None = None
         for backend in self.settings.LLM_BACKENDS:
             model = backend.get("vision_model", backend["model"]) if vision else backend["model"]
             try:
-                url = f"{backend['base_url']}/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {backend['api_key']}",
-                    "Content-Type": "application/json",
-                }
-                started = time.monotonic()
-                log(f"LLM{log_prefix} requesting [{model}] @ {backend['base_url']}")
-                response = HTTP.post(url, headers=headers, json={**payload, "model": model}, timeout=60)
-                response.raise_for_status()
-                data = response.json()
-                try:
-                    content = data["choices"][0]["message"]["content"]
-                except (KeyError, IndexError, TypeError) as e:
-                    raise ValueError(f"Malformed LLM response: {data}") from e
-                if content is None:
-                    raise ValueError(f"LLM returned null content: {data}")
-                elapsed = time.monotonic() - started
-                log(f"LLM{log_prefix} answered by {_C_BLUE}[{model}]{_C_RESET} @ {backend['base_url']} ({elapsed:.1f}s)\nResponse content:\n{content}")
+                message = self._request_llm_message(backend, payload, log_prefix, vision=vision)
+                content = message.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("LLM returned non-text content")
                 return content.strip()
             except Exception as e:
-                log(f"LLM backend '{model}'{log_prefix} failed: {e}, trying next...")
+                log(f"LLM backend '{model}' [用途：{log_prefix.strip() or '分录生成'}] failed: {e}, trying next...")
                 last_error = e
         raise ValueError(f"All LLM backends failed. Last error: {last_error}")
 

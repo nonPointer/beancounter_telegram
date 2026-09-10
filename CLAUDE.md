@@ -11,13 +11,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run in debug mode (extra logging)
 .venv/bin/python main.py debug
 
-# Run tests (unittest). All five suites inject settings and isolated state;
+# Run tests (unittest). All six suites inject settings and isolated state;
 # no deployment config or credentials are needed.
 .venv/bin/python tests/test_refactor.py   # core logic tests
 .venv/bin/python tests/test_bot.py        # Bot behaviour: auth, polling resilience, drafts, queries
 .venv/bin/python tests/test_fuzz.py       # fuzzing / edge-case tests
 .venv/bin/python tests/test_runtime.py    # SQLite restart, bounded queues, configuration
 .venv/bin/python tests/test_reports.py    # Post-save BQL summaries and checked snapshot reuse
+.venv/bin/python tests/test_analysis.py   # Native tools, JSON fallback, read-only BQL worker and bounds
 
 # Interactive LLM test tool (real services; use synthetic input and a test ledger)
 .venv/bin/python scripts/preview_llm.py --live
@@ -25,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs all five suites on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
+Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs all six suites on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
 
 **Python Telegram Bot (`beancounter/bot.py`)** — root `main.py` is a thin, stable launch entry point.
 - Polls Telegram; persists updates before acknowledgment and uses bounded FIFO worker lanes
@@ -109,6 +110,12 @@ ledger fallback is used. Parsed entries and downloaded snapshots are cached by t
 syntax validation (a download failure is not retried). Queries are read-only (no draft), and
 `format_query_result()` sizes columns by `display_width()` (CJK=2) because beancount's own
 renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
+
+### Multi-step analysis
+
+The router also accepts `analysis`. `analysis.py` owns the bounded loop: four query rounds, eight attempted BQL queries, then one final answer request. These budgets are shared across backend failover and protocol errors. Capability probes use synthetic data with no `user.md`, verify both function calls and tool-result messages, and cache explicit support/rejection for one hour by endpoint/model/credential. Inconclusive text-only probes use JSON for that analysis without negative caching; transient errors try the next backend. Analysis uses the existing Chat Completions transport and preference loader. See the [official function calling protocol](https://developers.openai.com/api/docs/guides/function-calling).
+
+`analysis_query.py` owns AST-based SELECT/function/column restrictions, exact typed JSON serialization and a persistent spawn worker holding the already-validated snapshot. It does not re-load or re-check the ledger between queries. Transaction and posting metadata are removed from the worker copy without modifying the shared cache. Each query has a 15-second wait limit; timeout exits the session and terminates the worker. The 180-second workflow budget starts after ledger loading; request inactivity timeouts and process startup mean this is not a strict end-to-end wall-clock guarantee. Result rows/cells/characters and Telegram tables are capped with explicit truncation markers. The model's narrative is escaped, citations must name successful query IDs, and tables/BQL come from executed evidence, not model-written tables. Narrative accuracy remains a model limitation.
 
 ### Payee context for drafts
 
