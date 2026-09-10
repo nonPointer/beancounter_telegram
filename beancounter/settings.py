@@ -26,7 +26,10 @@ class Settings:
                 self.LLM_BACKENDS.append({"base_url": url.rstrip("/"), "api_key": key, "model": model,
                                           "vision_model": backend.get("LLM_VISION_MODEL") or model})
         for name, default in (("ACCOUNTS_CACHE_TTL", 300), ("DRAFT_TTL_SECONDS", 120),
-                              ("WORKERS", 4), ("QUEUE_SIZE", 64)):
+                              ("WORKERS", 4), ("QUEUE_SIZE", 64),
+                              ("ANALYSIS_REQUEST_TIMEOUT_SECONDS", 180),
+                              ("ANALYSIS_TIMEOUT_SECONDS", 600),
+                              ("ANALYSIS_PROBE_BUDGET_SECONDS", 120)):
             try:
                 number = int(values.get(name, default))
             except (TypeError, ValueError):

@@ -2,6 +2,7 @@
 
 import html
 import json
+import re
 import time
 
 import requests
@@ -13,7 +14,6 @@ from .prompts import BQL_REFERENCE, build_query_router_prompt
 
 MAX_QUERY_ROUNDS = 4
 MAX_QUERIES = 8
-ANALYSIS_SECONDS = 180
 CAPABILITY_TTL = 3600
 
 
@@ -105,6 +105,30 @@ def render_analysis(answer, evidence, ids):
 
 
 class AnalysisMixin:
+    def _analysis_error_detail(self, exc):
+        """Log status and selected API error fields, not raw responses or echoed request payloads."""
+        detail = type(exc).__name__
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            detail += f" HTTP {exc.response.status_code}"
+            try:
+                data = exc.response.json()
+                error = data.get("error", {}) if isinstance(data, dict) else {}
+                if isinstance(error, dict):
+                    for field in ("type", "code", "message"):
+                        value = error.get(field)
+                        if isinstance(value, (str, int)) and not isinstance(value, bool):
+                            detail += f" {field}={value}"
+            except ValueError:
+                pass
+        secrets = [self.settings.GITHUB_TOKEN, self.settings.TELEGRAM_BOT_TOKEN]
+        secrets.extend(backend["api_key"] for backend in self.settings.LLM_BACKENDS)
+        for secret in sorted(set(secrets), key=len, reverse=True):
+            if secret:
+                detail = detail.replace(secret, "[REDACTED]")
+        detail = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", detail)
+        detail = " ".join(detail.split())
+        return detail if len(detail) <= 600 else detail[:600] + " [truncated]"
+
     def _cache_tool_support(self, backend, supported):
         with self._tool_capabilities_lock:
             self._tool_capabilities[_key(backend)] = (supported, time.monotonic() + CAPABILITY_TTL)
@@ -135,6 +159,7 @@ class AnalysisMixin:
         except Exception as exc:
             if not _unsupported_tools(exc):
                 raise
+            log(f"Analysis tools explicitly rejected ({self._analysis_error_detail(exc)}); using JSON.")
             self._cache_tool_support(backend, False)
             return False
         self._cache_tool_support(backend, True)
@@ -144,7 +169,7 @@ class AnalysisMixin:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Analysis time budget exhausted")
-        message = self._request_llm_message(backend, payload, purpose, timeout=min(60, remaining))
+        message = self._request_llm_message(backend, payload, purpose, timeout=min(self.settings.ANALYSIS_REQUEST_TIMEOUT_SECONDS, remaining))
         if time.monotonic() >= deadline:
             raise TimeoutError("Analysis time budget exhausted")
         if len(json.dumps(message, ensure_ascii=False)) > 32000:
@@ -155,7 +180,8 @@ class AnalysisMixin:
         loaded = self.load_ledger()
         if loaded is None:
             raise ValueError("Ledger unavailable")
-        deadline = time.monotonic() + ANALYSIS_SECONDS
+        deadline = time.monotonic() + self.settings.ANALYSIS_TIMEOUT_SECONDS
+        probe_remaining = self.settings.ANALYSIS_PROBE_BUDGET_SECONDS
         base = [
             {"role": "system", "content": ANALYSIS_PROMPT},
             {"role": "user", "content": build_query_router_prompt(user_input, self._accounts_for_prompt(), today)},
@@ -171,11 +197,18 @@ class AnalysisMixin:
             for backend in self.settings.LLM_BACKENDS:
                 if turns > MAX_QUERY_ROUNDS or time.monotonic() >= deadline:
                     break
+                probe_started = time.monotonic()
                 try:
-                    native = self._supports_tools(backend, deadline)
+                    native = self._supports_tools(backend, min(deadline, probe_started + probe_remaining))
+                except (TimeoutError, requests.Timeout) as exc:
+                    # An exhausted probe budget is inconclusive, not cached negative evidence.
+                    log(f"Analysis capability probe timed out or exhausted its budget ({self._analysis_error_detail(exc)}); using JSON for this analysis only.")
+                    native = False
                 except Exception as exc:
-                    log(f"Analysis capability probe failed ({type(exc).__name__}); trying next backend.")
+                    log(f"Analysis capability probe failed ({self._analysis_error_detail(exc)}); trying next backend.")
                     continue
+                finally:
+                    probe_remaining = max(0, probe_remaining - (time.monotonic() - probe_started))
                 messages = history(native)
                 while turns <= MAX_QUERY_ROUNDS and time.monotonic() < deadline:
                     final_only = turns == MAX_QUERY_ROUNDS or calls_used >= MAX_QUERIES
@@ -189,11 +222,12 @@ class AnalysisMixin:
                         message = self._analysis_request(backend, payload, deadline)
                     except Exception as exc:
                         if native and _unsupported_tools(exc):
+                            log(f"Analysis tools explicitly rejected ({self._analysis_error_detail(exc)}); switching to JSON.")
                             self._cache_tool_support(backend, False)
                             native = False
                             messages = history(native)
                             continue
-                        log(f"Analysis request failed ({type(exc).__name__}); trying next backend.")
+                        log(f"Analysis request failed ({self._analysis_error_detail(exc)}); trying next backend.")
                         break
                     try:
                         native_calls = _calls(message) if native else []

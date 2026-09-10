@@ -20,7 +20,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from beancounter.analysis import ANALYSIS_SECONDS, CAPABILITY_TTL, render_analysis
+from beancounter.analysis import CAPABILITY_TTL, render_analysis
 from beancounter.analysis_query import QuerySession, encode_value, query_result, validate_query
 from beancounter.bot import Bot
 from beancounter.bot_utils import _utf16_len
@@ -112,7 +112,7 @@ class AnalysisFixture(unittest.TestCase):
         self.bot.load_ledger = MagicMock(return_value=self.loaded)
         self.bot._accounts_for_prompt = MagicMock(return_value=["Assets:Cash", "Expenses:Food:Cafe"])
         self.backend = settings.LLM_BACKENDS[0]
-        self.deadline = time.monotonic() + ANALYSIS_SECONDS
+        self.deadline = time.monotonic() + settings.ANALYSIS_TIMEOUT_SECONDS
 
     def run_analysis(self, replies, *, native=False):
         self.bot._supports_tools = MagicMock(return_value=native)
@@ -371,7 +371,7 @@ class TestAnalysisLoop(AnalysisFixture):
 
     def test_probe_failure_moves_to_next_backend_without_negative_cache(self):
         self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
-        self.bot._request_llm_message = MagicMock(side_effect=[requests.Timeout(), http_error(), QUERY_JSON, FINAL])
+        self.bot._request_llm_message = MagicMock(side_effect=[http_error(401), http_error(), QUERY_JSON, FINAL])
         with patch("beancounter.analysis.QuerySession", InlineSession):
             result = self.bot.analyze_ledger("分析开支", "2026-09-10")
         self.assertIn("退款", result[0])
@@ -435,6 +435,134 @@ class TestAnalysisLoop(AnalysisFixture):
         self.bot._supports_tools = MagicMock()
         self.bot.handle_natural_language(123, "查询余额", "查询余额", "2026-09-10")
         self.bot._supports_tools.assert_not_called()
+
+
+class TestAnalysisTimeouts(AnalysisFixture):
+    def test_timeout_defaults_overrides_and_invalid_values(self):
+        defaults = {"ANALYSIS_REQUEST_TIMEOUT_SECONDS": 180, "ANALYSIS_TIMEOUT_SECONDS": 600, "ANALYSIS_PROBE_BUDGET_SECONDS": 120}
+        for name, default in defaults.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(self.bot.settings, name), default)
+                self.assertEqual(getattr(Settings({**MOCK_CONFIG, name: "240"}), name), 240)
+                for invalid in (0, -1, None, "invalid"):
+                    self.assertEqual(getattr(Settings({**MOCK_CONFIG, name: invalid}), name), default)
+
+    def test_request_timeout_is_configurable_and_clamped_to_remaining_budget(self):
+        self.bot._request_llm_message = MagicMock(return_value=FINAL)
+        with patch("beancounter.analysis.time.monotonic", return_value=100):
+            self.bot._analysis_request(self.backend, {}, 700)
+            self.assertEqual(self.bot._request_llm_message.call_args.kwargs["timeout"], 180)
+            self.bot.settings.ANALYSIS_REQUEST_TIMEOUT_SECONDS = 240
+            self.bot._analysis_request(self.backend, {}, 700)
+            self.assertEqual(self.bot._request_llm_message.call_args.kwargs["timeout"], 240)
+            self.bot._analysis_request(self.backend, {}, 107)
+            self.assertEqual(self.bot._request_llm_message.call_args.kwargs["timeout"], 7)
+
+    def test_slow_probe_and_analysis_can_finish_beyond_old_limits(self):
+        self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
+        self.bot._cache_tool_support(self.backend, True)
+        now, timeouts = [0], []
+        replies = iter([
+            (1, tool_message(call_id="one")), (1, tool_message(call_id="two")),
+            (1, http_error(429)), (54, tool_message("capability_probe", {})),
+            (55, {"content": "OK"}), (90, FINAL),
+        ])
+
+        def request(backend, payload, purpose, *, timeout):
+            duration, reply = next(replies)
+            timeouts.append(timeout)
+            self.assertLess(duration, timeout)
+            now[0] += duration
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        with patch("beancounter.analysis.QuerySession", InlineSession), patch("beancounter.analysis.time.monotonic", side_effect=lambda: now[0]), patch.object(self.bot, "_request_llm_message", side_effect=request):
+            result = self.bot.analyze_ledger("分析本月开支", "2026-09-10")
+        self.assertIn("退款", result[0])
+        self.assertEqual(now[0], 202)
+        self.assertEqual(timeouts, [180, 180, 180, 120, 66, 180])
+        self.bot.load_ledger.assert_called_once()
+
+    def test_probe_budget_shared_across_backends_and_exhaustion_uses_json(self):
+        self.bot.settings.LLM_BACKENDS += [{**self.backend, "model": "backup"}, {**self.backend, "model": "last"}]
+        now, seen = [0], []
+        replies = iter([
+            (80, requests.ConnectionError()), (30, tool_message("capability_probe", {})),
+            (10, requests.ReadTimeout()), (1, requests.ConnectionError()),
+            (1, QUERY_JSON), (1, FINAL),
+        ])
+
+        def request(backend, payload, purpose, *, timeout):
+            seen.append((backend["model"], timeout, "tools" in payload))
+            duration, reply = next(replies)
+            now[0] += duration
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        with patch("beancounter.analysis.QuerySession", InlineSession), patch("beancounter.analysis.time.monotonic", side_effect=lambda: now[0]), patch.object(self.bot, "_request_llm_message", side_effect=request):
+            result = self.bot.analyze_ledger("分析本月开支", "2026-09-10")
+        self.assertIn("退款", result[0])
+        self.assertEqual([s[1] for s in seen[:3]], [120, 40, 10])
+        self.assertEqual(seen[-2:], [("last", 180, False), ("last", 180, False)])
+        self.assertEqual(self.bot._tool_capabilities, {})
+
+    def test_cached_support_still_works_with_expired_probe_deadline(self):
+        self.bot._cache_tool_support(self.backend, True)
+        with patch.object(self.bot, "_request_llm_message") as request:
+            self.assertTrue(self.bot._supports_tools(self.backend, time.monotonic() - 1))
+            request.assert_not_called()
+
+    def test_probe_timeout_falls_back_without_negative_cache(self):
+        self.bot._request_llm_message = MagicMock(side_effect=[requests.ReadTimeout(), QUERY_JSON, FINAL])
+        with patch("beancounter.analysis.QuerySession", InlineSession):
+            result = self.bot.analyze_ledger("分析开支", "2026-09-10")
+        self.assertIn("退款", result[0])
+        calls = self.bot._request_llm_message.call_args_list
+        self.assertIn("tools", calls[0].args[1])
+        self.assertNotIn("tools", calls[1].args[1])
+        self.assertEqual(self.bot._tool_capabilities, {})
+
+    def test_custom_workflow_deadline_stops_late_responses(self):
+        self.bot.settings.ANALYSIS_TIMEOUT_SECONDS = 12
+        self.bot._cache_tool_support(self.backend, True)
+        now, timeouts = [0], []
+
+        def request(backend, payload, purpose, *, timeout):
+            timeouts.append(timeout)
+            now[0] += 13
+            return FINAL
+
+        with patch("beancounter.analysis.QuerySession", InlineSession), patch("beancounter.analysis.time.monotonic", side_effect=lambda: now[0]), patch.object(self.bot, "_request_llm_message", side_effect=request):
+            result = self.bot.analyze_ledger("分析开支", "2026-09-10")
+        self.assertEqual(timeouts, [12])
+        self.assertIn("分析未完成", result[0])
+
+    def test_http_diagnostics_retain_status_but_redact_secrets_and_echoed_payload(self):
+        message = "quota exceeded " + " ".join([self.backend["api_key"], self.bot.settings.GITHUB_TOKEN, self.bot.settings.TELEGRAM_BOT_TOKEN]) + "\nAuthorization: Bearer unconfigured-secret"
+        error = http_error(429, json.dumps({"error": {
+            "type": "tokens", "code": "rate_limit", "message": message,
+            "failed_generation": "synthetic ledger echo must be omitted",
+        }}))
+        detail = self.bot._analysis_error_detail(error)
+        for expected in ("HTTP 429", "type=tokens", "code=rate_limit", "quota exceeded", "[REDACTED]"):
+            self.assertIn(expected, detail)
+        for secret in (self.backend["api_key"], self.bot.settings.GITHUB_TOKEN, self.bot.settings.TELEGRAM_BOT_TOKEN, "unconfigured-secret", "synthetic ledger echo", "\n"):
+            self.assertNotIn(secret, detail)
+
+    def test_http_diagnostics_bound_text_and_omit_non_json_bodies(self):
+        detail = self.bot._analysis_error_detail(http_error(400, json.dumps({"error": {"message": "x" * 10000}})))
+        self.assertLessEqual(len(detail), 612)
+        self.assertIn("truncated", detail)
+        self.assertEqual(self.bot._analysis_error_detail(http_error(502, "<html>private upstream body</html>")), "HTTPError HTTP 502")
+
+    def test_request_failure_logs_http_status_and_message(self):
+        self.bot._supports_tools = MagicMock(return_value=False)
+        self.bot._request_llm_message = MagicMock(side_effect=http_error(429, json.dumps({"error": {"message": "quota exceeded"}})))
+        with patch("beancounter.analysis.QuerySession", InlineSession), patch("beancounter.analysis.log") as logged:
+            self.bot.analyze_ledger("分析开支", "2026-09-10")
+        self.assertIn("HTTP 429 message=quota exceeded", str(logged.call_args_list))
 
 
 class TestHttpSmoke(AnalysisFixture):
