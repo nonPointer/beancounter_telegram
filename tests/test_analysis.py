@@ -539,7 +539,7 @@ class TestAnalysisTimeouts(AnalysisFixture):
         self.assertEqual(timeouts, [12])
         self.assertIn("分析未完成", result[0])
 
-    def test_http_diagnostics_retain_status_but_redact_secrets_and_echoed_payload(self):
+    def test_http_diagnostics_retain_status_mask_secrets_and_omit_failed_generation(self):
         message = "quota exceeded " + " ".join([self.backend["api_key"], self.bot.settings.GITHUB_TOKEN, self.bot.settings.TELEGRAM_BOT_TOKEN]) + "\nAuthorization: Bearer unconfigured-secret"
         error = http_error(429, json.dumps({"error": {
             "type": "tokens", "code": "rate_limit", "message": message,

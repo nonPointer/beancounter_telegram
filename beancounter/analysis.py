@@ -106,7 +106,7 @@ def render_analysis(answer, evidence, ids):
 
 class AnalysisMixin:
     def _analysis_error_detail(self, exc):
-        """Log status and selected API error fields, not raw responses or echoed request payloads."""
+        """Format selected API error fields with credential masking; messages may still contain private data."""
         detail = type(exc).__name__
         if isinstance(exc, requests.HTTPError) and exc.response is not None:
             detail += f" HTTP {exc.response.status_code}"
