@@ -29,9 +29,10 @@ from .ledger import LedgerMixin
 from .llm import LLMMixin
 from .drafts import DraftMixin
 from .telegram_api import TelegramMixin
+from .reports import ReportMixin
 
 
-class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
+class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMixin):
     def __init__(self, debug: bool = False, settings: Settings | dict | None = None,
                  state_path: str | None = None):
         self.settings = Settings(settings) if isinstance(settings, dict) else settings or Settings.load()
@@ -366,6 +367,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin):
                 parse_mode="HTML",
             )
             log("Logged entry:\n" + appendix)
+            self.send_transaction_report(chat_id, appendix)
         else:
             reply(err)
 

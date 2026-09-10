@@ -11,12 +11,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run in debug mode (extra logging)
 .venv/bin/python main.py debug
 
-# Run tests (unittest). All four suites inject settings and isolated state;
+# Run tests (unittest). All five suites inject settings and isolated state;
 # no deployment config or credentials are needed.
 .venv/bin/python tests/test_refactor.py   # core logic tests
 .venv/bin/python tests/test_bot.py        # Bot behaviour: auth, polling resilience, drafts, queries
 .venv/bin/python tests/test_fuzz.py       # fuzzing / edge-case tests
 .venv/bin/python tests/test_runtime.py    # SQLite restart, bounded queues, configuration
+.venv/bin/python tests/test_reports.py    # Post-save BQL summaries and checked snapshot reuse
 
 # Interactive LLM test tool (real services; use synthetic input and a test ledger)
 .venv/bin/python scripts/preview_llm.py --live
@@ -24,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs all four suites on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
+Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs all five suites on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
 
 **Python Telegram Bot (`beancounter/bot.py`)** — root `main.py` is a thin, stable launch entry point.
 - Polls Telegram; persists updates before acknowledgment and uses bounded FIFO worker lanes
@@ -208,6 +209,8 @@ If a date is detected, it overrides today's date and the first line is stripped 
 - `_ThreadHTTP` keeps one requests.Session per thread; sessions are never shared across workers.
 
 `Timing [...]` logs expose queue wait, tree listing, blob download count/time, account refresh, ledger context, snapshot materialization, parser/validation and draft checkpoints. Stages overlap, so their durations are not additive. Full LLM output and full validation diagnostics remain available; never remove the mandatory validation/review gates as a speed optimization.
+
+Post-save transaction reports live in `reports.py` and run for manual and approved/auto-approved LLM transactions. Both BQL queries share one checked ledger; a successful LLM save seeds the parsed cache, which readers reuse only after verifying identical remote texts. Non-transaction directives do not trigger reports. Monthly expenses use the bot timezone's current calendar month, `root(account, 2)` categories and cost inventories; balances use exact Assets/Liabilities accounts over all ledger dates in original units. Never add different currencies or convert holdings to market value implicitly. Telegram tables use escaped HTML `<pre>` blocks and abbreviated, collision-safe account labels. Reporting failures must never restore a saved draft or retry the ledger write. `tests/test_reports.py` covers the real query engine, post-save hooks, cache validation and display rules on both Beancount versions.
 
 ### Input validation
 - `/open` validates account name against beancount pattern (`^[A-Z][a-zA-Z0-9]*(?::[A-Z][a-zA-Z0-9]*)+$`) and currency against `^[A-Z][A-Z0-9]{0,9}$`

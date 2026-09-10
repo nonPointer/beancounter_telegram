@@ -29,7 +29,9 @@ from beancounter.bot import Bot
 
 
 def make_bot() -> Bot:
-    return Bot(settings=MOCK_CONFIG, state_path=":memory:")
+    bot = Bot(settings=MOCK_CONFIG, state_path=":memory:")
+    bot.send_transaction_report = MagicMock()
+    return bot
 
 
 class TestStripCodeFence(unittest.TestCase):

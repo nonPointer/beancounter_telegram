@@ -12,6 +12,10 @@
 
 支持 Beancount v2 和 v3。v2 使用内置查询模块，v3 使用独立的 `beanquery`（已列入依赖）。升级 Beancount 后请使用启动机器人的同一个 Python 安装依赖，例如 `python3 -m pip install -r requirements.txt`；仅 pull 代码不会安装新依赖。遇到 `No module named 'beancount.query'` 时，需要先更新代码并安装依赖，再启动机器人，无需降级账本环境。
 
+每次交易保存成功后，机器人通过 BQL 发送两张代码块表格：当前自然月的分类开支，以及本笔交易涉及的 Assets／Liabilities 账户余额。月份按机器人时区确定，补录历史交易也显示当前月；开支合并 `Expenses:Food:*` 等二级类别，按成本计价，退款冲减开支，各币种分别列示并合计。余额包含账本全部日期的记录，按实际涉及的完整账户精确查询，不并入子账户；保留负债符号和股票等持仓单位，不按市价折算。展示省略 `Expenses:`、`Assets:`／`Liabilities:` 及银行账户的 `Bank:` 前缀，简写重名时恢复必要前缀。过长表格会注明截断；统计失败不影响已保存交易，也无需重复记账。
+
+两项统计共用一次账本加载。LLM 保存前完整校验的结果在保存成功后保留；确认远端账本文件内容一致后，统计和后续查询可直接复用该结果。远端账本发生变化时仍重新校验。手工交易保存后的统计需要加载并校验一次完整账本。统计使用进程内查询接口，不额外启动两个 `bean-query` 进程；无需配置 GitHub Actions。若账本仓库已启用 `notify-on-push.yml` 通知，两边可能分别发送统计消息。
+
 依赖兼容性、生产升级步骤及常见错误见 [`requirements.md`](requirements.md)；pip 安装仍使用 `requirements.txt`。
 
 - 配置
@@ -141,13 +145,14 @@ user.md.example         # 用户 prompt 模板
   生成请求、Telegram 通知或 `/view` 工作流在进程意外中断后可能再次执行。
 - `SIGTERM` 会停止轮询并等待已排队任务结束。强制终止后仍可从 SQLite 恢复。
 
-生产更新前先备份代码、`config.json`、`user.md` 和状态目录，再运行四套测试：
+生产更新前先备份代码、`config.json`、`user.md` 和状态目录，再运行五套测试：
 
 ```bash
 python tests/test_refactor.py
 python tests/test_bot.py
 python tests/test_fuzz.py
 python tests/test_runtime.py
+python tests/test_reports.py
 ```
 
 更换代码时保留配置和状态文件，首次升级前先处理完旧版本内存中的草稿。服务管理器应给

@@ -36,3 +36,6 @@ jobs:
 
       - name: test_runtime
         run: python tests/test_runtime.py
+
+      - name: test_reports
+        run: python tests/test_reports.py

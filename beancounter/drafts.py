@@ -88,7 +88,7 @@ class DraftMixin:
                 return appendix
             texts = {path: f["content"] for path, f in files.items()}
             texts[self.settings.FILE_PATH] = current["content"] + "\n" + marker + "\n" + appendix + "\n"
-            check_ledger(texts, self._ledger_root(texts), self.settings.FILE_PATH)
+            checked = check_ledger(texts, self._ledger_root(texts), self.settings.FILE_PATH)
             if not reviewed:
                 if not self.parse_accounts():
                     raise ValueError("无法取得账户上下文，未提交。")
@@ -104,6 +104,10 @@ class DraftMixin:
             ok, status = self._github_put_file(
                 texts[self.settings.FILE_PATH], current["sha"], pending["commit_message"].strip())
             if ok:
+                # The next reader verifies the remote texts before reusing this result.
+                with self._ledger_cache_lock:
+                    self._ledger_cache = {"tree_sha": None, "entries": checked[0],
+                                          "options_map": checked[1], "texts": texts}
                 return appendix
             if status not in (409, 422):
                 raise ValueError(f"GitHub 提交失败（HTTP {status}）。")
@@ -128,6 +132,7 @@ class DraftMixin:
         label = "超时自动确认，已保存" if automatic else "已保存"
         block, _ = _capped_code_block(appendix, 3800)
         self.send_message(chat_id, f"{label}（本地检查及输入审核通过）：\n{block}", parse_mode="HTML")
+        self.send_transaction_report(chat_id, appendix)
 
     def next_pending_id(self) -> str:
         with self._pending_lock:

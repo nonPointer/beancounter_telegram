@@ -31,6 +31,7 @@ class TestRuntime(unittest.TestCase):
         bot = Bot(settings={**MOCK_CONFIG, **changes}, state_path=self.path)
         bot.send_message = MagicMock(return_value={"ok": True, "result": {"message_id": 7}})
         bot.edit_message_reply_markup = MagicMock()
+        bot.send_transaction_report = MagicMock()
         self.addCleanup(bot.close)
         return bot
 

@@ -638,6 +638,7 @@ class TestCleanupExpiredDrafts(unittest.TestCase):
         self.addCleanup(self.bot.close)
         self.bot._spawn_handler = lambda fn, update, chat_id: fn(update)
         self.bot.commit_llm_entry = MagicMock(return_value="checked entry")
+        self.bot.send_transaction_report = MagicMock()
 
     def test_removes_expired_entries(self):
         old_entry = self.bot._make_pending_entry(42, "app", "cm", "inp", "2024-01-15")
@@ -1456,6 +1457,7 @@ class TestApproveDownloadFailureKeepsDraft(unittest.TestCase):
     def setUp(self):
         self.bot = main.Bot(settings=FAKE_CONFIG, state_path=":memory:")
         self.addCleanup(self.bot.close)
+        self.bot.send_transaction_report = MagicMock()
 
     def _appendix(self):
         return '2026-06-26 * "x" "y"\n  Expenses:Food 5 CNY\n  Assets:Cash'

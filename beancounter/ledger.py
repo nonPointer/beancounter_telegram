@@ -167,6 +167,11 @@ class LedgerMixin:
         _, files = self._download_ledger_snapshot(listed)
         texts = {path: f["content"] for path, f in files.items()}
 
+        with self._ledger_cache_lock:
+            if self._ledger_cache.get("texts") == texts and self._ledger_cache.get("entries") is not None:
+                self._ledger_cache["tree_sha"] = tree_sha
+                return self._ledger_cache["entries"], self._ledger_cache["options_map"]
+
         if not texts.get(self.settings.FILE_PATH):
             log("Ledger main file is empty or missing; cannot query.")
             return None
