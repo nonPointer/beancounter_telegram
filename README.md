@@ -45,11 +45,14 @@ LLM 草稿保存前必须通过完整账本校验和独立 LLM 一致性审核�
 
 ### 常用命令
 
+Bot 启动时自动为 `CHAT_ID` 中的会话注册中文 `/` 命令菜单，并为私聊设置菜单按钮，无需在 BotFather 手动录入。注册失败会记录日志，每隔约 5 分钟重试，期间继续处理消息；重启会重新同步菜单。输入 `/help` 可查看命令和记账示例，群聊支持 `/命令@机器人用户名`。
+
 | 输入 | 操作 |
 | --- | --- |
+| `/start` / `/help` | 入门说明、命令用法和记账示例 |
 | `/last [N]` / `/today` | 最近 N 条（默认 5）／今天的记录 |
 | `/undo` | 预览并确认撤回最后一条指令 |
-| `/tz Europe/London` | 设置时区 |
+| `/tz` / `/tz Europe/London` | 查看／设置时区 |
 | `open Assets:Cash GBP` / `close Assets:Cash` | 开户／销户 |
 | `balance Cash 200 GBP` | 余额断言，默认次日开盘生效 |
 | `pad Cash Opening-Balances` | 补差指令 |

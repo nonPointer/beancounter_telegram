@@ -31,6 +31,9 @@ jobs:
       - name: test_bot
         run: python tests/test_bot.py
 
+      - name: test_commands
+        run: python tests/test_commands.py
+
       - name: test_fuzz
         run: python tests/test_fuzz.py
 

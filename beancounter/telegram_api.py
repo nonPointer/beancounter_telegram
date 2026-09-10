@@ -3,12 +3,65 @@
 import traceback
 import uuid
 import time
+import requests
 from .bot_utils import (
     AccountMatchError, HTTP, POLL_BACKOFF_BASE, POLL_BACKOFF_MAX, TELEGRAM_MESSAGE_LIMIT,
     _scrub, _utf16_len, log,
 )
 
 class TelegramMixin:
+    # Menu descriptions and help share one command list.
+    COMMANDS = (
+        ("help", "查看命令和记账示例", ""),
+        ("today", "查看今天的记录", ""),
+        ("last", "查看最近记录（默认 5 条，最多 50 条）", "[数量]"),
+        ("undo", "预览并确认撤回最后一条指令", ""),
+        ("tz", "查看或设置时区", "[时区，例如 Europe/London]"),
+        ("update", "补差并设置次日余额断言", "<账户> <补差账户> <金额> <币种>"),
+        ("view", "生成月度桑基图（需配置工作流）", ""),
+        ("start", "查看入门说明", ""),
+    )
+
+    def command_help(self):
+        lines = ["记账助手", "输入 / 可选择命令："]
+        lines.extend(f"/{name}{' ' + usage if usage else ''} — {description}" for name, description, usage in self.COMMANDS)
+        lines.extend([
+            "", "记账示例：", "直接发送：现金买咖啡 5 GBP", "也可以发送账单截图；投资订单截图请在说明中加 invest。",
+            "自然语言和截图需要配置 LLM；草稿的保存方式请查看确认消息。",
+            "", "手动记账（每项单独一行）：", "咖啡店\n咖啡\nExpenses:Food 5 GBP\nAssets:Cash -5 GBP",
+            "", "账户指令不加 /，例如：open Assets:Cash GBP", "还支持 close、balance、pad；/update 会直接写入补差和余额断言。",
+        ])
+        return "\n".join(lines)
+
+    def register_commands(self):
+        """Refresh menus for configured chats; failures leave polling available."""
+        calls = []
+        if not self._telegram_username:
+            calls.append(("getMe", {}))
+        commands = [{"command": name, "description": description} for name, description, _ in self.COMMANDS]
+        for chat_id in sorted(self.settings.ALLOWED_CHATS):
+            calls.append(("setMyCommands", {"commands": commands, "scope": {"type": "chat", "chat_id": chat_id}, "language_code": ""}))
+            if chat_id.isdigit() and int(chat_id) > 0:
+                calls.append(("setChatMenuButton", {"chat_id": int(chat_id), "menu_button": {"type": "commands"}}))
+        succeeded = True
+        for method, payload in calls:
+            if self.stop.is_set():
+                return False
+            try:
+                response = HTTP.post(self.api_base + "/" + method, json=payload, timeout=10)
+                data = response.json()
+                if response.status_code != 200 or not isinstance(data, dict) or data.get("ok") is not True:
+                    raise ValueError(f"HTTP {response.status_code}")
+                if method == "getMe":
+                    self._telegram_username = data["result"]["username"].lower()
+                elif data.get("result") is not True:
+                    raise ValueError("Unexpected result")
+            except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as exc:
+                # Request exceptions may contain the token in the URL; log only the type.
+                log(f"Telegram {method} failed ({type(exc).__name__}); retrying in 5 minutes.")
+                succeeded = False
+        return succeeded
+
     def get_telegram_file_bytes(self, file_id: str) -> bytes | None:
         r = HTTP.get(self.api_base + "/getFile", params={"file_id": file_id}, timeout=30)
         if r.status_code != 200:
@@ -188,8 +241,12 @@ class TelegramMixin:
         self.cleanup_expired_drafts()
 
     def start(self):
+        next_registration = 0
         while not self.stop.is_set():
             try:
+                if time.monotonic() >= next_registration:
+                    registered = self.register_commands()
+                    next_registration = float("inf") if registered else time.monotonic() + 300
                 self.process_updates()
             except KeyboardInterrupt:
                 raise

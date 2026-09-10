@@ -50,6 +50,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         self._poll_failures = 0
         self.timezone = pytz.timezone(self.settings.TIMEZONE)
         self.api_base = "https://api.telegram.org/bot{}".format(self.settings.TELEGRAM_BOT_TOKEN)
+        self._telegram_username = None
         saved = self.state.get("drafts", {})
         self.pending_llm_entries = saved.get("pending", {})
         self.pending_llm_entries.update(saved.get("inflight", {}))
@@ -215,6 +216,17 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
             log(f"Ignoring message from unauthorized chat_id {chat_id}.")
             return
 
+        text = text.strip()
+        if text.startswith('/'):
+            parts = text.split(maxsplit=1)
+            command, separator, username = parts[0][1:].partition('@')
+            if separator and (not self._telegram_username or username.lower() != self._telegram_username):
+                return
+            text = '/' + command.lower() + (' ' + parts[1] if len(parts) == 2 else '')
+            if command.lower() in {"start", "help"}:
+                reply(self.command_help())
+                return
+
         dt = datetime.now(self.timezone)
         time_str = dt.strftime('%H:%M')
         datetime_str = dt.isoformat(timespec='seconds')
@@ -244,7 +256,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         # consuming the entire line and breaking command dispatch.
         _directive_commands = {'open', 'close', 'balance', 'pad'}
         _first_word = text.strip().split()[0].lower() if text.strip() else ''
-        if _first_word in _directive_commands:
+        if _first_word in _directive_commands or text.startswith('/'):
             date_str = dt.strftime('%Y-%m-%d')
             custom_date = False
         else:
@@ -266,14 +278,16 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
             payload = text[len(command):].strip()
             log(f"Command: {command}, Payload: {payload}")
             if command == "tz":
+                if not payload:
+                    reply(f"当前时区：{self.timezone}\n当前时间：{datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')}\n修改示例：/tz Europe/London")
+                    return
                 try:
                     self.timezone = pytz.timezone(payload)
                     self._save_pending()
                 except pytz.UnknownTimeZoneError:
-                    reply(f"Unknown timezone: {payload}")
+                    reply(f"未知时区：{payload}\n修改示例：/tz Europe/London")
                     return
-                reply(f"Timezone set to {self.timezone}")
-                reply(f"Current time: {datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')}")
+                reply(f"时区已设置为 {self.timezone}\n当前时间：{datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S')}")
                 return
             elif command == "update":
                 parts = payload.split()
@@ -334,7 +348,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
                 self.handle_today(chat_id)
                 return
             else:
-                reply(f"Unknown command: {command}")
+                reply(f"未知命令：/{command}\n输入 /help 查看可用命令和示例。")
                 return
 
         elif dispatch_word in _directive_commands:

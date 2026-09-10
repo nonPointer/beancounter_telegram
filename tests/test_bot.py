@@ -977,6 +977,7 @@ class TestPollingResilience(unittest.TestCase):
 
         self.bot.process_updates = flaky
         self.bot._backoff = lambda *a, **k: None
+        self.bot.register_commands = MagicMock(return_value=True)
         self.bot.start()
         self.assertEqual(len(calls), 3)
 
