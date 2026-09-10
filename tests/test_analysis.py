@@ -354,12 +354,41 @@ class TestAnalysisLoop(AnalysisFixture):
             query.assert_not_called()
 
     def test_actual_tool_rejection_switches_to_json(self):
+        self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
         result = self.run_analysis([http_error(), QUERY_JSON, FINAL], native=True)
         self.assertIn("退款", result[0])
         calls = self.bot._request_llm_message.call_args_list
         self.assertIn("tools", calls[0].args[1])
         self.assertNotIn("tools", calls[1].args[1])
+        self.assertTrue(all(call.args[0] is self.backend for call in calls))
         self.assertTrue(any(not value[0] for value in self.bot._tool_capabilities.values()))
+
+    def test_final_turn_tool_rejection_retries_json_with_existing_evidence(self):
+        self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
+        result = self.run_analysis([tool_message()] * 4 + [http_error(), FINAL], native=True)
+        self.assertIn("退款", result[0])
+        calls = self.bot._request_llm_message.call_args_list
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(call.args[0] is self.backend for call in calls))
+        payload = calls[-1].args[1]
+        self.assertNotIn("tools", payload)
+        self.assertFalse(any(message["role"] == "tool" for message in payload["messages"]))
+        self.assertIn("q4", json.dumps(payload))
+
+    def test_probe_failure_tries_json_on_same_backend_without_negative_cache(self):
+        self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
+        for error in [http_error(400, '{"error":{"code":"tool_use_failed"}}'), http_error(401), http_error(429), requests.ConnectionError()]:
+            with self.subTest(error=repr(error)):
+                self.bot._request_llm_message = MagicMock(side_effect=[error, QUERY_JSON, FINAL])
+                with patch("beancounter.analysis.QuerySession", InlineSession):
+                    result = self.bot.analyze_ledger("分析开支", "2026-09-10")
+                self.assertIn("退款", result[0])
+                calls = self.bot._request_llm_message.call_args_list
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(all(call.args[0] is self.backend for call in calls))
+                self.assertIn("tools", calls[0].args[1])
+                self.assertNotIn("tools", calls[1].args[1])
+                self.assertEqual(self.bot._tool_capabilities, {})
 
     def test_backend_failure_preserves_query_evidence_and_budget(self):
         self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
@@ -369,14 +398,17 @@ class TestAnalysisLoop(AnalysisFixture):
         self.assertIn('q1', json.dumps(self.bot._request_llm_message.call_args.args[1]))
         self.bot.load_ledger.assert_called_once()
 
-    def test_probe_failure_moves_to_next_backend_without_negative_cache(self):
+    def test_probe_and_json_failure_move_to_next_backend_without_negative_cache(self):
         self.bot.settings.LLM_BACKENDS.append({**self.backend, "model": "backup"})
-        self.bot._request_llm_message = MagicMock(side_effect=[http_error(401), http_error(), QUERY_JSON, FINAL])
+        self.bot._request_llm_message = MagicMock(side_effect=[http_error(401), http_error(401), http_error(), QUERY_JSON, FINAL])
         with patch("beancounter.analysis.QuerySession", InlineSession):
             result = self.bot.analyze_ledger("分析开支", "2026-09-10")
         self.assertIn("退款", result[0])
         self.assertEqual(len(self.bot._tool_capabilities), 1)
         self.assertEqual(next(iter(self.bot._tool_capabilities))[1], "backup")
+        calls = self.bot._request_llm_message.call_args_list
+        self.assertEqual([call.args[0]["model"] for call in calls], ["test-model", "test-model", "backup", "backup", "backup"])
+        self.assertNotIn("tools", calls[1].args[1])
 
     def test_timeout_returns_partial_results(self):
         original = InlineSession.query
@@ -488,7 +520,7 @@ class TestAnalysisTimeouts(AnalysisFixture):
         self.bot.settings.LLM_BACKENDS += [{**self.backend, "model": "backup"}, {**self.backend, "model": "last"}]
         now, seen = [0], []
         replies = iter([
-            (80, requests.ConnectionError()), (30, tool_message("capability_probe", {})),
+            (80, requests.ConnectionError()), (1, requests.ConnectionError()), (30, tool_message("capability_probe", {})),
             (10, requests.ReadTimeout()), (1, requests.ConnectionError()),
             (1, QUERY_JSON), (1, FINAL),
         ])
@@ -504,7 +536,7 @@ class TestAnalysisTimeouts(AnalysisFixture):
         with patch("beancounter.analysis.QuerySession", InlineSession), patch("beancounter.analysis.time.monotonic", side_effect=lambda: now[0]), patch.object(self.bot, "_request_llm_message", side_effect=request):
             result = self.bot.analyze_ledger("分析本月开支", "2026-09-10")
         self.assertIn("退款", result[0])
-        self.assertEqual([s[1] for s in seen[:3]], [120, 40, 10])
+        self.assertEqual(seen[:4], [("test-model", 120, True), ("test-model", 180, False), ("backup", 40, True), ("backup", 10, True)])
         self.assertEqual(seen[-2:], [("last", 180, False), ("last", 180, False)])
         self.assertEqual(self.bot._tool_capabilities, {})
 
@@ -578,12 +610,16 @@ class TestHttpSmoke(AnalysisFixture):
         self.bot.load_ledger.assert_called_once()
 
     def test_unsupported_api_through_real_http_and_spawn_worker(self):
-        with fake_api([(400, {"error": {"message": "tools not supported"}}), QUERY_JSON, FINAL]) as (url, received):
-            self.backend["base_url"] = url
-            result = self.bot.analyze_ledger("分析本月开支", "2026-09-10")
-        self.assertEqual(len(received), 3)
-        self.assertNotIn("tools", received[1])
-        self.assertIn("退款", result[0])
+        for error in [{"message": "tools not supported"}, {"code": "tool_use_failed", "message": "Failed to call a function"}]:
+            with self.subTest(error=error), fake_api([(400, {"error": error}), QUERY_JSON, FINAL]) as (url, received), fake_api([]) as (backup_url, backup_received):
+                self.backend["base_url"] = url
+                self.bot.settings.LLM_BACKENDS = [self.backend, {**self.backend, "base_url": backup_url, "model": "backup"}]
+                result = self.bot.analyze_ledger("分析本月开支", "2026-09-10")
+                self.assertEqual(len(received), 3)
+                self.assertIn("tools", received[0])
+                self.assertNotIn("tools", received[1])
+                self.assertIn("退款", result[0])
+                self.assertEqual(backup_received, [])
 
 
 if __name__ == "__main__":

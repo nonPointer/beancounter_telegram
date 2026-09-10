@@ -200,13 +200,10 @@ class AnalysisMixin:
                 probe_started = time.monotonic()
                 try:
                     native = self._supports_tools(backend, min(deadline, probe_started + probe_remaining))
-                except (TimeoutError, requests.Timeout) as exc:
-                    # An exhausted probe budget is inconclusive, not cached negative evidence.
-                    log(f"Analysis capability probe timed out or exhausted its budget ({self._analysis_error_detail(exc)}); using JSON for this analysis only.")
-                    native = False
                 except Exception as exc:
-                    log(f"Analysis capability probe failed ({self._analysis_error_detail(exc)}); trying next backend.")
-                    continue
+                    # A failed probe does not establish whether JSON requests will work.
+                    log(f"Analysis capability probe failed ({self._analysis_error_detail(exc)}); using JSON on the same backend for this analysis only.")
+                    native = False
                 finally:
                     probe_remaining = max(0, probe_remaining - (time.monotonic() - probe_started))
                 messages = history(native)
@@ -222,10 +219,11 @@ class AnalysisMixin:
                         message = self._analysis_request(backend, payload, deadline)
                     except Exception as exc:
                         if native and _unsupported_tools(exc):
-                            log(f"Analysis tools explicitly rejected ({self._analysis_error_detail(exc)}); switching to JSON.")
+                            log(f"Analysis tools explicitly rejected ({self._analysis_error_detail(exc)}); switching to JSON on the same backend.")
                             self._cache_tool_support(backend, False)
                             native = False
                             messages = history(native)
+                            turns -= 1  # Protocol negotiation does not consume an analysis turn.
                             continue
                         log(f"Analysis request failed ({self._analysis_error_detail(exc)}); trying next backend.")
                         break
