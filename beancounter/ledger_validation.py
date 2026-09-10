@@ -2,15 +2,33 @@
 
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
+from contextlib import nullcontext
+from threading import RLock
 
-from beancount import loader
+from beancount import loader, __version__ as BEANCOUNT_VERSION
 from beancount.ops import validation
 from beancount.parser import printer
 from .bot_utils import log, timed
 
 
+# v2 temporarily changes the process working directory while parsing includes. v3 resolves paths without chdir and does not need this serialization.
+_LOAD_GUARD = RLock() if BEANCOUNT_VERSION.startswith("2.") else nullcontext()
+
+
 def _error_details(errors):
     return "\n".join(printer.format_error(error).rstrip() for error in errors)
+
+
+def _load_complete_file(filename):
+    """Run the full loader and all bean-check validations without a disk cache."""
+    # Disposable snapshots cannot reuse pickle caches. Keep the v2/v3 uncached entry point isolated here and covered by equivalence tests.
+    with _LOAD_GUARD:
+        entries, errors, options = loader._uncached_load_file(filename, None, None, None)
+        # Passing extra_validations to affected Beancount versions mutates their global validation list on every call. Run the same checks explicitly after the loader's basic checks.
+        with timed("bean-check hardcore validation"):
+            for check in validation.HARDCORE_VALIDATIONS:
+                errors.extend(check(entries, options))
+    return entries, errors, options
 
 
 def load_ledger_texts(texts: dict[str, str], root: str, required_file: str | None = None):
@@ -27,10 +45,7 @@ def load_ledger_texts(texts: dict[str, str], root: str, required_file: str | Non
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
         with timed("bean-check parse and validation"):
-            entries, errors, options = loader.load_file(
-                str(Path(directory, root)),
-                extra_validations=validation.HARDCORE_VALIDATIONS,
-            )
+            entries, errors, options = _load_complete_file(str(Path(directory, root)))
         # Keep diagnostics useful after the temporary snapshot is removed.
         for index, error in enumerate(errors):
             source = dict(error.source or {})

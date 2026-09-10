@@ -4,6 +4,8 @@ Use synthetic fixtures only. Do not copy real journals, prompts, screenshots, na
 
 The automated suites use explicit fake settings and mocked external services. Do not attach real config files, ledgers or test output containing personal data to commits or CI artifacts.
 
+`../scripts/benchmark_ledger.py` is an offline performance comparison using generated transactions and temporary files. It never loads deployment configuration or personal journals. The baseline and optimized loader each run in a separate process with identical basic-validation state before every sample, so repeated extra-validation registration does not inflate the baseline. Timing results are evidence for that environment, not a universal performance threshold.
+
 `../scripts/preview_llm.py` is a manual integration preview, not an offline unit test. It requires `--live`, reads local configuration, the configured ledger and `user.md`, and sends input and context to the configured LLM. Use a dedicated test configuration and synthetic ledger; do not run it in CI. It does not write journals.
 
 Cleaning current fixtures does not remove data from Git history. Any history rewrite needs separate coordination; rotate credentials if they were exposed.

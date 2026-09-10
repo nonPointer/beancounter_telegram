@@ -18,6 +18,9 @@ from beancounter.settings import Settings
 from beancounter.dispatch import Dispatcher
 from beancounter.state_store import StateStore
 from beancounter.ledger_validation import check_ledger, load_ledger_texts
+from beancounter.ledger_validation import _load_complete_file
+from beancount import loader
+from beancount.ops import validation
 from test_bot import MOCK_CONFIG, FakeGitHub
 
 
@@ -260,6 +263,77 @@ class TestExplicitSettings(unittest.TestCase):
                 self.assertEqual(message.count("Invalid token: 'invalid'"), 10)
                 self.assertIn("main.bean:10:", message)
                 self.assertNotIn("ledger_check_", message)
+
+
+class TestCompleteValidationPerformance(unittest.TestCase):
+    ACCOUNTS = "2000-01-01 open Assets:Cash GBP\n2000-01-01 open Expenses:Food GBP\n2000-01-01 open Equity:Opening GBP\n"
+    ENTRY = '2000-01-02 * "Synthetic"\n  Assets:Cash -5 GBP\n  Expenses:Food 5 GBP\n'
+
+    def test_repeated_checks_do_not_accumulate_validations(self):
+        original = tuple(validation.VALIDATIONS)
+        original_basic = tuple(validation.BASIC_VALIDATIONS)
+        with patch.object(validation, "HARDCORE_VALIDATIONS", [MagicMock(wraps=validation.validate_data_types)]) as checks:
+            for _ in range(5):
+                _, errors, _ = load_ledger_texts({"main.bean": self.ACCOUNTS + self.ENTRY}, "main.bean")
+                self.assertEqual(errors, [])
+        self.assertEqual(checks[0].call_count, 5)
+        self.assertEqual(tuple(validation.VALIDATIONS), original)
+        self.assertEqual(tuple(validation.BASIC_VALIDATIONS), original_basic)
+
+    def test_concurrent_checks_do_not_accumulate_validations(self):
+        from concurrent.futures import ThreadPoolExecutor
+        original = tuple(validation.VALIDATIONS)
+        original_directory = os.getcwd()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: load_ledger_texts({"main.bean": self.ACCOUNTS + self.ENTRY}, "main.bean"), range(12)))
+        self.assertTrue(all(not errors for _, errors, _ in results))
+        self.assertEqual(tuple(validation.VALIDATIONS), original)
+        self.assertEqual(os.getcwd(), original_directory)
+
+    def test_disposable_snapshot_does_not_write_pickle_cache(self):
+        uncached = loader._uncached_load_file
+        always_cache = loader.pickle_cache_function(lambda name: name + ".picklecache", -1, uncached)
+        with patch.object(loader, "_load_file", always_cache), patch.object(loader.pickle, "dump") as dumped:
+            check_ledger({"main.bean": self.ACCOUNTS + self.ENTRY}, "main.bean")
+        dumped.assert_not_called()
+
+    def test_result_matches_full_bean_check_including_errors_and_options(self):
+        cases = [
+            self.ENTRY,
+            self.ENTRY.replace("Food 5", "Food 6"),
+            self.ENTRY.replace("Assets:Cash", "Assets:Missing"),
+            self.ENTRY + "2000-01-03 balance Assets:Cash 10 GBP\n",
+            "2000-01-02 pad Assets:Cash Equity:Opening\n2000-01-03 balance Assets:Cash 10 GBP\n",
+            "2000-01-01 commodity invalid\n",
+            'plugin "missing_synthetic_test_plugin"\n' + self.ENTRY,
+            '2000-01-01 open Assets:Shares DEMO\n2000-01-02 * "Buy"\n  Assets:Shares 2 DEMO {3 GBP}\n  Assets:Cash -6 GBP\n',
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "main.bean")
+            nested = Path(directory, "journal.bean")
+            root.write_text('option "title" "Synthetic benchmark"\ninclude "journal.bean"\n' + self.ACCOUNTS, encoding="utf-8")
+            for journal in cases:
+                with self.subTest(journal=journal):
+                    nested.write_text(journal, encoding="utf-8")
+                    # The reference call may append to VALIDATIONS; isolate that known library side effect from the optimized call.
+                    with patch.object(validation, "VALIDATIONS", list(validation.VALIDATIONS)):
+                        reference = loader.load_file(str(root), extra_validations=validation.HARDCORE_VALIDATIONS)
+                    actual = _load_complete_file(str(root))
+                    self.assertEqual(actual[:2], reference[:2])
+                    # DisplayContext has identity equality; compare its precision summary and all other options by value.
+                    actual_options, reference_options = dict(actual[2]), dict(reference[2])
+                    self.assertEqual(str(actual_options.pop("dcontext")), str(reference_options.pop("dcontext")))
+                    self.assertEqual(actual_options, reference_options)
+
+    def test_hardcore_check_still_rejects_invalid_plugin_output(self):
+        import types
+        from beancount.core.data import Transaction
+        plugin = types.ModuleType("synthetic_type_error_plugin")
+        plugin.__plugins__ = ("invalidate_flag",)
+        plugin.invalidate_flag = lambda entries, options: ([entry._replace(flag=123) if isinstance(entry, Transaction) else entry for entry in entries], [])
+        with patch.dict(sys.modules, {plugin.__name__: plugin}):
+            with self.assertRaisesRegex(ValueError, "Invalid data types"):
+                check_ledger({"main.bean": f'plugin "{plugin.__name__}"\n' + self.ACCOUNTS + self.ENTRY}, "main.bean")
 
 
 class TestEntryReuse(unittest.TestCase):

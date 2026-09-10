@@ -39,3 +39,7 @@ jobs:
 
       - name: test_reports
         run: python tests/test_reports.py
+
+      - name: Synthetic ledger performance comparison
+        if: matrix.python == '3.12' && matrix.beancount == '>=3,<4'
+        run: python scripts/benchmark_ledger.py
