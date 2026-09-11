@@ -126,17 +126,17 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
             if is_invest:
                 log(f"Processing investment order screenshot (caption: {caption!r})")
                 appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, caption, datetime_str)
-                draft_label, user_input = "Investment order draft", caption or "(investment order screenshot)"
+                draft_label, user_input = "投资草稿", caption or "(investment order screenshot)"
                 commit_prefix = 'Add investment entry by Telegram Bot\n\n'
             else:
                 log(f"Processing expense screenshot (caption: {caption!r})")
                 appendix = self.call_openai_vision_expense(image_bytes, accounts, date_str, caption, datetime_str)
-                draft_label, user_input = "Expense screenshot draft", caption or "(expense screenshot)"
+                draft_label, user_input = "消费草稿", caption or "(expense screenshot)"
                 commit_prefix = 'Add entry by Telegram Bot\n\n'
 
             self.publish_llm_draft(
                 chat_id, appendix, commit_prefix, user_input, date_str,
-                header=f"{draft_label}:", prompt=caption, photo_file_id=file_id,
+                header=f"{draft_label}：", prompt=caption, photo_file_id=file_id,
             )
         except Exception as e:
             log(f"Photo processing failed: {e}")

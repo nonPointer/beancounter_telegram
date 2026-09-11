@@ -129,9 +129,9 @@ class DraftMixin:
         self._finish_pending(pending_id)
         if pending.get("message_id"):
             self.edit_message_reply_markup(chat_id, pending["message_id"])
-        label = "超时自动确认，已保存" if automatic else "已保存"
+        label = "已自动保存" if automatic else "已保存"
         block, _ = _capped_code_block(appendix, 3800)
-        self.send_message(chat_id, f"{label}（本地检查及输入审核通过）：\n{block}", parse_mode="HTML")
+        self.send_message(chat_id, f"{label}\n{block}", parse_mode="HTML")
         self.send_transaction_report(chat_id, appendix)
 
     def next_pending_id(self) -> str:
@@ -217,7 +217,7 @@ class DraftMixin:
                 pending["auto_confirm"] = False
             self._save_pending_locked()
         block, _ = _capped_code_block(appendix, 3500)
-        result = self.send_message(chat_id, f"{header}\n{block}\n✅ 保存 · 🔧 修改 · ❌ 放弃\n{self.settings.DRAFT_TTL_SECONDS} 秒内无操作将自动确认；仅在本地 bean-check 和输入一致性审核均通过后保存。", reply_markup=self.build_review_buttons(pending_id), parse_mode="HTML")
+        result = self.send_message(chat_id, f"{header}\n{block}\n✅ 保存 · 🔧 修改 · ❌ 放弃\n{self.settings.DRAFT_TTL_SECONDS} 秒无操作自动保存", reply_markup=self.build_review_buttons(pending_id), parse_mode="HTML")
         with self._pending_lock:
             pending = self.pending_llm_entries.get(pending_id)
             if pending is not None:
@@ -273,7 +273,7 @@ class DraftMixin:
             self.publish_llm_draft(
                 chat_id, new_appendix, 'Add entry by Telegram Bot\n\n',
                 pending["user_input"], pending["date_str"],
-                header="LLM rechecked draft:", replaces=(pending_id, pending),
+                header="已修改：", replaces=(pending_id, pending),
             )
         except Exception as e:
             pending["rechecking"] = False

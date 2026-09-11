@@ -97,7 +97,7 @@ class LLMMixin:
             appendix = self.call_openai_compatible(text, accounts, date_str, current_time=current_time, examples=examples, payees=payees, loaded=loaded_ledger)
             self.publish_llm_draft(
                 chat_id, appendix, commit_message, user_input, date_str,
-                header="LLM draft (checked padding):", prompt=text,
+                header="草稿：", prompt=text,
             )
             return
         except Exception as e:

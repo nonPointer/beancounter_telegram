@@ -1753,7 +1753,7 @@ class TestCheckedApproval(unittest.TestCase):
         self.pending["created_at"] = 0
         self.bot.cleanup_expired_drafts()
         self.assertEqual(len(self.gh.commits), 1)
-        self.assertIn("超时自动确认", self.bot.send_message.call_args.args[1])
+        self.assertIn("已自动保存", self.bot.send_message.call_args.args[1])
 
     def test_unbalanced_entry_is_blocked_before_review(self):
         self.pending["appendix"] = self.entry.replace("Food 5", "Food 6")

@@ -58,7 +58,7 @@ class ReportMixin:
             if expense_rows:
                 expense_rows.append(("合计", _amounts(total)))
             expense_text = format_query_result([("类别", str), ("金额", str)], expense_rows) if expense_rows else "本月暂无开支。"
-            tables = [(f"{first_day:%Y-%m} 分类开支（按成本计，多币种分别列示）", expense_text)]
+            tables = [(f"{first_day:%Y-%m} 分类开支", expense_text)]
             if accounts:
                 # Account names come from parsed postings, and equality excludes subaccounts.
                 predicate = " OR ".join(f"account = '{account}'" for account in accounts)
@@ -68,10 +68,10 @@ class ReportMixin:
                 by_account = dict(balances)
                 labels = _account_labels(accounts)
                 rows = [(labels[account], _amounts(by_account.get(account, Inventory()))) for account in accounts]
-                tables.append(("本笔交易涉及的账户余额（账本全部日期，原币种／持仓单位）",
+                tables.append(("账户余额",
                                format_query_result([("账户", str), ("余额", str)], rows)))
             else:
-                tables.append(("本笔交易涉及的账户余额", "本笔交易未涉及 Assets／Liabilities 账户。"))
+                tables.append(("账户余额", "未涉及资产或负债账户。"))
             return tables
 
     def send_transaction_report(self, chat_id, appendix):
