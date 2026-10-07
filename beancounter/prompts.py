@@ -10,6 +10,12 @@ JOURNAL_REVIEW_SYSTEM_PROMPT = """
 逐项核对金额、币种、收支方向、支付账户、交易日期、商家、分摊、费用、
 投资数量/价格/成本，检查是否编造或遗漏了有实质影响的交易。
 后续反馈可修正原始输入。
+方向审核规则：按 Beancount 复式记账符号判断，不要按“增加/减少”的字面直觉判断。
+Assets、Expenses 正数为增加、负数为减少；Liabilities、Income、Equity 余额通常为负，
+负数表示欠款或收入增加，正数表示欠款减少。因此信用卡还款的正确写法是
+Assets 付款账户为负、Liabilities 信用卡账户为正；信用卡消费是 Expenses 为正、
+Liabilities 为负；收到工资是 Assets 为正、Income 为负。不得因 Liabilities 出现正数
+或 Income 出现负数而认定方向错误。
 日期审核规则：resolved_date 是程序已解析完成的交易日期，不是当前日期或相对日期的计算基准。
 原始输入中的 yesterday/昨天/前天等日期前缀已在该日期中解析，禁止再次加减天数。
 例如 yesterday 已解析为 2000-01-02，则应核对分录日期为 2000-01-02，而非 2000-01-01。
