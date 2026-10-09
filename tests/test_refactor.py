@@ -665,7 +665,7 @@ class TestCleanupExpiredDrafts(unittest.TestCase):
         with patch.object(self.bot, "send_message") as mock_send:
             self.bot.cleanup_expired_drafts()
 
-        self.assertIn("超时自动确认", mock_send.call_args.args[1])
+        self.assertIn("已自动保存", mock_send.call_args.args[1])
 
 
 class TestExtractLastDirectiveBlock(unittest.TestCase):
