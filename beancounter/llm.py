@@ -122,7 +122,7 @@ class LLMMixin:
     def explain_ledger_error(self, entry_text: str, error: str) -> str:
         header = "这条分录没有通过账本校验，尚未保存。"
         try:
-            advice = self._call_llm_backends({"temperature": 0.2, "messages": [
+            advice = self._call_llm_backends({"messages": [
                 {"role": "system", "content": LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT},
                 {"role": "user", "content": build_ledger_error_explanation_prompt(entry_text, error)},
             ]}, "账本校验错误解释")
@@ -147,7 +147,6 @@ class LLMMixin:
         Returns entry (optional payee), query (with BQL), or analysis. Retains the existing entry fallback on router failure; any resulting draft still requires the normal checks before saving.
         """
         payload = {
-            "temperature": 0,
             "messages": [
                 {"role": "system", "content": QUERY_ROUTER_SYSTEM_PROMPT},
                 {"role": "user", "content": build_query_router_prompt(
@@ -198,7 +197,6 @@ class LLMMixin:
                 break
 
             payload = {
-                "temperature": 0,
                 "messages": [
                     {"role": "system", "content": QUERY_ROUTER_SYSTEM_PROMPT},
                     {"role": "user", "content": build_query_router_prompt(
@@ -298,7 +296,6 @@ class LLMMixin:
 
             user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time, examples, payees)
             payload = {
-                "temperature": 0.2,
                 "messages": [
                     {"role": "system", "content": BEANCOUNT_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -333,7 +330,7 @@ class LLMMixin:
 
     def _call_vision_with_retry(
         self, image_bytes: bytes, accounts: list[str],
-        system_prompt: str, base_prompt: str, temperature: float, log_label: str,
+        system_prompt: str, base_prompt: str, log_label: str,
     ) -> str:
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
@@ -372,7 +369,6 @@ class LLMMixin:
                 ]
 
             payload = {
-                "temperature": temperature,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -403,14 +399,14 @@ class LLMMixin:
         return self._call_vision_with_retry(
             image_bytes, accounts, INVEST_ORDER_SYSTEM_PROMPT,
             build_invest_order_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
-            temperature=0.1, log_label="投资截图识别与分录生成",
+            log_label="投资截图识别与分录生成",
         )
 
     def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, EXPENSE_SCREENSHOT_SYSTEM_PROMPT,
             build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
-            temperature=0.2, log_label="消费截图识别与分录生成",
+            log_label="消费截图识别与分录生成",
         )
 
     def review_journal(self, pending: dict, appendix: str):
@@ -443,7 +439,6 @@ class LLMMixin:
             b64 = base64.b64encode(image_bytes).decode("ascii")
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
         raw = self._call_llm_backends({
-            "temperature": 0,
             "messages": [
                 {"role": "system", "content": JOURNAL_REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": content},

@@ -1602,11 +1602,13 @@ class TestVisionRetryDropsImage(unittest.TestCase):
             result = self.bot._call_vision_with_retry(
                 b"\x00\x01imagebytes", ["Assets:Cash"],
                 system_prompt="SYS", base_prompt=base_prompt,
-                temperature=0.1, log_label="vision",
+                log_label="vision",
             )
 
         self.assertEqual(result, "ENTRY")
         self.assertEqual(len(captured_payloads), 2)
+        for payload in captured_payloads:
+            self.assertNotIn("temperature", payload)
 
         # Attempt 0: image present, prompt text present.
         attempt0_content = captured_payloads[0]["messages"][1]["content"]
@@ -1775,7 +1777,7 @@ class TestLedgerValidationRetryLoop(_LedgerFixtureMixin, unittest.TestCase):
              patch.object(self.bot, "load_ledger", return_value=self.loaded):
             result = self.bot._call_vision_with_retry(
                 b"\x00img", self.ACCOUNT_NAMES,
-                system_prompt="SYS", base_prompt="BASE", temperature=0.1, log_label="vision",
+                system_prompt="SYS", base_prompt="BASE", log_label="vision",
             )
         self.assertIn("28 CNY", result)
         self.assertEqual(responses, [])

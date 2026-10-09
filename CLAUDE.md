@@ -100,7 +100,7 @@ Exceptions and HTTP failures restore the draft with automatic confirmation disab
 `/undo` rewrites precomputed content, so a conflict requires a fresh `/undo`.
 
 ### Conversational queries (NL → BQL)
-Single-line text first goes through `route_intent()`, one temperature-0 LLM call that
+Single-line text first goes through `route_intent()`, one LLM call that
 classifies entry-vs-query and, for a query, emits the BQL in the same response
 (`QUERY_ROUTER_SYSTEM_PROMPT`). `load_ledger()` mirrors a complete tree snapshot locally and
 uses `ledger_validation.check_ledger`, which invokes the same loader and hardcore checks as

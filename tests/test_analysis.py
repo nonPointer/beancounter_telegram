@@ -131,6 +131,8 @@ class TestCapability(AnalysisFixture):
         data = request.call_args.args[1]
         self.assertTrue(any(m["role"] == "tool" for m in data["messages"]))
         self.assertNotIn("Assets", json.dumps(data))
+        for call in request.call_args_list:
+            self.assertNotIn("temperature", call.args[1])
         self.bot.load_ledger.assert_not_called()
 
     def test_explicit_rejection_cached(self):
@@ -283,6 +285,7 @@ class TestAnalysisLoop(AnalysisFixture):
         self.assertFalse(self.bot.pending_llm_entries)
         for call in self.bot._request_llm_message.call_args_list:
             self.assertNotIn("tools", call.args[1])
+            self.assertNotIn("temperature", call.args[1])
 
     def test_native_tool_results_returned_to_model(self):
         self.run_analysis([tool_message(), FINAL], native=True)

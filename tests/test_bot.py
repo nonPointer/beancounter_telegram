@@ -1468,6 +1468,7 @@ class TestIntentRouting(unittest.TestCase):
         b = self._bot('{"intent": "query", "bql": "SELECT date"}')
         self.addCleanup(b.close)
         self.assertEqual(b.route_intent("最近10条", "2026-07-17")["intent"], "query")
+        self.assertNotIn("temperature", b._call_llm_backends.call_args.args[0])
 
     def test_entry(self):
         b = self._bot('{"intent": "entry"}')
@@ -1731,6 +1732,7 @@ class TestCheckedApproval(unittest.TestCase):
         self.assertTrue(context["journal"].startswith(date_str))
         self.assertIn("禁止再次加减天数", payload["messages"][0]["content"])
         self.assertIn("不是交易发生时间", payload["messages"][0]["content"])
+        self.assertNotIn("temperature", payload)
         self.assertEqual(len(self.gh.commits), 1)
 
         # Retrying a persisted payload must preserve the same provenance.

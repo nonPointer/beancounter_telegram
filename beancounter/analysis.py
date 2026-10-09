@@ -140,7 +140,7 @@ class AnalysisMixin:
             return cached[0]
         # No user.md, account names or ledger data belongs in this probe.
         messages = [{"role": "user", "content": "Call capability_probe exactly once with {}. Do not answer in text yet."}]
-        payload = {"messages": messages, "tools": [PROBE_TOOL], "temperature": 0}
+        payload = {"messages": messages, "tools": [PROBE_TOOL]}
         try:
             message = self._analysis_request(backend, payload, deadline, "工具能力探测")
             try:
@@ -212,7 +212,7 @@ class AnalysisMixin:
                     if final_only:
                         messages.append({"role": "user", "content": "查询预算已用完。不要再查询，基于已有结果输出最终 JSON；不足之处请明确说明。"})
                     turns += 1
-                    payload = self._with_user_preferences({"temperature": 0, "messages": messages})
+                    payload = self._with_user_preferences({"messages": messages})
                     if native:
                         payload["tools"] = [QUERY_TOOL]
                     try:
