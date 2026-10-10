@@ -99,6 +99,12 @@ A stable `; telegram-operation: <uuid>` marker reconciles a PUT whose response w
 Exceptions and HTTP failures restore the draft with automatic confirmation disabled.
 `/undo` rewrites precomputed content, so a conflict requires a fresh `/undo`.
 
+`_check_commit_candidate` keeps the last passing pre-commit check in one slot keyed by a SHA-256 digest of the root and every candidate file. Only a byte-identical candidate checked within `DRAFT_TTL_SECONDS` reuses it; any ledger or draft change, an older result, and every failed check run the full check again. This does not let the generation-stage check stand in for the commit gate.
+
+Once a draft is published, `_precheck_commit` runs that same check in a single background thread on the exact bytes a save would write (current journal, operation marker, `_commit_appendix`), so the cost overlaps with the user reading the draft. The save still downloads the current snapshot, rebuilds the candidate and compares digests; it reuses the precheck only when nothing changed. A save arriving mid-precheck waits on `_commit_check_lock` instead of repeating it. Prechecks are best effort, never mutate the draft, never notify the user, and are enabled only by `start()`, so offline tests do not start background ledger work. This is the accepted meaning of a "fresh" commit check: identical bytes, checked no longer ago than one draft lifetime.
+
+The program-supplied `datetime` metadata is the time the user sent the prompt (`prompt_time`, from the Telegram message date, kept across feedback regeneration), not the save time. It applies only when the entry has no `datetime` of its own. Drafts persisted before `prompt_time` existed fall back to the save time and are not prechecked.
+
 ### Conversational queries (NL → BQL)
 Single-line text first goes through `route_intent()`, one LLM call that
 classifies entry-vs-query and, for a query, emits the BQL in the same response

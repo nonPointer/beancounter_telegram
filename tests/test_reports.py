@@ -165,6 +165,84 @@ class TestReports(unittest.TestCase):
         self.assertNotIn("1", self.bot.pending_llm_entries)
         self.assertIn("无需重复记账", self.bot.send_message.call_args.args[1])
 
+    def test_retry_after_review_rejection_reuses_identical_candidate_check(self):
+        pending = self.pending()
+        self.bot.review_journal.side_effect = [ValueError("synthetic rejection"), None]
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
+            with self.assertRaises(ValueError):
+                self.bot.commit_llm_entry(pending)
+            self.bot.commit_llm_entry(pending)
+        commit_check.assert_called_once()
+        self.assertEqual(self.bot.review_journal.call_count, 2)
+        self.assertEqual(self.puts, 1)
+
+    def test_retry_rechecks_when_ledger_changed_or_check_failed(self):
+        pending = self.pending()
+        self.bot.review_journal.side_effect = [ValueError("synthetic rejection"), None]
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
+            with self.assertRaises(ValueError):
+                self.bot.commit_llm_entry(pending)
+            self.texts["accounts.bean"] = ACCOUNTS + "2026-09-09 close Assets:Cash\n"
+            self.tree = "account-closed"
+            for _ in range(2):  # A failed check is never cached.
+                with self.assertRaisesRegex(ValueError, "bean-check failed"):
+                    self.bot.commit_llm_entry(pending)
+        self.assertEqual(commit_check.call_count, 3)
+        self.assertEqual(self.puts, 0)
+
+    def _published(self):
+        pending = self.pending()
+        self.bot.pending_llm_entries["1"] = pending
+        return pending
+
+    def test_precheck_while_reading_is_reused_by_save(self):
+        pending = self._published()
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
+            self.bot._precheck_commit("1", pending)
+            self.assertNotIn("commit_appendix", pending)
+            self.assertEqual(self.puts, 0)
+            self.bot.commit_llm_entry(pending)
+        commit_check.assert_called_once()
+        self.assertEqual(self.puts, 1)
+        self.assertIn(f'datetime: "{pending["prompt_time"]}"', self.texts["test.bean"])
+
+    def test_precheck_is_not_reused_for_changed_ledger_or_stale_result(self):
+        pending = self._published()
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
+            self.bot._precheck_commit("1", pending)
+            self.texts["test.bean"] += '\n2026-09-08 * "Other writer"\n  Expenses:Food:Cafe 2 GBP\n  Assets:Cash -2 GBP\n'
+            self.tree = "other-writer"
+            self.bot._precheck_commit("1", pending)
+            self.assertEqual(commit_check.call_count, 2)
+            digest, checked, checked_at = self.bot._commit_check_cache
+            self.bot._commit_check_cache = (digest, checked, checked_at - self.bot.settings.DRAFT_TTL_SECONDS - 1)
+            self.bot.commit_llm_entry(pending)
+        self.assertEqual(commit_check.call_count, 3)
+        self.assertEqual(self.puts, 1)
+
+    def test_precheck_skips_discarded_draft_and_contains_failures(self):
+        pending = self.pending()
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
+            self.bot._precheck_commit("1", pending)  # Not pending any more.
+            commit_check.assert_not_called()
+            bad = self.pending('2026-09-10 * "Unbalanced"\n  Expenses:Food:Cafe 5 GBP\n  Assets:Cash -4 GBP')
+            self.bot.pending_llm_entries["2"] = bad
+            self.bot._precheck_commit("2", bad)
+            commit_check.assert_called_once()
+        self.assertIsNone(self.bot._commit_check_cache[0])
+        self.assertIn("2", self.bot.pending_llm_entries)
+        with self.assertRaisesRegex(ValueError, "bean-check failed"):
+            self.bot.commit_llm_entry(bad)
+
+    def test_publish_schedules_precheck_only_while_polling(self):
+        self.bot._prechecks = MagicMock()
+        self.bot.publish_llm_draft(123, ENTRY, "msg", "Lunch 5 GBP", "2026-09-10", header="草稿：")
+        self.bot._prechecks.submit.assert_not_called()
+        self.bot._precheck_enabled = True
+        pid = self.bot.publish_llm_draft(123, ENTRY, "msg", "Lunch 5 GBP", "2026-09-10", header="草稿：")
+        self.bot._prechecks.submit.assert_called_once_with(
+            self.bot._precheck_commit, pid, self.bot.pending_llm_entries[pid])
+
     def test_changed_remote_texts_must_be_rechecked(self):
         self.bot.commit_llm_entry(self.pending())
         self.texts["test.bean"] += '\n2026-09-11 * "Other writer"\n  Expenses:Food:Cafe 2 GBP\n  Assets:Cash -2 GBP\n'

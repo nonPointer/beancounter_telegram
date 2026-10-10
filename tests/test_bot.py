@@ -1700,13 +1700,29 @@ class TestCheckedApproval(unittest.TestCase):
             "id": "cb", "data": f"{action}:1",
             "message": {"chat": {"id": 123}, "message_id": 7}}})
 
+    def test_datetime_records_when_the_prompt_was_sent(self):
+        self.bot._handler_context.message_date = 1782993600  # 2026-07-02T12:00:00Z
+        self.addCleanup(setattr, self.bot._handler_context, "message_date", None)
+        self.bot.send_message = MagicMock(return_value={"ok": True, "result": {"message_id": 9}})
+        pid = self.bot.publish_llm_draft(123, self.entry, "entry", "现金买咖啡 5 GBP", "2026-07-01", header="草稿：")
+        first = self.bot.pending_llm_entries[pid]
+        self.assertEqual(first["prompt_time"], "2026-07-02T12:00:00+00:00")
+        # Feedback arrives in a later update; the regenerated draft keeps the original prompt time.
+        self.bot._handler_context.message_date = 1782993900
+        replaced = self.bot.publish_llm_draft(123, self.entry, "entry", "现金买咖啡 5 GBP", "2026-07-01",
+                                              header="草稿：", replaces=(pid, first))
+        pending = self.bot.pending_llm_entries[replaced]
+        self.assertEqual(pending["prompt_time"], "2026-07-02T12:00:00+00:00")
+        self.bot.commit_llm_entry(pending)
+        self.assertIn('  datetime: "2026-07-02T12:00:00+00:00"', self.gh.content)
+
     def test_manual_confirmation_checks_and_commits(self):
         self.approve()
         self.assertEqual(len(self.gh.commits), 1)
         self.assertNotIn("1", self.bot.pending_llm_entries)
         self.bot._call_llm_backends.assert_called_once()
 
-    def test_relative_date_review_distinguishes_save_timestamp(self):
+    def test_relative_date_review_distinguishes_prompt_timestamp(self):
         import json
         from datetime import datetime
         from beancounter.bot_utils import parse_natural_date
@@ -1721,9 +1737,8 @@ class TestCheckedApproval(unittest.TestCase):
             '  Assets:Cash 5 GBP\n  Expenses:Food -5 GBP'
         )
         stamp = "2026-07-02T12:00:00+00:00"
-        with patch("beancounter.drafts.datetime") as clock:
-            clock.now.return_value.isoformat.return_value = stamp
-            self.approve()
+        self.pending["prompt_time"] = stamp
+        self.approve()
         payload = self.bot._call_llm_backends.call_args.args[0]
         context = json.loads(payload["messages"][1]["content"][0]["text"])
         self.assertEqual(context["original_input"], original)

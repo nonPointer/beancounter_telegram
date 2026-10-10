@@ -72,6 +72,11 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         self._ledger_cache = {"tree_sha": None, "entries": None, "options_map": None}
         self._ledger_cache_lock = threading.Lock()
         self._snapshot_cache = (None, None)
+        # Last passing pre-commit check, keyed by a digest of the complete candidate texts.
+        self._commit_check_cache = (None, None, 0.0)
+        self._commit_check_lock = threading.Lock()
+        self._prechecks = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit-precheck")
+        self._precheck_enabled = False  # Background ledger work starts with the polling loop.
         self._account_files = {}
         self._snapshot_lock = threading.RLock()
         self._accounts_refresh_lock = threading.Lock()

@@ -185,6 +185,7 @@ class TelegramMixin:
         def guarded():
             log(f"Timing [queue wait {token}]: {time.monotonic() - queued_at:.3f}s")
             self._handler_context.update_id = uid
+            self._handler_context.message_date = (update.get("message") or {}).get("date")
             if uid is not None:
                 self.state.begin(uid)
             try:
@@ -205,6 +206,7 @@ class TelegramMixin:
                 if uid is not None:
                     self.state.finish(uid)
                 self._handler_context.update_id = None
+                self._handler_context.message_date = None
 
         return self.dispatcher.submit(chat_id, token, guarded)
 
@@ -241,6 +243,7 @@ class TelegramMixin:
         self.cleanup_expired_drafts()
 
     def start(self):
+        self._precheck_enabled = True
         next_registration = 0
         while not self.stop.is_set():
             try:
@@ -259,6 +262,7 @@ class TelegramMixin:
         if not self._closed:
             self.stop.set()
             self.dispatcher.close()
+            self._prechecks.shutdown(wait=True, cancel_futures=True)
             self._downloads.shutdown(wait=True)
             self._save_pending()
             self.state.close()

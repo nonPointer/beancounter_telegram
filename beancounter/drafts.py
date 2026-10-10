@@ -2,6 +2,7 @@
 
 from .ledger_validation import check_ledger
 from datetime import datetime
+import hashlib
 import requests
 import time
 import uuid
@@ -9,6 +10,15 @@ from .bot_utils import (
     GITHUB_CONFLICT_RETRIES, _capped_code_block, _code_block, _is_account_error, log, timed,
 )
 from .bot_utils import LedgerValidationError
+
+def _texts_digest(texts: dict, root: str) -> str:
+    digest = hashlib.sha256(root.encode("utf-8"))
+    for path in sorted(texts):
+        for part in (path, texts[path]):
+            data = part.encode("utf-8")
+            digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
 
 class DraftMixin:
     def publish_llm_draft(self, chat_id, appendix, commit_message, user_input, date_str,
@@ -26,6 +36,8 @@ class DraftMixin:
             if replaces:
                 previous_id, previous = replaces
                 pending["feedback"] = previous.get("feedback", [])
+                # Feedback regenerates the same transaction; keep the original prompt time.
+                pending["prompt_time"] = previous.get("prompt_time", pending["prompt_time"])
                 photo_file_id = previous.get("photo_file_id")
                 self.pending_llm_entries.pop(previous_id)
             if photo_file_id:
@@ -34,6 +46,8 @@ class DraftMixin:
             self._save_pending_locked()
         log(f"{header}\n{appendix}")
         self.send_draft_for_review(chat_id, header, appendix, pending_id)
+        if self._precheck_enabled and not self.stop.is_set():
+            self._prechecks.submit(self._precheck_commit, pending_id, pending)
         return pending_id
 
     def _save_pending_locked(self):
@@ -60,7 +74,11 @@ class DraftMixin:
             self._save_pending_locked()
 
     def _make_pending_entry(self, chat_id: int, appendix: str, commit_message: str, user_input: str, date_str: str) -> dict:
+        sent = getattr(self._handler_context, "message_date", None)
+        prompt_time = datetime.fromtimestamp(sent, self.timezone) if isinstance(sent, (int, float)) else datetime.now(self.timezone)
         return {
+            # When the user sent the prompt; recorded as datetime metadata unless the entry has one.
+            "prompt_time": prompt_time.isoformat(timespec="seconds"),
             "kind": "llm",
             "operation_id": (f"update-{self._handler_context.update_id}"
                              if getattr(self._handler_context, "update_id", None) is not None else uuid.uuid4().hex),
@@ -77,8 +95,7 @@ class DraftMixin:
         """Revalidate each immutable snapshot; a stable marker reconciles uncertain PUTs."""
         operation_id = pending.setdefault("operation_id", uuid.uuid4().hex)
         marker = f'; telegram-operation: {operation_id}'
-        appendix = pending.setdefault("commit_appendix", self.ensure_datetime_metadata(
-            pending["appendix"], datetime.now(self.timezone).isoformat(timespec="seconds")))
+        appendix = pending.setdefault("commit_appendix", self._commit_appendix(pending))
         self._save_pending()  # Persist the stable payload before a potentially ambiguous PUT.
         reviewed = False
         for _ in range(GITHUB_CONFLICT_RETRIES):
@@ -86,9 +103,8 @@ class DraftMixin:
             current = files[self.settings.FILE_PATH]
             if marker in current["content"].splitlines():
                 return appendix
-            texts = {path: f["content"] for path, f in files.items()}
-            texts[self.settings.FILE_PATH] = current["content"] + "\n" + marker + "\n" + appendix + "\n"
-            checked = check_ledger(texts, self._ledger_root(texts), self.settings.FILE_PATH)
+            texts = self._commit_candidate(files, marker, appendix)
+            checked = self._check_commit_candidate(texts)
             if not reviewed:
                 if not self.parse_accounts():
                     raise ValueError("无法取得账户上下文，未提交。")
@@ -112,6 +128,45 @@ class DraftMixin:
             if status not in (409, 422):
                 raise ValueError(f"GitHub 提交失败（HTTP {status}）。")
         raise ValueError("账本正在被其他操作修改，请重试。")
+
+    def _commit_appendix(self, pending: dict) -> str:
+        # Drafts persisted before prompt_time existed fall back to the save time.
+        return pending.get("commit_appendix") or self.ensure_datetime_metadata(
+            pending["appendix"], pending.get("prompt_time") or datetime.now(self.timezone).isoformat(timespec="seconds"))
+
+    def _commit_candidate(self, files: dict, marker: str, appendix: str) -> dict:
+        texts = {path: f["content"] for path, f in files.items()}
+        texts[self.settings.FILE_PATH] = files[self.settings.FILE_PATH]["content"] + "\n" + marker + "\n" + appendix + "\n"
+        return texts
+
+    def _check_commit_candidate(self, texts: dict) -> tuple[list, dict]:
+        """Full check of one candidate; only a recent byte-identical candidate reuses a pass."""
+        root = self._ledger_root(texts)
+        digest = _texts_digest(texts, root)
+        # A save arriving during the precheck of the same candidate waits for it instead of repeating it.
+        with self._commit_check_lock:
+            cached_digest, checked, checked_at = self._commit_check_cache
+            if cached_digest == digest and time.monotonic() - checked_at <= self.settings.DRAFT_TTL_SECONDS:
+                log("Commit bean-check reused for an identical candidate ledger.")
+                return checked
+            checked = check_ledger(texts, root, self.settings.FILE_PATH)
+            # Failures raise above and are never cached; one slot bounds memory.
+            self._commit_check_cache = (digest, checked, time.monotonic())
+            return checked
+
+    def _precheck_commit(self, pending_id: str, pending: dict):
+        """Check the exact bytes a save would write while the user reads the draft."""
+        try:
+            with self._pending_lock:
+                if self.stop.is_set() or "prompt_time" not in pending or self.pending_llm_entries.get(pending_id) is not pending:
+                    return
+            _, files = self._download_ledger_snapshot()
+            marker = f'; telegram-operation: {pending["operation_id"]}'
+            with timed("commit precheck"):
+                self._check_commit_candidate(self._commit_candidate(files, marker, self._commit_appendix(pending)))
+        except Exception as exc:
+            # Best effort: the save runs the same check and reports the failure to the user.
+            log(f"Commit precheck did not pass ({type(exc).__name__}: {str(exc)[:200]}).")
 
     def approve_pending(self, pending_id: str, pending: dict, automatic: bool = False):
         """The caller owns the claimed draft; all failures retain it for explicit retry."""
