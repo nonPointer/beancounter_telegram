@@ -10,6 +10,7 @@ import requests
 from .analysis_query import QuerySession
 from .bot_utils import _capped_code_block, _utf16_len, extract_json_object, log
 from .prompts import BQL_REFERENCE, build_query_router_prompt
+from .settings import llm_headers
 
 
 MAX_QUERY_ROUNDS = 4
@@ -42,7 +43,8 @@ ANALYSIS_PROMPT = """你是只读账本分析助手。按需查询，再用结�
 
 def _key(backend):
     # Scope to credentials as well as endpoint/model; never log this key.
-    return backend["base_url"], backend["model"], backend["api_key"]
+    headers = tuple(sorted((name.lower(), value) for name, value in llm_headers(backend).items()))
+    return backend["base_url"], backend["model"], backend["api_key"], headers
 
 
 def _unsupported_tools(exc):
@@ -122,6 +124,8 @@ class AnalysisMixin:
                 pass
         secrets = [self.settings.GITHUB_TOKEN, self.settings.TELEGRAM_BOT_TOKEN]
         secrets.extend(backend["api_key"] for backend in self.settings.LLM_BACKENDS)
+        secrets.extend(value for backend in self.settings.LLM_BACKENDS
+                       for value in backend.get("headers", {}).values() if value)
         for secret in sorted(set(secrets), key=len, reverse=True):
             if secret:
                 detail = detail.replace(secret, "[REDACTED]")

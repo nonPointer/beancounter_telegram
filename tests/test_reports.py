@@ -3,6 +3,7 @@
 import hashlib
 import os
 import sys
+import time
 import unittest
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
@@ -89,6 +90,128 @@ class TestReports(unittest.TestCase):
     def pending(self, appendix=ENTRY):
         return self.bot._make_pending_entry(123, appendix, "Save synthetic entry", "Lunch 5 GBP", "2026-09-10")
 
+    def send_manual(self, currency="GBP"):
+        self.bot.send_transaction_report = MagicMock()
+        self.bot._call_llm_backends = MagicMock(side_effect=AssertionError("manual journal needs no LLM"))
+        self.bot.handle_message({"message": {"chat": {"id": 123}, "text": (
+            f"2026-09-10\nSynthetic Cafe\nManual purchase\n"
+            f"Expenses:Food:Cafe 5 {currency}\nAssets:Cash -5 {currency}"
+        )}})
+
+    def test_manual_journal_checks_exact_full_candidate_before_writing(self):
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as check:
+            self.send_manual()
+        self.assertEqual(self.puts, 1)
+        check.assert_called_once()
+        self.assertEqual(check.call_args.args[0], self.texts)
+        self.assertIn("Manual purchase", self.texts["test.bean"])
+        self.bot._call_llm_backends.assert_not_called()
+        # The checked snapshot can also serve the subsequent report/query.
+        with patch("beancounter.ledger.check_ledger", side_effect=AssertionError("must reuse exact texts")):
+            entries, _ = self.bot.load_ledger()
+        self.assertTrue(any(getattr(entry, "narration", None) == "Manual purchase" for entry in entries))
+
+    def test_manual_journal_blocks_currency_disallowed_by_account(self):
+        self.send_manual(currency="CNY")
+        self.assertEqual(self.puts, 0)
+        self.assertIn("账本校验未通过，尚未保存", self.bot.send_message.call_args.args[1])
+        self.bot.send_transaction_report.assert_not_called()
+
+    def test_manual_journal_blocks_closed_account_despite_cached_name_match(self):
+        self.texts["accounts.bean"] += "2026-09-09 close Assets:Cash\n"
+        self.send_manual()
+        self.assertEqual(self.puts, 0)
+        self.assertIn("bean-check failed", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_blocks_errors_elsewhere_in_complete_ledger(self):
+        self.texts["accounts.bean"] += "2000-01-01 commodity invalid\n"
+        self.send_manual()
+        self.assertEqual(self.puts, 0)
+        self.assertIn("accounts.bean", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_requires_root_to_include_target(self):
+        self.bot.settings.LEDGER_ROOT = "root.bean"
+        self.texts["root.bean"] = 'include "accounts.bean"\n'
+        self.send_manual()
+        self.assertEqual(self.puts, 0)
+        self.assertIn("does not include journal", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_blocks_incomplete_download(self):
+        self.bot._download_blob.side_effect = ConnectionError("synthetic download failure")
+        self.send_manual()
+        self.assertEqual(self.puts, 0)
+        self.assertIn("无法获取完整账本，尚未保存", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_conflict_rebuilds_and_checks_again(self):
+        attempts = []
+
+        def conflicting_put(content, sha, message, file_path=None):
+            attempts.append(content)
+            if len(attempts) == 1:
+                self.texts["test.bean"] += '\n2026-09-09 * "Concurrent entry"\n  Assets:Cash -1 GBP\n  Expenses:Food:Cafe 1 GBP\n'
+                self.tree = "concurrent"
+                return False, 409
+            return self.put(content, sha, message, file_path)
+
+        self.bot._github_put_file = conflicting_put
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as check:
+            self.send_manual()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.puts, 1)
+        self.assertIn("Concurrent entry", self.texts["test.bean"])
+        self.assertEqual(self.texts["test.bean"].count("Manual purchase"), 1)
+
+    def test_manual_journal_rechecks_other_files_changed_during_validation(self):
+        listing = self.bot._list_bean_files.side_effect
+        calls = []
+
+        def changed_listing():
+            calls.append(True)
+            if len(calls) == 2:
+                self.texts["accounts.bean"] += "2026-09-09 close Assets:Cash\n"
+                self.tree = "closed-during-check"
+            return listing()
+
+        self.bot._list_bean_files.side_effect = changed_listing
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as check:
+            self.send_manual()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(self.puts, 0)
+        self.assertIn("账本校验未通过", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_conflict_cannot_bypass_a_new_validation_error(self):
+        attempts = []
+
+        def conflicting_put(*args):
+            attempts.append(args)
+            self.texts["accounts.bean"] += "2026-09-09 close Assets:Cash\n"
+            self.tree = "closed-after-conflict"
+            return False, 409
+
+        self.bot._github_put_file = conflicting_put
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as check:
+            self.send_manual()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.puts, 0)
+        self.assertIn("账本校验未通过", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_requires_version_confirmation_after_validation(self):
+        listed = self.bot._list_bean_files()
+        self.bot._list_bean_files.side_effect = [listed, None]
+        self.send_manual()
+        self.assertEqual(self.puts, 0)
+        self.assertIn("无法确认账本版本，尚未保存", self.bot.send_message.call_args.args[1])
+
+    def test_manual_journal_replay_does_not_duplicate_a_successful_write(self):
+        self.bot._handler_context.update_id = 1234
+        self.send_manual()
+        self.send_manual()
+        self.assertEqual(self.puts, 1)
+        self.assertEqual(self.texts["test.bean"].count("telegram-update: 1234"), 1)
+        self.assertEqual(self.texts["test.bean"].count("Manual purchase"), 1)
+
     def test_month_categories_refunds_currencies_and_exact_account_balance(self):
         self.texts["test.bean"] += ENTRY + "\n"
         tables = self.bot.transaction_report_tables(ENTRY, today=date(2026, 9, 10))
@@ -143,12 +266,14 @@ class TestReports(unittest.TestCase):
         self.assertEqual(self.bot.send_message.call_count, 3)
         self.assertIn("已保存", self.bot.send_message.call_args_list[0].args[1])
 
-    def test_manual_save_reports_load_once_for_both_queries(self):
-        with patch("beancounter.ledger.check_ledger", wraps=check_ledger) as checked:
+    def test_manual_save_reports_reuse_precommit_check_for_both_queries(self):
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as checked, \
+             patch("beancounter.ledger.check_ledger", wraps=check_ledger) as context_check:
             self.bot.handle_message({"message": {"chat": {"id": 123},
                 "text": "Cafe\nLunch\nAssets:Cash -5 GBP\nExpenses:Food:Cafe 5 GBP"}})
         self.assertEqual(self.puts, 1)
         checked.assert_called_once()
+        context_check.assert_not_called()
         self.assertEqual(self.bot.send_message.call_count, 3)
 
     def test_failed_save_never_reports(self):
@@ -190,58 +315,96 @@ class TestReports(unittest.TestCase):
         self.assertEqual(commit_check.call_count, 3)
         self.assertEqual(self.puts, 0)
 
-    def _published(self):
-        pending = self.pending()
-        self.bot.pending_llm_entries["1"] = pending
-        return pending
+    def publish_checked(self, appendix=ENTRY):
+        return self.bot.publish_llm_draft(123, appendix, "entry", "Synthetic lunch 5 GBP", "2026-09-10", header="草稿：")
 
-    def test_precheck_while_reading_is_reused_by_save(self):
-        pending = self._published()
+    def test_publication_checks_before_delivery_and_save_reuses_result(self):
+        self.bot.send_draft_for_review = MagicMock()
         with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
-            self.bot._precheck_commit("1", pending)
-            self.assertNotIn("commit_appendix", pending)
-            self.assertEqual(self.puts, 0)
-            self.bot.commit_llm_entry(pending)
+            def delivered(chat, header, appendix, pid):
+                commit_check.assert_called_once()
+                pending = self.bot.pending_llm_entries[pid]
+                self.assertIn('datetime:', pending["commit_appendix"])
+                self.assertIn('prompt:', pending["commit_appendix"])
+                self.assertEqual(self.puts, 0)
+            self.bot.send_draft_for_review.side_effect = delivered
+            pid = self.publish_checked()
+            self.bot.commit_llm_entry(self.bot.pending_llm_entries[pid])
         commit_check.assert_called_once()
         self.assertEqual(self.puts, 1)
-        self.assertIn(f'datetime: "{pending["prompt_time"]}"', self.texts["test.bean"])
 
-    def test_precheck_is_not_reused_for_changed_ledger_or_stale_result(self):
-        pending = self._published()
+    def test_identical_candidate_reuses_result_after_draft_lifetime(self):
         with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
-            self.bot._precheck_commit("1", pending)
-            self.texts["test.bean"] += '\n2026-09-08 * "Other writer"\n  Expenses:Food:Cafe 2 GBP\n  Assets:Cash -2 GBP\n'
-            self.tree = "other-writer"
-            self.bot._precheck_commit("1", pending)
-            self.assertEqual(commit_check.call_count, 2)
-            digest, checked, checked_at = self.bot._commit_check_cache
-            self.bot._commit_check_cache = (digest, checked, checked_at - self.bot.settings.DRAFT_TTL_SECONDS - 1)
-            self.bot.commit_llm_entry(pending)
-        self.assertEqual(commit_check.call_count, 3)
+            pid = self.publish_checked()
+            pending = self.bot.pending_llm_entries[pid]
+            with patch("beancounter.drafts.time.monotonic", return_value=time.monotonic() + 86400):
+                self.bot.commit_llm_entry(pending)
+        commit_check.assert_called_once()
         self.assertEqual(self.puts, 1)
 
-    def test_precheck_skips_discarded_draft_and_contains_failures(self):
-        pending = self.pending()
+    def test_changed_ledger_after_publication_requires_another_check(self):
         with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as commit_check:
-            self.bot._precheck_commit("1", pending)  # Not pending any more.
-            commit_check.assert_not_called()
-            bad = self.pending('2026-09-10 * "Unbalanced"\n  Expenses:Food:Cafe 5 GBP\n  Assets:Cash -4 GBP')
-            self.bot.pending_llm_entries["2"] = bad
-            self.bot._precheck_commit("2", bad)
-            commit_check.assert_called_once()
-        self.assertIsNone(self.bot._commit_check_cache[0])
-        self.assertIn("2", self.bot.pending_llm_entries)
-        with self.assertRaisesRegex(ValueError, "bean-check failed"):
-            self.bot.commit_llm_entry(bad)
+            pid = self.publish_checked()
+            self.texts["test.bean"] += '\n2026-09-08 * "Other writer"\n  Expenses:Food:Cafe 2 GBP\n  Assets:Cash -2 GBP\n'
+            self.tree = "other-writer"
+            self.bot.commit_llm_entry(self.bot.pending_llm_entries[pid])
+        self.assertEqual(commit_check.call_count, 2)
+        self.assertEqual(self.puts, 1)
 
-    def test_publish_schedules_precheck_only_while_polling(self):
-        self.bot._prechecks = MagicMock()
-        self.bot.publish_llm_draft(123, ENTRY, "msg", "Lunch 5 GBP", "2026-09-10", header="草稿：")
-        self.bot._prechecks.submit.assert_not_called()
-        self.bot._precheck_enabled = True
-        pid = self.bot.publish_llm_draft(123, ENTRY, "msg", "Lunch 5 GBP", "2026-09-10", header="草稿：")
-        self.bot._prechecks.submit.assert_called_once_with(
-            self.bot._precheck_commit, pid, self.bot.pending_llm_entries[pid])
+    def test_invalid_candidate_cannot_be_published_or_cached(self):
+        self.bot.send_draft_for_review = MagicMock()
+        bad = '2026-09-10 * "Unbalanced"\n  Expenses:Food:Cafe 5 GBP\n  Assets:Cash -4 GBP'
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "bean-check failed"):
+                self.publish_checked(bad)
+        self.bot.send_draft_for_review.assert_not_called()
+        self.assertEqual(self.bot.pending_llm_entries, {})
+        self.assertIsNone(self.bot._commit_check_cache[0])
+        self.assertEqual(self.puts, 0)
+
+    def test_generation_publication_and_save_share_one_final_candidate_check(self):
+        self.bot.llm_enabled = True
+        self.bot._call_llm_backends = MagicMock(return_value=ENTRY)
+        pending = self.bot._prepare_llm_pending(123, "entry", "Synthetic lunch 5 GBP", "2026-09-10")
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as checked, \
+             patch("beancounter.ledger.check_ledger", side_effect=AssertionError("no separate generation check")):
+            entry = self.bot.call_openai_compatible("Synthetic lunch 5 GBP", self.bot.parse_accounts(),
+                                                    "2026-09-10", pending=pending)
+            checked.assert_called_once()
+            pid = self.bot.publish_llm_draft(123, entry, "entry", "Synthetic lunch 5 GBP", "2026-09-10", header="草稿：", pending=pending)
+            self.bot.commit_llm_entry(self.bot.pending_llm_entries[pid])
+        checked.assert_called_once()
+        self.assertEqual(self.puts, 1)
+
+    def test_generation_repairs_full_candidate_before_publication(self):
+        self.bot.llm_enabled = True
+        bad = ENTRY.replace("Expenses:Food:Cafe", "Expenses:Travel").replace("GBP", "USD")
+        self.bot._call_llm_backends = MagicMock(side_effect=[bad, ENTRY])
+        pending = self.bot._prepare_llm_pending(123, "entry", "Synthetic lunch 5 GBP", "2026-09-10")
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as checked:
+            entry = self.bot.call_openai_compatible("Synthetic lunch 5 GBP", ["Assets:Cash", "Expenses:Food:Cafe", "Expenses:Travel"],
+                                                    "2026-09-10", pending=pending)
+            self.assertEqual(self.bot._call_llm_backends.call_count, 2)
+            self.bot.publish_llm_draft(123, entry, "entry", "Synthetic lunch 5 GBP", "2026-09-10", header="草稿：", pending=pending)
+        self.assertEqual(checked.call_count, 2)
+        self.assertEqual(self.puts, 0)
+
+    def test_review_can_be_disabled_without_skipping_bean_check(self):
+        self.bot.settings.LLM_REVIEW_ENABLED = False
+        self.bot.parse_accounts = MagicMock(side_effect=AssertionError("no review account refresh"))
+        with patch("beancounter.drafts.check_ledger", wraps=check_ledger) as checked:
+            self.bot.commit_llm_entry(self.pending())
+        checked.assert_called_once()
+        self.bot.review_journal.assert_not_called()
+        self.assertEqual(self.puts, 1)
+
+    def test_disabling_review_cannot_save_an_invalid_ledger(self):
+        self.bot.settings.LLM_REVIEW_ENABLED = False
+        self.texts["accounts.bean"] += "2026-09-09 close Assets:Cash\n"
+        with self.assertRaisesRegex(ValueError, "bean-check failed"):
+            self.bot.commit_llm_entry(self.pending())
+        self.bot.review_journal.assert_not_called()
+        self.assertEqual(self.puts, 0)
 
     def test_changed_remote_texts_must_be_rechecked(self):
         self.bot.commit_llm_entry(self.pending())

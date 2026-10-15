@@ -13,9 +13,11 @@
             "LLM_API_BASE_URL": "https://api.openai.com/v1",
             "LLM_API_KEY": "",
             "LLM_MODEL": "gpt-4o-mini",
-            "LLM_VISION_MODEL": "gpt-4o"
+            "LLM_VISION_MODEL": "gpt-4o",
+            "LLM_HEADERS": {}
         }
     ],
+    "LLM_REVIEW_ENABLED": true,
     "ACCOUNTS_CACHE_TTL": 300,
     "DRAFT_TTL_SECONDS": 120,
     "ANALYSIS_REQUEST_TIMEOUT_SECONDS": 180,

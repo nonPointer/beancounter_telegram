@@ -7,7 +7,7 @@ import requests
 import time
 import uuid
 from .bot_utils import (
-    GITHUB_CONFLICT_RETRIES, _capped_code_block, _code_block, _is_account_error, log, timed,
+    GITHUB_CONFLICT_RETRIES, JournalReviewRejected, _capped_code_block, _code_block, _is_account_error, log, timed,
 )
 from .bot_utils import LedgerValidationError
 
@@ -21,33 +21,58 @@ def _texts_digest(texts: dict, root: str) -> str:
 
 
 class DraftMixin:
+    def _prepare_llm_pending(self, chat_id, commit_message, user_input, date_str, *,
+                             prompt=None, photo_file_id=None, replaces=None):
+        pending = self._make_pending_entry(chat_id, "", commit_message, user_input, date_str)
+        pending["draft_prompt"] = user_input if prompt is None else prompt
+        if replaces:
+            previous = replaces[1]
+            pending["feedback"] = previous.get("feedback", [])
+            pending["prompt_time"] = previous.get("prompt_time", pending["prompt_time"])
+            photo_file_id = previous.get("photo_file_id")
+        if photo_file_id:
+            pending["photo_file_id"] = photo_file_id
+        return pending
+
+    def _finalize_pending_entry(self, pending, appendix):
+        prompt = pending.get("draft_prompt", pending["user_input"])
+        pending["appendix"] = self.insert_prompt_metadata(appendix, prompt) if prompt else appendix
+        pending.pop("commit_appendix", None)
+        pending["commit_appendix"] = self._commit_appendix(pending)
+
+    def _validate_pending_draft(self, pending, files=None):
+        if files is None:
+            _, files = self._download_ledger_snapshot()
+        marker = f'; telegram-operation: {pending["operation_id"]}'
+        self._check_commit_candidate(self._commit_candidate(files, marker, pending["commit_appendix"]))
+        pending["_checked_payload"] = (pending["operation_id"], pending["commit_appendix"])
+
     def publish_llm_draft(self, chat_id, appendix, commit_message, user_input, date_str,
-                          *, header, prompt=None, photo_file_id=None, replaces=None):
+                          *, header, prompt=None, photo_file_id=None, replaces=None, pending=None):
         """Prepare, persist and show a draft; replacement must still own the original."""
-        prompt = user_input if prompt is None else prompt
-        if prompt:
-            appendix = self.insert_prompt_metadata(appendix, prompt)
-        commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
+        with self._pending_lock:
+            if replaces and self.pending_llm_entries.get(replaces[0]) is not replaces[1]:
+                return None
+        if pending is None:
+            pending = self._prepare_llm_pending(chat_id, commit_message, user_input, date_str,
+                                               prompt=prompt, photo_file_id=photo_file_id, replaces=replaces)
+        self._finalize_pending_entry(pending, appendix)
+        if pending.get("_checked_payload") != (pending["operation_id"], pending["commit_appendix"]):
+            self._validate_pending_draft(pending)
+        pending.pop("_checked_payload", None)
+        pending.pop("draft_prompt", None)
+        appendix = pending["appendix"]
+        pending["commit_message"] = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
         pending_id = self.next_pending_id()
         with self._pending_lock:
             if replaces and self.pending_llm_entries.get(replaces[0]) is not replaces[1]:
                 return None
-            pending = self._make_pending_entry(chat_id, appendix, commit_message, user_input, date_str)
             if replaces:
-                previous_id, previous = replaces
-                pending["feedback"] = previous.get("feedback", [])
-                # Feedback regenerates the same transaction; keep the original prompt time.
-                pending["prompt_time"] = previous.get("prompt_time", pending["prompt_time"])
-                photo_file_id = previous.get("photo_file_id")
-                self.pending_llm_entries.pop(previous_id)
-            if photo_file_id:
-                pending["photo_file_id"] = photo_file_id
+                self.pending_llm_entries.pop(replaces[0])
             self.pending_llm_entries[pending_id] = pending
             self._save_pending_locked()
         log(f"{header}\n{appendix}")
         self.send_draft_for_review(chat_id, header, appendix, pending_id)
-        if self._precheck_enabled and not self.stop.is_set():
-            self._prechecks.submit(self._precheck_commit, pending_id, pending)
         return pending_id
 
     def _save_pending_locked(self):
@@ -105,7 +130,7 @@ class DraftMixin:
                 return appendix
             texts = self._commit_candidate(files, marker, appendix)
             checked = self._check_commit_candidate(texts)
-            if not reviewed:
+            if not reviewed and self.settings.LLM_REVIEW_ENABLED:
                 if not self.parse_accounts():
                     raise ValueError("无法取得账户上下文，未提交。")
                 self.review_journal(pending, appendix)
@@ -120,10 +145,7 @@ class DraftMixin:
             ok, status = self._github_put_file(
                 texts[self.settings.FILE_PATH], current["sha"], pending["commit_message"].strip())
             if ok:
-                # The next reader verifies the remote texts before reusing this result.
-                with self._ledger_cache_lock:
-                    self._ledger_cache = {"tree_sha": None, "entries": checked[0],
-                                          "options_map": checked[1], "texts": texts}
+                self._remember_checked_ledger(texts, checked)
                 return appendix
             if status not in (409, 422):
                 raise ValueError(f"GitHub 提交失败（HTTP {status}）。")
@@ -140,33 +162,18 @@ class DraftMixin:
         return texts
 
     def _check_commit_candidate(self, texts: dict) -> tuple[list, dict]:
-        """Full check of one candidate; only a recent byte-identical candidate reuses a pass."""
+        """Check once per exact candidate; elapsed time alone cannot invalidate identical bytes."""
         root = self._ledger_root(texts)
         digest = _texts_digest(texts, root)
-        # A save arriving during the precheck of the same candidate waits for it instead of repeating it.
         with self._commit_check_lock:
-            cached_digest, checked, checked_at = self._commit_check_cache
-            if cached_digest == digest and time.monotonic() - checked_at <= self.settings.DRAFT_TTL_SECONDS:
+            cached_digest, checked = self._commit_check_cache
+            if cached_digest == digest:
                 log("Commit bean-check reused for an identical candidate ledger.")
                 return checked
             checked = check_ledger(texts, root, self.settings.FILE_PATH)
             # Failures raise above and are never cached; one slot bounds memory.
-            self._commit_check_cache = (digest, checked, time.monotonic())
+            self._commit_check_cache = (digest, checked)
             return checked
-
-    def _precheck_commit(self, pending_id: str, pending: dict):
-        """Check the exact bytes a save would write while the user reads the draft."""
-        try:
-            with self._pending_lock:
-                if self.stop.is_set() or "prompt_time" not in pending or self.pending_llm_entries.get(pending_id) is not pending:
-                    return
-            _, files = self._download_ledger_snapshot()
-            marker = f'; telegram-operation: {pending["operation_id"]}'
-            with timed("commit precheck"):
-                self._check_commit_candidate(self._commit_candidate(files, marker, self._commit_appendix(pending)))
-        except Exception as exc:
-            # Best effort: the save runs the same check and reports the failure to the user.
-            log(f"Commit precheck did not pass ({type(exc).__name__}: {str(exc)[:200]}).")
 
     def approve_pending(self, pending_id: str, pending: dict, automatic: bool = False):
         """The caller owns the claimed draft; all failures retain it for explicit retry."""
@@ -177,8 +184,11 @@ class DraftMixin:
             log(f"Draft {pending_id} save failed ({type(exc).__name__}: {exc}); draft retained.")
             pending["auto_confirm"] = False
             self._restore_pending(pending_id, pending)
-            self.send_message(chat_id, f"未能确认保存：{exc}\n草稿已保留，自动确认已暂停。可点击 ✅ 重试或 🔧 修改。",
-                              reply_markup=self.build_review_buttons(pending_id))
+            if isinstance(exc, JournalReviewRejected):
+                message = f"保存前审核未通过，尚未提交。\n原因：{exc}\n草稿已保留，自动确认已暂停。请点击 🔧 修改，或 ❌ 放弃。"
+            else:
+                message = f"未能确认保存：{exc}\n草稿已保留，自动确认已暂停。可点击 ✅ 重试或 🔧 修改。"
+            self.send_message(chat_id, message, reply_markup=self.build_review_buttons(pending_id))
             return
         # Notifications must never roll back a successful write into a retryable draft.
         self._finish_pending(pending_id)
@@ -317,6 +327,8 @@ class DraftMixin:
             accounts = self.parse_accounts()
             if not accounts:
                 raise ValueError("No accounts available. Please check GitHub account parsing first.")
+            replacement = self._prepare_llm_pending(chat_id, 'Add entry by Telegram Bot\n\n',
+                                                     pending["user_input"], pending["date_str"], replaces=(pending_id, pending))
             new_appendix = self.call_openai_compatible(
                 pending["user_input"],
                 accounts,
@@ -324,11 +336,12 @@ class DraftMixin:
                 previous_draft=pending["appendix"],
                 decline_reason="\n".join(pending.get("feedback", [])) or None,
                 current_time=datetime.now(self.timezone).strftime('%H:%M'),
+                pending=replacement,
             )
             self.publish_llm_draft(
                 chat_id, new_appendix, 'Add entry by Telegram Bot\n\n',
                 pending["user_input"], pending["date_str"],
-                header="已修改：", replaces=(pending_id, pending),
+                header="已修改：", replaces=(pending_id, pending), pending=replacement,
             )
         except Exception as e:
             pending["rechecking"] = False

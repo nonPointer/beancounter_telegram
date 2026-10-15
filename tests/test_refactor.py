@@ -126,6 +126,28 @@ class TestCallLlmBackends(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(call_count, 2)
 
+    def test_endpoint_headers_are_isolated_across_text_and_vision_failover(self):
+        self.bot.settings = main.Settings({**FAKE_CONFIG, "LLM_BACKENDS": [
+            {"LLM_API_BASE_URL": "https://first.invalid/v1", "LLM_API_KEY": "first-key",
+             "LLM_MODEL": "first-model", "LLM_HEADERS": {"authorization": "Custom first-token", "X-Route": "first"}},
+            {"LLM_API_BASE_URL": "https://second.invalid/v1", "LLM_API_KEY": "second-key",
+             "LLM_MODEL": "second-model", "LLM_VISION_MODEL": "second-vision",
+             "LLM_HEADERS": {"X-Api-Key": "second-token"}},
+        ]})
+        response = MagicMock()
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        for vision in (False, True):
+            with self.subTest(vision=vision), patch.object(main.HTTP, "post", side_effect=[ConnectionError("offline"), response]) as post:
+                self.assertEqual(self.bot._call_llm_backends({}, vision=vision), "ok")
+            first, second = [call.kwargs for call in post.call_args_list]
+            self.assertEqual(first["headers"]["authorization"], "Custom first-token")
+            self.assertEqual(first["headers"]["X-Route"], "first")
+            self.assertEqual(second["headers"]["Authorization"], "Bearer second-key")
+            self.assertEqual(second["headers"]["X-Api-Key"], "second-token")
+            self.assertNotIn("X-Route", second["headers"])
+            self.assertEqual(second["json"]["model"], "second-vision" if vision else "second-model")
+        self.assertNotIn("X-Api-Key", main.HTTP.headers)
+
     def test_raises_when_all_fail(self):
         with patch.object(self.bot.settings, "LLM_BACKENDS", [self._make_backend()]):
             with patch.object(main.HTTP, "post", side_effect=ConnectionError("nope")):
@@ -355,7 +377,7 @@ class TestNormalizeAndValidate(unittest.TestCase):
     def test_paren_currency_annotation_stripped(self):
         """Parenthesized currency annotations from account list are stripped."""
         entry = (
-            '2026-04-06 * "DemoBank" "Sainsbury\'s"\n'
+            '2026-04-06 * "DemoBank" "DemoMarket\'s"\n'
             '  Expenses:Food                     5.50 GBP\n'
             '  Liabilities:CreditCard:DemoBank (GBP)  -5.50 GBP'
         )

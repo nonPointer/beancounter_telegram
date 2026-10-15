@@ -56,7 +56,7 @@ Required keys: `GITHUB_TOKEN`, `REPO_OWNER`, `REPO_NAME`, `BRANCH_NAME`, `FILE_P
 
 LLM backends:
 ```json
-"LLM_BACKENDS": [{"LLM_API_BASE_URL": "...", "LLM_API_KEY": "...", "LLM_MODEL": "..."}]
+"LLM_BACKENDS": [{"LLM_API_BASE_URL": "...", "LLM_API_KEY": "...", "LLM_MODEL": "...", "LLM_HEADERS": {}}]
 ```
 
 Optional tuning: `ACCOUNTS_CACHE_TTL` (300s), `DRAFT_TTL_SECONDS` (120s), `WORKERS` (4),
@@ -79,7 +79,11 @@ with `_scrub()` to remove terminal control characters.
 - `ACCOUNT_TYPE_MAP` module constant maps lowercase prefix → bean file path
 
 ### LLM backend fallback
+`LLM_REVIEW_ENABLED` defaults to true and must be a JSON boolean. The independent reviewer checks only explicit factual contradictions; classification preferences, fallback categories, wording and uncertainty alone must not reject a draft. Setting it to false skips this model call, while complete bean-check validation stays mandatory.
+
 `LLM_BACKENDS` list is tried in order; `Bot._call_llm_backends(payload)` raises `ValueError` if all fail. Text and vision paths both use this helper. LLM output starting with `NEED_ACCOUNT:` signals missing account context and is surfaced as a user-facing error.
+
+`settings.llm_headers` builds a fresh header mapping per request: Bearer authorization, JSON content type and JSON accept by default, then each backend's validated `LLM_HEADERS` overrides (case-insensitive; null removes the application default). This applies to all logical requests and synthetic probes; never update session headers with endpoint credentials. Capability cache keys include the effective headers, and analysis error diagnostics mask custom header values. Text, feedback and screenshot drafts share `_generate_validated_entry`; their payload builders preserve feedback context and omit screenshot pixels on correction retries.
 
 ### Polling resilience
 `get_updates` backs off (1→2→4…→60s, `stop.wait` so Ctrl-C interrupts) on any non-200,
@@ -91,7 +95,7 @@ only — a crash must not become a liveness oracle) instead of dying silently; `
 catches a crashing cycle and backs off rather than exiting.
 
 ### Appending to the ledger
-Manual entries use `append_to_file`, with bounded stale-SHA retries. LLM entries use
+Manual multiline transactions use `append_to_file(..., validate_ledger=True)`: construct the exact candidate from a complete immutable snapshot, pass `_check_commit_candidate`, verify the tree again, then PUT. Every conflict or tree change rebuilds and checks the new candidate; unavailable snapshots and bean-check failures block the write. Successful saves share `_remember_checked_ledger` with LLM saves so reports reuse the checked entries. Directive commands retain their separate append behavior. LLM entries use
 `commit_llm_entry`: download immutable blobs from one tree, check the complete candidate
 ledger locally, run an independent prompt/journal review, then check the tree again before
 writing via the shared `_github_put_file`. Every conflict rebuilds and checks the candidate.
@@ -99,11 +103,11 @@ A stable `; telegram-operation: <uuid>` marker reconciles a PUT whose response w
 Exceptions and HTTP failures restore the draft with automatic confirmation disabled.
 `/undo` rewrites precomputed content, so a conflict requires a fresh `/undo`.
 
-`_check_commit_candidate` keeps the last passing pre-commit check in one slot keyed by a SHA-256 digest of the root and every candidate file. Only a byte-identical candidate checked within `DRAFT_TTL_SECONDS` reuses it; any ledger or draft change, an older result, and every failed check run the full check again. This does not let the generation-stage check stand in for the commit gate.
+`_check_commit_candidate` keeps the last passing check in one slot keyed by a SHA-256 digest of the root and every candidate file. Byte-identical candidates reuse it regardless of elapsed time. A changed candidate, a process restart, or an evicted result requires a full check; failures are never cached.
 
-Once a draft is published, `_precheck_commit` runs that same check in a single background thread on the exact bytes a save would write (current journal, operation marker, `_commit_appendix`), so the cost overlaps with the user reading the draft. The save still downloads the current snapshot, rebuilds the candidate and compares digests; it reuses the precheck only when nothing changed. A save arriving mid-precheck waits on `_commit_check_lock` instead of repeating it. Prechecks are best effort, never mutate the draft, never notify the user, and are enabled only by `start()`, so offline tests do not start background ledger work. This is the accepted meaning of a "fresh" commit check: identical bytes, checked no longer ago than one draft lifetime.
+Production text, screenshot and feedback generation prepare a pending draft before calling the LLM. The retry loop finalizes prompt/datetime metadata and checks the exact candidate bytes, including its operation marker. `publish_llm_draft` accepts that prepared result, persists it and only then shows the draft. Direct publication also checks before showing. Saving downloads the current snapshot and compares the candidate digest, so an unchanged candidate reuses the generation check. There is no background precheck thread. Standalone generation calls without a prepared pending draft retain the best-effort legacy context validator for the manual preview tool.
 
-The program-supplied `datetime` metadata is the time the user sent the prompt (`prompt_time`, from the Telegram message date, kept across feedback regeneration), not the save time. It applies only when the entry has no `datetime` of its own. Drafts persisted before `prompt_time` existed fall back to the save time and are not prechecked.
+The program-supplied `datetime` metadata is the time the user sent the prompt (`prompt_time`, from the Telegram message date, kept across feedback regeneration), not the save time. It applies only when the entry has no `datetime` of its own. Older persisted drafts without a reusable result are checked at save time.
 
 ### Conversational queries (NL → BQL)
 Single-line text first goes through `route_intent()`, one LLM call that
@@ -127,26 +131,24 @@ The router also accepts `analysis`. `analysis.py` owns the bounded loop: four qu
 
 Text generation, screenshot generation and feedback regeneration all use `publish_llm_draft` in `drafts.py` to annotate the journal, build its commit message, persist the pending draft and present it. Replacements check the original object's identity under the pending lock and retain feedback/image references. Automatic confirmation remains disabled until delivery succeeds. `/last` and `/today` share `_show_journal_records` for loading, filtering, escaping and length-limited display; keep their existing public command entry points.
 
-When the router classifies input as an entry, two best-effort lookups enrich the draft prompt so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes the result to both helpers via `loaded=`. Omitted context uses `NOT_LOADED` and triggers loading; explicit `None` means unavailable and must not trigger another load in that generation request. The next request can retry; the mandatory pre-commit check remains.
+When the router classifies input as an entry, two best-effort lookups enrich the draft prompt so the LLM matches the user's own conventions. `handle_message` loads the ledger and passes the result to both helpers via `loaded=`. Omitted context uses `NOT_LOADED` and triggers loading; explicit `None` means unavailable and must not trigger another load in that generation request. The next request can retry; publication still requires a complete candidate check.
 
 - **Same-payee history** (`examples_for_payee`): if the router named a `payee`, the user's most recent past transactions (up to 10, loose case-folded substring match, either direction) are rendered back to beancount text via `_format_example_entry` (header + postings only, no metadata) and shown so the LLM reuses the account/narration/currency conventions.
 - **Frequent-payee list** (`frequent_payees`): the top 50 payees by frequency across the whole ledger are handed to the LLM so it snaps a fuzzy input onto an existing merchant spelling instead of coining a near-duplicate. The ranked list is cached in `_ledger_cache["payees"]` keyed by tree sha (recomputed only when the ledger changes, guarded by an `entries is entries` identity check against a concurrent reload). Interior whitespace is collapsed so a multi-line payee stays a single `、`-joined token.
 
-Both feed into `build_user_prompt(..., examples, payees)`, threaded through `call_openai_compatible`. The router's payee is only a retrieval hint, not a fixed field in the final entry. The generation call still receives the complete transaction input and selects the final payee itself. For example, the fictional hint `Demo Cafe` can retrieve `Demo Cafe 42`; the program does not append `42` itself. Substring retrieval is not typo matching: there is no edit-distance correction, and a short hint can retrieve several distinct merchants. A misspelling such as `sainsburry` will not normally match `Sainsbury's` directly. Either LLM stage may resolve the spelling using its input/context, but this is best-effort, not guaranteed. The frequent list is limited to 50 names and may omit a rare merchant. The history-injection log shows the retrieval hint, not the matched names or final payee.
+Both feed into `build_user_prompt(..., examples, payees)`, threaded through `call_openai_compatible`. The router's payee is only a retrieval hint, not a fixed field in the final entry. The generation call still receives the complete transaction input and selects the final payee itself. For example, the fictional hint `Demo Cafe` can retrieve `Demo Cafe 42`; the program does not append `42` itself. Substring retrieval is not typo matching: there is no edit-distance correction, and a short hint can retrieve several distinct merchants. A misspelling such as `demomrket` will not normally match `DemoMarket's` directly. Either LLM stage may resolve the spelling using its input/context, but this is best-effort, not guaranteed. The frequent list is limited to 50 names and may omit a rare merchant. The history-injection log shows the retrieval hint, not the matched names or final payee.
 
 ### Beancount syntax validation
 After `normalize_and_validate_llm_entry()`, every LLM-generated entry is validated with `beancount.parser.parser.parse_string()`. If the parser reports errors, the entry + error message are sent back to the LLM for correction, up to `MAX_BEANCOUNT_RETRIES` (3) retries. Both text (`call_openai_compatible`) and vision (`call_openai_vision_invest`) paths use this retry loop.
 
-The production generation-stage ledger check is retained: cached snapshots provide early
-semantic errors to the same retry loop; exhaustion uses `explain_ledger_error` for Chinese
-advice. This early check attributes newly introduced errors, but it never replaces the
-mandatory fresh, complete bean-check immediately before commit. A missing generation-time
-snapshot cannot bypass the commit gate.
+Production generation checks the complete final candidate in the same retry loop; exhaustion uses `explain_ledger_error` for Chinese advice. Missing snapshots block publication. Saving reuses this exact result while still verifying the remote candidate contents.
 
 ### Pending draft lifecycle
-1. LLM generates entry → beancount syntax validated (with auto-retry) → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
+1. LLM generates entry → syntax and complete final candidate validated (with auto-retry) → stored in `Bot.pending_llm_entries` with `_make_pending_entry()`
 2. Bot sends entry text + inline confirm/decline/edit buttons to user
 3. On confirm or timeout → `approve_pending` → local bean-check + LLM consistency review → commit
+
+Review replies accept a single JSON object, either plain or enclosed in one Markdown code fence. Duplicate fields, surrounding prose, contradictory objects, non-boolean approval and missing/empty reasons block commits with a readable error. A negative verdict surfaces the reviewer's reason and asks the user to modify or discard the retained draft; both manual and automatic saves pause automatic confirmation on rejection.
 
 Automatic confirmation is armed only after the review message is delivered. Feedback pauses
 it; failed checks retain the draft for explicit retry without repeated automatic attempts.
@@ -176,6 +178,7 @@ Undo entries also use `pending_llm_entries` with `"kind": "undo"` to distinguish
 
 ### GitHub file ETag caching
 - `Bot._file_etag_cache` — dict keyed by file path, stores `{"etag", "content", "sha"}`
+- `Bot._tree_etag_cache` — one URL/ETag/complete-tree tuple guarded by `_tree_lock`; every call still validates the remote tree. A 304 reuses the parsed map; failures and truncated responses never return a stale success. A different branch URL cannot reuse the ETag.
 - `github_download_file()` sends `If-None-Match` header when cache exists; on `304 Not Modified`, returns cached content without re-downloading
 - `github_upload_file()` invalidates the cache entry on success to ensure next read fetches fresh data
 
@@ -215,7 +218,7 @@ If a date is detected, it overrides today's date and the first line is stripped 
 - `_accounts_cache_lock` — protects `_accounts_cache` read/write (network calls run outside the lock)
 - `_accounts_refresh_lock` — coalesces concurrent account refreshes; `_load_lock` serializes ledger context loads so successful parsing is reused by tree SHA
 - `_snapshot_lock` — protects snapshot construction and shared immutable blob reuse across account and full-ledger reads; `_downloads` is one reusable pool of at most 8 workers per Bot, drained on close
-- Snapshot cache holds the latest complete ledger plus the latest complete account files, not an unbounded history of blob versions. Only missing SHAs are downloaded; failed refreshes never replace the complete snapshot. Each request still checks the remote tree, and every pre-commit candidate gets a full local validation.
+- Snapshot cache holds the latest complete ledger plus the latest complete account files, not an unbounded history of blob versions. Only missing SHAs are downloaded; failed refreshes never replace the complete snapshot. Each request still checks the remote tree, and every distinct candidate must pass full local validation before writing.
 - `print_lock` — serializes log output
 - Fixed worker lanes preserve per-chat order, including timeout approval. Capacity is bounded. A full lane is skipped for the rest of the scheduling pass, without blocking other lanes or letting later jobs in that lane overtake it.
 - SQLite inbox acknowledgment follows durable enqueue; interrupted jobs replay on startup.

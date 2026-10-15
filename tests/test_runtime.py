@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from beancounter.bot import Bot
-from beancounter.settings import Settings
+from beancounter.settings import Settings, llm_headers
 from beancounter.dispatch import Dispatcher
 from beancounter.state_store import StateStore
 from beancounter.ledger_validation import check_ledger, load_ledger_texts
@@ -171,6 +171,47 @@ class TestDispatcher(unittest.TestCase):
 
 
 class TestExplicitSettings(unittest.TestCase):
+    def llm_settings(self, **backend):
+        return Settings({**MOCK_CONFIG, "LLM_BACKENDS": [{
+            "LLM_API_BASE_URL": "https://llm.invalid/v1", "LLM_API_KEY": "synthetic-key",
+            "LLM_MODEL": "synthetic-model", **backend,
+        }]})
+
+    def test_llm_headers_default_and_case_insensitive_overrides(self):
+        backend = self.llm_settings().LLM_BACKENDS[0]
+        self.assertEqual(llm_headers(backend), {
+            "Authorization": "Bearer synthetic-key", "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        custom = {"authorization": "Custom synthetic-token", "content-type": "application/custom+json", "X-Route": "test"}
+        backend = self.llm_settings(LLM_HEADERS=custom).LLM_BACKENDS[0]
+        custom["X-Route"] = "changed"
+        headers = llm_headers(backend)
+        self.assertEqual(headers["authorization"], "Custom synthetic-token")
+        self.assertEqual(headers["content-type"], "application/custom+json")
+        self.assertEqual(headers["X-Route"], "test")
+        self.assertEqual(len(headers), 4)
+
+    def test_llm_headers_can_omit_default_authorization(self):
+        backend = self.llm_settings(LLM_HEADERS={"AUTHORIZATION": None, "X-Api-Key": "synthetic-token"}).LLM_BACKENDS[0]
+        headers = llm_headers(backend)
+        self.assertFalse(any(name.lower() == "authorization" for name in headers))
+        self.assertEqual(headers["X-Api-Key"], "synthetic-token")
+        headers["X-Api-Key"] = "mutated"
+        self.assertEqual(llm_headers(backend)["X-Api-Key"], "synthetic-token")
+
+    def test_invalid_llm_headers_fail_at_startup_without_echoing_values(self):
+        invalid = [None, [], "invalid", {"": "secret-value"}, {"Bad Name": "secret-value"},
+                   {"X-Test": 1}, {"X-Test": True}, {"X-Test": []},
+                   {"X-Test": "secret-value\r\nInjected: yes"}, {"X-Test": " secret-value"},
+                   {"X-Test": "secret-value\x00"}, {"X-Test": "secret-value\x7f"},
+                   {"X-Test": "secret-value中文"}]
+        for headers in invalid:
+            with self.subTest(headers=headers), self.assertRaises(ValueError) as caught:
+                self.llm_settings(LLM_HEADERS=headers)
+            self.assertIn("LLM_HEADERS", str(caught.exception))
+            self.assertNotIn("secret-value", str(caught.exception))
+
     def test_import_does_not_load_configuration(self):
         result = subprocess.run([sys.executable, "-c",
             "from beancounter import settings; settings.Settings.load = lambda *a: (_ for _ in ()).throw(AssertionError('config read')); from beancounter import bot as main"],
@@ -223,6 +264,13 @@ class TestExplicitSettings(unittest.TestCase):
         settings = Settings({**MOCK_CONFIG, "WORKERS": -1, "QUEUE_SIZE": "invalid"})
         self.assertEqual(settings.WORKERS, 4)
         self.assertEqual(settings.QUEUE_SIZE, 64)
+
+    def test_review_switch_requires_an_explicit_json_boolean(self):
+        self.assertTrue(Settings(MOCK_CONFIG).LLM_REVIEW_ENABLED)
+        self.assertFalse(Settings({**MOCK_CONFIG, "LLM_REVIEW_ENABLED": False}).LLM_REVIEW_ENABLED)
+        for value in ("false", "true", 0, 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "LLM_REVIEW_ENABLED"):
+                Settings({**MOCK_CONFIG, "LLM_REVIEW_ENABLED": value})
 
     def test_root_must_actually_include_the_journal(self):
         texts = {"main.bean": "; empty root\n", "test.bean": "; journal\n"}
@@ -403,6 +451,11 @@ class TestDraftPublication(unittest.TestCase):
         self.addCleanup(self.bot.close)
         self.entry = '2000-01-02 * "Example Shop"\n  Expenses:Food  1 GBP\n  Assets:Cash  -1 GBP'
         self.bot.send_draft_for_review = MagicMock()
+        self.bot._download_ledger_snapshot = MagicMock(return_value=("tree", {
+            "test.bean": {"sha": "journal", "content": 'include "accounts.bean"\n'},
+            "accounts.bean": {"sha": "accounts", "content":
+                "2000-01-01 open Assets:Cash GBP\n2000-01-01 open Expenses:Food GBP\n"},
+        }))
 
     def publish(self, **kwargs):
         return self.bot.publish_llm_draft(123, self.entry, "entry", "original synthetic input",

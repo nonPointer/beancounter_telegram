@@ -1,24 +1,21 @@
 """Llm responsibilities of Bot; shared entry points are preserved."""
 
-from .prompts import BEANCOUNT_SYSTEM_PROMPT
-from .prompts import EXPENSE_SCREENSHOT_SYSTEM_PROMPT
-from .prompts import INVEST_ORDER_SYSTEM_PROMPT
-from .prompts import JOURNAL_REVIEW_SYSTEM_PROMPT
-from .prompts import QUERY_ROUTER_SYSTEM_PROMPT
 import base64
-from .prompts import build_expense_screenshot_prompt
-from .prompts import build_invest_order_prompt
-from .prompts import build_query_router_prompt
-from .prompts import build_user_prompt
 import json
 import re
 import time
+from .settings import llm_headers
 from .bot_utils import (
     HTTP, MAX_BEANCOUNT_RETRIES, _C_BLUE, _C_RESET, extract_json_object, format_query_result,
     log, NOT_LOADED, TELEGRAM_MESSAGE_LIMIT, _capped_code_block, _is_account_error,
+    JournalReviewRejected, LedgerValidationError,
 )
-from .bot_utils import LedgerValidationError
-from .prompts import LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, build_ledger_error_explanation_prompt
+from .prompts import (
+    BEANCOUNT_SYSTEM_PROMPT, EXPENSE_SCREENSHOT_SYSTEM_PROMPT, INVEST_ORDER_SYSTEM_PROMPT,
+    JOURNAL_REVIEW_SYSTEM_PROMPT, LEDGER_ERROR_EXPLANATION_SYSTEM_PROMPT, QUERY_ROUTER_SYSTEM_PROMPT,
+    build_expense_screenshot_prompt, build_invest_order_prompt, build_ledger_error_explanation_prompt,
+    build_query_router_prompt, build_user_prompt,
+)
 
 class LLMMixin:
     def handle_natural_language(self, chat_id, text, user_input, date_str, current_time=""):
@@ -94,10 +91,12 @@ class LLMMixin:
             log(f"Frequent-payee lookup failed ({e}); generating without payee list.")
 
         try:
-            appendix = self.call_openai_compatible(text, accounts, date_str, current_time=current_time, examples=examples, payees=payees, loaded=loaded_ledger)
+            pending = self._prepare_llm_pending(chat_id, commit_message, user_input, date_str, prompt=text)
+            appendix = self.call_openai_compatible(text, accounts, date_str, current_time=current_time,
+                                                  examples=examples, payees=payees, loaded=loaded_ledger, pending=pending)
             self.publish_llm_draft(
                 chat_id, appendix, commit_message, user_input, date_str,
-                header="草稿：", prompt=text,
+                header="草稿：", prompt=text, pending=pending,
             )
             return
         except Exception as e:
@@ -233,7 +232,7 @@ class LLMMixin:
         log(f"LLM{label} requesting [{model}] @ {backend['base_url']}")
         response = HTTP.post(
             f"{backend['base_url']}/chat/completions",
-            headers={"Authorization": f"Bearer {backend['api_key']}", "Content-Type": "application/json"},
+            headers=llm_headers(backend),
             json={**payload, "model": model}, timeout=timeout,
         )
         response.raise_for_status()
@@ -276,137 +275,105 @@ class LLMMixin:
         examples: str | None = None,
         payees: list[str] | None = None,
         loaded=NOT_LOADED,
+        pending=None,
     ) -> str:
-        if not self.llm_enabled:
-            raise ValueError(self.llm_unavailable_message())
-
         accounts_for_prompt = self._accounts_for_prompt()
-        loaded = self._draft_ledger_context(loaded)
-        validation_error = None
-        entry = None
-        ledger_error = None
 
-        for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
-            if attempt == 0:
-                prompt_draft = previous_draft
-                prompt_reason = decline_reason
-            else:
-                prompt_draft = entry
-                prompt_reason = f"Previous draft validation error: {validation_error}"
+        def build_payload(attempt, entry, error):
+            prompt_draft = entry if attempt else previous_draft
+            prompt_reason = f"Previous draft validation error: {error}" if attempt else decline_reason
+            return {"messages": [
+                {"role": "system", "content": BEANCOUNT_SYSTEM_PROMPT},
+                {"role": "user", "content": build_user_prompt(
+                    txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason,
+                    current_time, examples, payees)},
+            ]}
 
-            user_prompt = build_user_prompt(txn_date, accounts_for_prompt, user_input, prompt_draft, prompt_reason, current_time, examples, payees)
-            payload = {
-                "messages": [
-                    {"role": "system", "content": BEANCOUNT_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-            }
-
-            purpose = "根据用户反馈修改分录" if previous_draft is not None else "文本分录生成"
-            if attempt:
-                purpose += f" / 校验纠错（重试 {attempt}）"
-            raw_text = self._call_llm_backends(payload, purpose)
-
-            if raw_text.upper().startswith("NEED_ACCOUNT:"):
-                guidance = raw_text.split(":", 1)[1].strip() if ":" in raw_text else ""
-                raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
-
-            try:
-                entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
-            except Exception as e:
-                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
-
-            validation_error = self.validate_beancount_syntax(entry) or self.validate_accounts_exist(entry, accounts)
-            ledger_error = self.validate_entry_against_ledger(entry, loaded) if validation_error is None and loaded is not None else None
-            validation_error = validation_error or ledger_error
-            if validation_error is None:
-                return entry
-
-            log(f"Draft validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {validation_error}")
-
-        if ledger_error:
-            raise LedgerValidationError(self.explain_ledger_error(entry, ledger_error))
-        raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
+        purpose = "根据用户反馈修改分录" if previous_draft is not None else "文本分录生成"
+        return self._generate_validated_entry(build_payload, accounts, purpose, loaded=loaded, pending=pending)
 
     def _call_vision_with_retry(
         self, image_bytes: bytes, accounts: list[str],
         system_prompt: str, base_prompt: str, log_label: str,
+        *, pending=None,
     ) -> str:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        def build_payload(attempt, entry, error):
+            prompt_text = base_prompt
+            if attempt:
+                prompt_text += (
+                    f"\n\nPrevious draft had validation errors:\n{entry}\n\n"
+                    f"Error: {error}\n\nFix the errors and regenerate."
+                )
+                log(f"Retry attempt {attempt}: dropping screenshot, sending text-only correction")
+            # Only the initial request needs pixels; correction retries use the
+            # draft and validation errors, avoiding repeated image-token costs.
+            content = [] if attempt else [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            ]
+            content.append({"type": "text", "text": prompt_text})
+            return {"messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ]}
+
+        return self._generate_validated_entry(build_payload, accounts, log_label, vision=True, pending=pending)
+
+    def _generate_validated_entry(self, build_payload, accounts, purpose, *, loaded=NOT_LOADED, vision=False, pending=None):
+        """One retry/validation pipeline for text, feedback and screenshot drafts."""
         if not self.llm_enabled:
             raise ValueError(self.llm_unavailable_message())
-
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        loaded = self._draft_ledger_context()
-        validation_error = None
-        entry = None
-        ledger_error = None
-
+        files = None
+        if pending is not None:
+            _, files = self._download_ledger_snapshot()
+        else:
+            loaded = self._draft_ledger_context(loaded)
+        entry = validation_error = ledger_error = None
         for attempt in range(1 + MAX_BEANCOUNT_RETRIES):
-            if attempt == 0:
-                prompt_text = base_prompt
-            else:
-                prompt_text = (
-                    f"{base_prompt}\n\n"
-                    f"Previous draft had validation errors:\n{entry}\n\n"
-                    f"Error: {validation_error}\n\n"
-                    "Fix the errors and regenerate."
-                )
-
-            if attempt == 0:
-                user_content = [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {"type": "text", "text": prompt_text},
-                ]
-            else:
-                # Retries are driven only by textual validation errors
-                # (syntax / account-exists), which the pixels rarely help fix.
-                # Drop the image on retry to avoid re-billing up to 3x image
-                # tokens; the full prompt text (incl. account list) is kept so
-                # account-exists corrections still work.
-                log(f"Retry attempt {attempt}: dropping screenshot, sending text-only correction")
-                user_content = [
-                    {"type": "text", "text": prompt_text},
-                ]
-
-            payload = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-            }
-
-            purpose = log_label + (f" / 校验纠错（纯文本重试 {attempt}）" if attempt else "")
-            raw_text = self._call_llm_backends(payload, purpose, vision=True)
-
+            payload = build_payload(attempt, entry, validation_error)
+            retry_label = f" / 校验纠错（{'纯文本重试' if vision else '重试'} {attempt}）" if attempt else ""
+            raw_text = self._call_llm_backends(payload, purpose + retry_label, vision=vision)
+            if not vision and raw_text.upper().startswith("NEED_ACCOUNT:"):
+                guidance = raw_text.split(":", 1)[1].strip()
+                raise ValueError(guidance or "请在输入中提供至少一个账户名（或账户后缀），我才能生成分录。")
             try:
                 entry = self.normalize_and_validate_llm_entry(raw_text, accounts)
-            except Exception as e:
-                raise ValueError(f"{e}\nInvalid LLM output:\n{raw_text}") from e
-
+            except Exception as exc:
+                raise ValueError(f"{exc}\nInvalid LLM output:\n{raw_text}") from exc
             validation_error = self.validate_beancount_syntax(entry) or self.validate_accounts_exist(entry, accounts)
-            ledger_error = self.validate_entry_against_ledger(entry, loaded) if validation_error is None and loaded is not None else None
+            ledger_error = None
+            if validation_error is None:
+                if pending is not None:
+                    self._finalize_pending_entry(pending, entry)
+                    try:
+                        self._validate_pending_draft(pending, files)
+                    except ValueError as exc:
+                        ledger_error = str(exc)
+                elif loaded is not None:
+                    ledger_error = self.validate_entry_against_ledger(entry, loaded)
             validation_error = validation_error or ledger_error
             if validation_error is None:
                 return entry
-
             log(f"Draft validation failed (attempt {attempt + 1}/{1 + MAX_BEANCOUNT_RETRIES}): {validation_error}")
-
         if ledger_error:
             raise LedgerValidationError(self.explain_ledger_error(entry, ledger_error))
         raise ValueError(f"Draft validation failed after {MAX_BEANCOUNT_RETRIES} retries: {validation_error}")
 
-    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
+    def call_openai_vision_invest(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "", *, pending=None) -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, INVEST_ORDER_SYSTEM_PROMPT,
             build_invest_order_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
             log_label="投资截图识别与分录生成",
+            pending=pending,
         )
 
-    def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "") -> str:
+    def call_openai_vision_expense(self, image_bytes: bytes, accounts: list[str], txn_date: str, caption: str = "", current_datetime: str = "", *, pending=None) -> str:
         return self._call_vision_with_retry(
             image_bytes, accounts, EXPENSE_SCREENSHOT_SYSTEM_PROMPT,
             build_expense_screenshot_prompt(txn_date, self._accounts_for_prompt(), caption, current_datetime),
             log_label="消费截图识别与分录生成",
+            pending=pending,
         )
 
     def review_journal(self, pending: dict, appendix: str):
@@ -444,10 +411,24 @@ class LLMMixin:
                 {"role": "user", "content": content},
             ],
         }, "保存前分录与原始输入一致性审核", vision=bool(photo))
-        # A strict positive verdict is required; malformed or uncertain output blocks writes.
-        verdict = json.loads(raw)
-        if not isinstance(verdict, dict) or verdict.get("approved") is not True:
-            reason = verdict.get("reason", "审核未明确通过") if isinstance(verdict, dict) else "审核格式无效"
-            raise ValueError(f"分录与输入一致性审核未通过：{reason}")
-        if not isinstance(verdict.get("reason"), str) or not verdict["reason"].strip():
-            raise ValueError("审核缺少理由，未提交。")
+        # Accept one JSON object, optionally enclosed in a Markdown fence. Do
+        # not extract a positive fragment from prose or contradictory verdicts.
+        fenced = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n[ \t]*```", raw.strip(), re.DOTALL | re.IGNORECASE)
+
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate review field")
+                result[key] = value
+            return result
+
+        try:
+            verdict = json.loads(fenced[1] if fenced else raw, object_pairs_hook=unique_fields)
+        except ValueError:
+            raise ValueError("保存前审核的回复格式无效，无法确认是否通过，尚未提交。请重试审核。") from None
+        if (not isinstance(verdict, dict) or not isinstance(verdict.get("approved"), bool)
+                or not isinstance(verdict.get("reason"), str) or not verdict["reason"].strip()):
+            raise ValueError("保存前审核缺少明确结论或理由，尚未提交。请重试审核。")
+        if not verdict["approved"]:
+            raise JournalReviewRejected(verdict["reason"].strip())

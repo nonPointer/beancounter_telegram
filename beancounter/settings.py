@@ -1,7 +1,46 @@
 """Explicit configuration loading; importing the bot never reads credentials."""
 
 import json
+import re
 from pathlib import Path
+
+from requests.structures import CaseInsensitiveDict
+from requests.utils import check_header_validity
+
+
+def llm_headers(backend):
+    """Build fresh endpoint-local headers, with case-insensitive overrides/removals."""
+    headers = CaseInsensitiveDict({
+        "Authorization": f"Bearer {backend['api_key']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    })
+    for name, value in backend.get("headers", {}).items():
+        if value is None:
+            headers.pop(name, None)
+        else:
+            headers[name] = value
+    return dict(headers)
+
+
+def _validate_llm_headers(headers):
+    if not isinstance(headers, dict):
+        raise ValueError("LLM_HEADERS must be an object of header names to strings or null")
+    for name, value in headers.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise ValueError("LLM_HEADERS contains an invalid header name")
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError("LLM_HEADERS values must be strings or null")
+        try:
+            check_header_validity((name, value))
+            value.encode("latin-1")
+            if any((ord(char) < 32 and char != "\t") or ord(char) == 127 for char in value):
+                raise ValueError("control character")
+        except (ValueError, UnicodeError):
+            raise ValueError("LLM_HEADERS contains an invalid header value") from None
+    return dict(headers)
 
 
 class Settings:
@@ -20,11 +59,15 @@ class Settings:
                                "Accept": "application/vnd.github.object",
                                "X-GitHub-Api-Version": "2022-11-28"}
         self.LLM_BACKENDS = []
+        self.LLM_REVIEW_ENABLED = values.get("LLM_REVIEW_ENABLED", True)
+        if not isinstance(self.LLM_REVIEW_ENABLED, bool):
+            raise ValueError("LLM_REVIEW_ENABLED must be true or false")
         for backend in values.get("LLM_BACKENDS") or []:
             url, key, model = (backend.get(k, "") for k in ("LLM_API_BASE_URL", "LLM_API_KEY", "LLM_MODEL"))
             if url and key and model:
                 self.LLM_BACKENDS.append({"base_url": url.rstrip("/"), "api_key": key, "model": model,
-                                          "vision_model": backend.get("LLM_VISION_MODEL") or model})
+                                          "vision_model": backend.get("LLM_VISION_MODEL") or model,
+                                          "headers": _validate_llm_headers(backend.get("LLM_HEADERS", {}))})
         for name, default in (("ACCOUNTS_CACHE_TTL", 300), ("DRAFT_TTL_SECONDS", 120),
                               ("WORKERS", 4), ("QUEUE_SIZE", 64),
                               ("ANALYSIS_REQUEST_TIMEOUT_SECONDS", 180),

@@ -68,15 +68,15 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         self._accounts_cache = {"accounts": None, "currencies": {}, "comments": {}, "ts": 0, "sha_map": None}
         self._accounts_cache_lock = threading.Lock()
         self._file_etag_cache = {}  # file_path -> {"etag": str, "content": str, "sha": str}
+        self._tree_etag_cache = None
+        self._tree_lock = threading.Lock()
         # Parsed ledger cached by repo tree sha; reused until any .bean file changes.
         self._ledger_cache = {"tree_sha": None, "entries": None, "options_map": None}
         self._ledger_cache_lock = threading.Lock()
         self._snapshot_cache = (None, None)
         # Last passing pre-commit check, keyed by a digest of the complete candidate texts.
-        self._commit_check_cache = (None, None, 0.0)
+        self._commit_check_cache = (None, None)
         self._commit_check_lock = threading.Lock()
-        self._prechecks = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit-precheck")
-        self._precheck_enabled = False  # Background ledger work starts with the polling loop.
         self._account_files = {}
         self._snapshot_lock = threading.RLock()
         self._accounts_refresh_lock = threading.Lock()
@@ -130,18 +130,21 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         try:
             if is_invest:
                 log(f"Processing investment order screenshot (caption: {caption!r})")
-                appendix = self.call_openai_vision_invest(image_bytes, accounts, date_str, caption, datetime_str)
+                generate = self.call_openai_vision_invest
                 draft_label, user_input = "投资草稿", caption or "(investment order screenshot)"
                 commit_prefix = 'Add investment entry by Telegram Bot\n\n'
             else:
                 log(f"Processing expense screenshot (caption: {caption!r})")
-                appendix = self.call_openai_vision_expense(image_bytes, accounts, date_str, caption, datetime_str)
+                generate = self.call_openai_vision_expense
                 draft_label, user_input = "消费草稿", caption or "(expense screenshot)"
                 commit_prefix = 'Add entry by Telegram Bot\n\n'
 
+            pending = self._prepare_llm_pending(chat_id, commit_prefix, user_input, date_str,
+                                               prompt=caption, photo_file_id=file_id)
+            appendix = generate(image_bytes, accounts, date_str, caption, datetime_str, pending=pending)
             self.publish_llm_draft(
                 chat_id, appendix, commit_prefix, user_input, date_str,
-                header=f"{draft_label}：", prompt=caption, photo_file_id=file_id,
+                header=f"{draft_label}：", prompt=caption, photo_file_id=file_id, pending=pending,
             )
         except Exception as e:
             log(f"Photo processing failed: {e}")
@@ -276,6 +279,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         commit_message = 'Add entry by Telegram Bot\n\n'
         appendix = ""
         target_file_path = self.settings.FILE_PATH
+        manual_journal = False
 
         if text.startswith('/'):
             text = text[1:]
@@ -374,6 +378,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
 
         else:
             log("Transaction detected")
+            manual_journal = True
             try:
                 appendix = self.build_manual_entry(text, date_str, datetime_str)
                 commit_message = self.add_non_pnl_accounts_to_commit_message(commit_message, appendix)
@@ -381,7 +386,8 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
                 reply(str(exc))
                 return
 
-        ok, err = self.append_to_file(appendix, commit_message.strip(), target_file_path)
+        ok, err = self.append_to_file(appendix, commit_message.strip(), target_file_path,
+                                      validate_ledger=manual_journal)
         if ok:
             self.send_message(
                 chat_id,

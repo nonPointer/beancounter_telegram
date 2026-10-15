@@ -65,13 +65,15 @@ class InlineSession:
 
 
 @contextmanager
-def fake_api(replies):
+def fake_api(replies, received_headers=None):
     """Real loopback HTTP verifies wire payloads, including a native tool-result round trip."""
     received = []
     pending = iter(replies)
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            if received_headers is not None:
+                received_headers.append(dict(self.headers))
             received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
             reply = next(pending, {"content": "unexpected request"})
             status, body = reply if isinstance(reply, tuple) else (200, {"choices": [{"message": reply}]})
@@ -171,6 +173,15 @@ class TestCapability(AnalysisFixture):
         with patch("beancounter.analysis.time.monotonic", return_value=now + CAPABILITY_TTL + 1):
             self.assertFalse(self.bot._supports_tools(self.backend, now + CAPABILITY_TTL + 100))
         self.assertEqual(request.call_count, 3)
+
+    def test_capability_cache_includes_case_insensitive_effective_headers(self):
+        self.backend["headers"] = {"X-Route": "one"}
+        self.bot._cache_tool_support(self.backend, True)
+        request = self.bot._request_llm_message = MagicMock(return_value={"content": "plain"})
+        self.assertTrue(self.bot._supports_tools({**self.backend, "headers": {"x-route": "one"}}, self.deadline))
+        request.assert_not_called()
+        self.assertFalse(self.bot._supports_tools({**self.backend, "headers": {"X-Route": "two"}}, self.deadline))
+        request.assert_called_once()
 
     def test_probe_cannot_run_arbitrary_tool(self):
         self.bot._request_llm_message = MagicMock(return_value=tool_message("query_ledger"))
@@ -592,6 +603,14 @@ class TestAnalysisTimeouts(AnalysisFixture):
         self.assertIn("truncated", detail)
         self.assertEqual(self.bot._analysis_error_detail(http_error(502, "<html>private upstream body</html>")), "HTTPError HTTP 502")
 
+    def test_http_diagnostics_mask_custom_header_credentials(self):
+        self.backend["headers"] = {"X-Api-Key": "custom-secret", "Authorization": None}
+        error = http_error(401, json.dumps({"error": {"message": "invalid custom-secret"}}))
+        detail = self.bot._analysis_error_detail(error)
+        self.assertIn("HTTP 401", detail)
+        self.assertIn("[REDACTED]", detail)
+        self.assertNotIn("custom-secret", detail)
+
     def test_request_failure_logs_http_status_and_message(self):
         self.bot._supports_tools = MagicMock(return_value=False)
         self.bot._request_llm_message = MagicMock(side_effect=http_error(429, json.dumps({"error": {"message": "quota exceeded"}})))
@@ -602,7 +621,9 @@ class TestAnalysisTimeouts(AnalysisFixture):
 
 class TestHttpSmoke(AnalysisFixture):
     def test_native_tools_through_real_http_and_spawn_worker(self):
-        with fake_api([tool_message("capability_probe", {}), {"content": "OK"}, tool_message(), FINAL]) as (url, received):
+        received_headers = []
+        self.backend["headers"] = {"authorization": "Custom test-token", "X-Route": "analysis"}
+        with fake_api([tool_message("capability_probe", {}), {"content": "OK"}, tool_message(), FINAL], received_headers) as (url, received):
             self.backend["base_url"] = url
             result = self.bot.analyze_ledger("分析本月开支", "2026-09-10")
         self.assertEqual(len(received), 4)
@@ -610,6 +631,11 @@ class TestHttpSmoke(AnalysisFixture):
         self.assertEqual(received[0]["tools"][0]["function"]["name"], "capability_probe")
         self.assertNotIn("Assets", json.dumps(received[0]))
         self.assertTrue(any(m["role"] == "tool" for m in received[3]["messages"]))
+        self.assertEqual(len(received_headers), 4)
+        for headers in received_headers:
+            self.assertEqual(headers["authorization"], "Custom test-token")
+            self.assertEqual(headers["X-Route"], "analysis")
+            self.assertEqual(headers["Content-Type"], "application/json")
         self.bot.load_ledger.assert_called_once()
 
     def test_unsupported_api_through_real_http_and_spawn_worker(self):

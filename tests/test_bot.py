@@ -250,6 +250,33 @@ class TestExamplesForPayee(unittest.TestCase):
         self.assertLess(out.index("2026-03-10"), out.index("2026-06-20"))
         self.assertEqual(self.bot.examples_for_payee("示例甲", limit=1).count("Expenses:Food:Coffee"), 1)
 
+    def test_history_stops_after_limit_and_preserves_same_day_order(self):
+        from beancount import loader
+        entries, errors, opts = loader.load_string(
+            "2026-01-01 open Expenses:X\n2026-01-01 open Assets:Cash\n" + "".join(
+                f'2026-02-01 * "Example" "n{index}"\n  Expenses:X 1 GBP\n  Assets:Cash\n'
+                for index in range(20)))
+        self.assertEqual(errors, [])
+        seen = []
+
+        class CountedEntries(list):
+            def __reversed__(self):
+                for entry in super().__reversed__():
+                    seen.append(entry)
+                    yield entry
+
+        out = self.bot.examples_for_payee("Example", limit=2, loaded=(CountedEntries(entries), opts))
+        self.assertEqual(len(seen), 2)
+        self.assertIn('"n18"', out)
+        self.assertIn('"n19"', out)
+        self.assertLess(out.index('"n18"'), out.index('"n19"'))
+
+    def test_nonpositive_history_limit_does_not_load(self):
+        self.bot.load_ledger = MagicMock()
+        for limit in (0, -1):
+            self.assertIsNone(self.bot.examples_for_payee("Example", limit=limit))
+        self.bot.load_ledger.assert_not_called()
+
     def test_metadata_stripped(self):
         # The prompt/datetime metadata this pipeline injects must not leak into examples.
         self.assertNotIn("prompt:", self.bot.examples_for_payee("示例甲"))
@@ -422,8 +449,12 @@ class TestHandlePhotoMessage(unittest.TestCase):
         self.bot.get_telegram_file_bytes = lambda file_id: b"fakeimg"
         self.bot.send_draft_for_review = MagicMock()
         self.bot.send_message = MagicMock()
+        self.bot._download_ledger_snapshot = MagicMock(return_value=("tree", {
+            "test.bean": {"sha": "journal", "content":
+                "2000-01-01 open Assets:Cash USD,CNY\n2000-01-01 open Expenses:Food USD,CNY\n"},
+        }))
         self.bot.call_openai_vision_invest = MagicMock(
-            return_value='2026-07-25 * "IBKR" "buy"\n  Assets:Cash  -1 USD\n  Expenses:Food  1 USD')
+            return_value='2026-07-25 * "DemoBroker" "buy"\n  Assets:Cash  -1 USD\n  Expenses:Food  1 USD')
         self.bot.call_openai_vision_expense = MagicMock(
             return_value='2026-07-25 * "Cafe" "lunch"\n  Expenses:Food  1 CNY\n  Assets:Cash')
 
@@ -652,7 +683,8 @@ class TestManualTransactionValidation(unittest.TestCase):
         self.addCleanup(self.bot.close)
         self.bot.send_message = MagicMock()
         self.appended = {}
-        def fake_append(appendix, msg, path):
+        def fake_append(appendix, msg, path, *, validate_ledger=False):
+            self.assertTrue(validate_ledger)
             self.appended["appendix"] = appendix
             return True, ""
         self.bot.append_to_file = fake_append
@@ -1380,6 +1412,50 @@ class TestListBeanFiles(unittest.TestCase):
         with patch.object(main.HTTP, "get", return_value=MagicMock(status_code=500)):
             self.assertIsNone(self.bot._list_bean_files())
 
+    def tree_response(self, sha="tree1", etag='"etag1"', *, truncated=False):
+        resp = MagicMock(status_code=200, headers={"ETag": etag} if etag else {})
+        resp.json.return_value = {"sha": sha, "truncated": truncated, "tree": [
+            {"type": "blob", "path": "test.bean", "sha": "blob-" + sha},
+        ]}
+        return resp
+
+    def test_unchanged_tree_is_revalidated_without_decoding_again(self):
+        initial, unchanged = self.tree_response(), MagicMock(status_code=304)
+        with patch.object(main.HTTP, "get", side_effect=[initial, unchanged]) as get:
+            first = self.bot._list_bean_files()
+            self.assertEqual(self.bot._list_bean_files(), first)
+        self.assertNotIn("If-None-Match", get.call_args_list[0].kwargs["headers"])
+        self.assertEqual(get.call_args_list[1].kwargs["headers"]["If-None-Match"], '"etag1"')
+        unchanged.json.assert_not_called()
+
+    def test_updated_tree_replaces_cache(self):
+        with patch.object(main.HTTP, "get", side_effect=[self.tree_response(), self.tree_response("tree2", '"etag2"'), MagicMock(status_code=304)]) as get:
+            self.bot._list_bean_files()
+            expected = ("tree2", {"test.bean": "blob-tree2"})
+            self.assertEqual(self.bot._list_bean_files(), expected)
+            self.assertEqual(self.bot._list_bean_files(), expected)
+        self.assertEqual(get.call_args.kwargs["headers"]["If-None-Match"], '"etag2"')
+
+    def test_failed_or_truncated_tree_cannot_use_cached_success(self):
+        with patch.object(main.HTTP, "get", side_effect=[self.tree_response(), MagicMock(status_code=500), self.tree_response("bad", '"bad"', truncated=True)]):
+            self.bot._list_bean_files()
+            self.assertIsNone(self.bot._list_bean_files())
+            with self.assertRaisesRegex(ValueError, "truncated"):
+                self.bot._list_bean_files()
+
+    def test_tree_cache_does_not_cross_branch_or_survive_missing_etag(self):
+        with patch.object(main.HTTP, "get", side_effect=[self.tree_response(), self.tree_response("tree2", None), self.tree_response()]) as get:
+            self.bot._list_bean_files()
+            self.bot.settings.BRANCH_NAME = "other"
+            self.bot._list_bean_files()
+            self.bot._list_bean_files()
+        for call in get.call_args_list:
+            self.assertNotIn("If-None-Match", call.kwargs["headers"])
+
+    def test_unexpected_304_cannot_supply_a_snapshot(self):
+        with patch.object(main.HTTP, "get", return_value=MagicMock(status_code=304)):
+            self.assertIsNone(self.bot._list_bean_files())
+
 
 class TestLedgerQuery(unittest.TestCase):
     """load_ledger mirrors the repo to a temp dir and load_file()s it, so include
@@ -1798,6 +1874,59 @@ class TestCheckedApproval(unittest.TestCase):
                 self.approve()
                 self.assertIn("1", self.bot.pending_llm_entries)
                 self.assertEqual(self.gh.commits, [])
+
+    def test_fenced_review_rejection_shows_reason_and_retains_paused_draft(self):
+        reason = "商家名称加入了原始输入未提供的产品名，请按原始输入修改。"
+        self.bot._call_llm_backends.return_value = '```json\n{"approved": false, "reason": "' + reason + '"}\n```'
+        self.approve()
+        message = self.bot.send_message.call_args.args[1]
+        self.assertIn("保存前审核未通过，尚未提交", message)
+        self.assertIn(reason, message)
+        self.assertIn("🔧 修改", message)
+        self.assertNotIn("Expecting value", message)
+        self.assertNotIn("JSONDecodeError", message)
+        self.assertEqual(self.gh.commits, [])
+        self.assertFalse(self.bot.pending_llm_entries["1"]["auto_confirm"])
+        persisted = self.bot.state.get("drafts")
+        self.assertEqual(persisted["pending"]["1"]["appendix"], self.entry)
+        self.assertFalse(persisted["pending"]["1"]["auto_confirm"])
+        self.assertEqual(persisted["inflight"], {})
+        self.bot.cleanup_expired_drafts()
+        self.bot._call_llm_backends.assert_called_once()
+
+    def test_fenced_positive_review_can_commit(self):
+        self.bot._call_llm_backends.return_value = '```JSON\r\n{"approved": true, "reason": "金额、账户一致"}\r\n```'
+        self.approve()
+        self.assertEqual(len(self.gh.commits), 1)
+        self.assertNotIn("1", self.bot.pending_llm_entries)
+
+    def test_fenced_rejection_also_pauses_automatic_confirmation(self):
+        self.bot._call_llm_backends.return_value = '```\n{"approved": false, "reason": "分类不明确，请补充说明"}\n```'
+        self.pending["created_at"] = 0
+        self.bot.cleanup_expired_drafts()
+        self.assertIn("分类不明确，请补充说明", self.bot.send_message.call_args.args[1])
+        self.assertFalse(self.bot.pending_llm_entries["1"]["auto_confirm"])
+        self.assertEqual(self.gh.commits, [])
+
+    def test_invalid_review_has_readable_error_and_cannot_extract_partial_approval(self):
+        for raw in [
+            '```json\nnot json\n```',
+            '```json\n{"approved": true}\n```',
+            '{"approved":"true","reason":"ok"}',
+            '{"approved":true,"reason":"ok","approved":false}',
+            '{"approved":true,"reason":"ok"} {"approved":false,"reason":"conflict"}',
+            '说明：{"approved":true,"reason":"ok"}',
+            '```json\n{"approved":true,"reason":"ok"}\n```\n{"approved":false}',
+        ]:
+            with self.subTest(raw=raw):
+                self.bot._call_llm_backends.return_value = raw
+                self.approve()
+                message = self.bot.send_message.call_args.args[1]
+                self.assertIn("尚未提交", message)
+                self.assertIn("请重试审核", message)
+                self.assertNotIn("Expecting", message)
+                self.assertEqual(self.gh.commits, [])
+                self.assertFalse(self.bot.pending_llm_entries["1"]["auto_confirm"])
 
     def test_timeout_failure_does_not_auto_retry(self):
         self.pending["created_at"] = 0

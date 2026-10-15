@@ -28,14 +28,26 @@ python main.py
 
 LLM 的地址、密钥和模型配置见 [配置模板](config.json.example)。截图可单独指定 `LLM_VISION_MODEL`。账户定义放在账本仓库的 `accounts/` 及其子目录。
 
+每个 `LLM_BACKENDS` 项可独立设置 `LLM_HEADERS`，默认 `{}`。它覆盖或补充该 endpoint 的请求头，适用于文本、截图、保存前审核、查询、分析及能力探测；故障切换使用目标后端自己的配置。例如：
+
+```json
+"LLM_HEADERS": {
+    "User-Agent": "beancounter-telegram",
+    "X-Api-Key": "your-endpoint-key",
+    "X-Route": "accounting"
+}
+```
+
+未覆盖的应用默认值为 `Authorization: Bearer <LLM_API_KEY>`、`Content-Type: application/json` 和 `Accept: application/json`。字段名不区分大小写，值必须是字符串；设为 `null` 可移除应用默认值，例如用 `"Authorization": null` 配合 `X-Api-Key` 鉴权。HTTP 客户端仍可能自动补充协议头。`LLM_API_KEY` 仍按现有配置规则填写。非法头名称、换行或无法发送的字符会在启动时报告配置错误；修改 `config.json` 后需重启。
+
 ## 使用
 
 - 记账：发送 `星巴克 35 CNY，支付宝支付`，或发送账单截图。信息不足时会要求补充。
-- 查询：发送 `这个月吃饭花了多少`、`招行余额` 或 `最近 10 条 Chase 记录`，直接返回表格。
+- 查询：发送 `这个月吃饭花了多少`、`示例银行余额` 或 `最近 10 条 DemoBank 记录`，直接返回表格。
 - 分析：发送 `分析最近三个月消费趋势`、`为什么这个月比上个月花得多`。模型可连续查询，再给出带查询来源的解释和代码块表格。
 - 草稿：✅ 保存、🔧 修改、❌ 丢弃。默认 **120 秒无操作自动确认**；修改或检查失败后暂停自动确认，可用 `DRAFT_TTL_SECONDS` 调整时长。
 
-LLM 草稿保存前必须通过完整账本校验和独立 LLM 一致性审核。保存交易后自动展示**当前自然月分类开支**及**本笔涉及的资产／负债账户余额**，表格省略冗余账户前缀。开支按成本分币种统计，余额包含全部账本日期、保留持仓单位和负债符号；统计失败不影响已保存交易。
+LLM 草稿在展示前已完成最终候选账本的 bean-check；保存时内容一致就复用结果，账本或草稿变化时重新检查。独立 LLM 审核仅核对有输入依据的事实矛盾，不应因分类偏好、措辞或不确定性拒绝保存；可设 `"LLM_REVIEW_ENABLED": false` 关闭该模型调用（默认 `true`）。保存交易后自动展示**当前自然月分类开支**及**本笔涉及的资产／负债账户余额**，表格省略冗余账户前缀。开支按成本分币种统计，余额包含全部账本日期、保留持仓单位和负债符号；统计失败不影响已保存交易。
 
 ### 分析边界
 
@@ -79,6 +91,8 @@ Food 20 GBP
 Cash -20 GBP
 ```
 
+手动多行分录也必须先通过包含账户定义、历史记录等全部文件的 bean-check，才会写入 GitHub；不通过时返回具体账本错误。校验期间账本变化或提交冲突会重新下载并检查候选账本。保存后的统计复用已校验结果。
+
 ## 个性化与运维
 
 - 将 [user.md.example](user.md.example) 复制为本地 `user.md`，填写账户别名、分类和语言偏好；每次业务 LLM 请求重新读取，无需重启。已有文件请勿覆盖。
@@ -86,3 +100,5 @@ Cash -20 GBP
 - 用户输入、账户信息、必要查询结果和偏好会发送到配置的 LLM 服务；分析不开放交易元数据查询。日志包含模型返回和交易信息，请限制访问。
 - 可选工作流模板见 [.github/workflows](.github/workflows)：复制到**账本仓库**并去掉 `.example`，设置 `TELEGRAM_TOKEN` 和 `TELEGRAM_CHAT_ID` secrets。`/view` 需要 `monthly-report.yml`；`notify-on-push.yml` 可能与保存后的统计重复通知。
 - [依赖与升级](requirements.md) · [开发与测试](CLAUDE.md) · [完整校验性能基准](scripts/benchmark_ledger.py)
+
+性能方面，GitHub 目录每次仍向服务器校验最新状态，未变化时通过 ETag / 304 复用目录，减少传输和 JSON 解析；错误或截断的目录会阻止后续查询或提交。商家历史利用 Beancount 已排序的记录倒序检索，找到所需条数即停止。文本、反馈和截图生成共用校验重试流程。

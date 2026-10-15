@@ -5,6 +5,7 @@ from beancount.core.data import Transaction, Open, Close
 from beancount.parser import parser
 from concurrent.futures import as_completed
 import base64
+from itertools import chain, islice
 try:
     from beancount.query import query as beancount_query
 except ModuleNotFoundError as exc:
@@ -99,12 +100,19 @@ class LedgerMixin:
 
     def _list_bean_files(self) -> tuple[str, dict[str, str]] | None:
         """Return a tree SHA and path→blob SHA map for immutable ledger downloads."""
+        with self._tree_lock:
+            return self._fetch_bean_tree()
+
+    def _fetch_bean_tree(self):
         url = f"{GITHUB_URL_BASE}/repos/{self.settings.REPO_OWNER}/{self.settings.REPO_NAME}/git/trees/{self.settings.BRANCH_NAME}?recursive=1"
-        headers = {"Authorization": f"token {self.settings.GITHUB_TOKEN}",
-                   "Accept": "application/vnd.github+json",
-                   "X-GitHub-Api-Version": "2022-11-28"}
+        headers = {**self.settings.GITHUB_HEADERS, "Accept": "application/vnd.github+json"}
+        cached = self._tree_etag_cache
+        if cached and cached[0] == url:
+            headers["If-None-Match"] = cached[1]
         with timed("GitHub tree listing"):
             r = HTTP.get(url, headers=headers, timeout=30)
+        if r.status_code == 304 and cached and cached[0] == url:
+            return cached[2]
         if r.status_code != 200:
             log(f"Could not list repo tree: HTTP {r.status_code}")
             return None
@@ -113,7 +121,10 @@ class LedgerMixin:
             raise ValueError("Repo tree is truncated; cannot verify the complete ledger.")
         paths = {t["path"]: t["sha"] for t in data.get("tree", [])
                  if t.get("type") == "blob" and t["path"].endswith((".bean", ".beancount"))}
-        return data["sha"], paths
+        listed = data["sha"], paths
+        etag = r.headers.get("ETag")
+        self._tree_etag_cache = (url, etag, listed) if isinstance(etag, str) and etag else None
+        return listed
 
     def _download_blob(self, sha: str) -> dict:
         url = f"{GITHUB_URL_BASE}/repos/{self.settings.REPO_OWNER}/{self.settings.REPO_NAME}/git/blobs/{sha}"
@@ -126,7 +137,7 @@ class LedgerMixin:
 
     def _download_files(self, paths):
         """Caller holds _snapshot_lock; reuse immutable blobs from bounded snapshots."""
-        cached = {f["sha"]: f for f in [*(self._snapshot_cache[1] or {}).values(), *self._account_files.values()]}
+        cached = {f["sha"]: f for f in chain((self._snapshot_cache[1] or {}).values(), self._account_files.values())}
         missing = set(paths.values()) - cached.keys()
         with timed(f"blob downloads: {len(missing)} new / {len(paths)} files"):
             futures = {self._downloads.submit(self._download_blob, sha): sha for sha in missing}
@@ -224,6 +235,12 @@ class LedgerMixin:
     def _ledger_root(self, texts):
         return self.settings.LEDGER_ROOT or ("main.bean" if "main.bean" in texts else self.settings.FILE_PATH)
 
+    def _remember_checked_ledger(self, texts, checked):
+        """The next reader verifies remote texts before reusing this checked result."""
+        with self._ledger_cache_lock:
+            self._ledger_cache = {"tree_sha": None, "entries": checked[0],
+                                  "options_map": checked[1], "texts": texts}
+
     def run_bql(self, bql: str, loaded=None) -> tuple[list, list]:
         """Execute a BQL query. Raises on a bad query; the caller feeds that back to the LLM.
         Callers retrying a query pass a cached `load_ledger()` result as `loaded` to avoid
@@ -270,22 +287,23 @@ class LedgerMixin:
         the router's guess and may not exactly equal the stored string. Callers that
         already hold a `load_ledger()` result pass it as `loaded` to skip a round trip."""
         needle = payee.casefold().strip()
-        if not needle:
+        if not needle or limit <= 0:
             return None
         if loaded is NOT_LOADED:
             loaded = self.load_ledger()
         if loaded is None:
             return None
         entries, _ = loaded
-        matched = [
-            e for e in entries
+        # Beancount's loader returns entries in date order. Walk from the newest
+        # and stop at the limit instead of scanning and sorting every match.
+        matched = list(islice((
+            e for e in reversed(entries)
             if isinstance(e, Transaction) and e.payee
-            and (needle in e.payee.casefold() or e.payee.casefold() in needle)
-        ]
+            and (needle in (name := e.payee.casefold()) or name in needle)
+        ), limit))
         if not matched:
             return None
-        matched.sort(key=lambda e: e.date)
-        return "\n\n".join(self._format_example_entry(e) for e in matched[-limit:])
+        return "\n\n".join(self._format_example_entry(e) for e in reversed(matched))
 
     def frequent_payees(self, limit: int = 50, loaded=NOT_LOADED) -> list[str]:
         """Return up to `limit` payees ordered by how often they appear in the ledger.
@@ -374,7 +392,7 @@ class LedgerMixin:
         return ok
 
     def append_to_file(self, appendix: str, commit_message: str, file_path: str | None = None,
-                       downloaded: dict | None = None) -> tuple[bool, str]:
+                       downloaded: dict | None = None, *, validate_ledger: bool = False) -> tuple[bool, str]:
         """Append to a file, retrying when it changed underneath us.
 
         GitHub rejects a PUT carrying a stale sha (409, or 422 for the same reason),
@@ -384,6 +402,8 @@ class LedgerMixin:
 
         `downloaded` lets a caller that already fetched the file (to validate before
         claiming a draft) hand it over instead of paying for a second round trip.
+        Manual transactions require `validate_ledger`: ignore any caller-supplied
+        file and check a complete, fresh candidate snapshot on every attempt.
         Returns (ok, error_message_for_user).
         """
         file_path = file_path or self.settings.FILE_PATH
@@ -391,7 +411,14 @@ class LedgerMixin:
         marker = f"; telegram-update: {update_id}" if update_id is not None else None
         f = downloaded
         for attempt in range(1, GITHUB_CONFLICT_RETRIES + 1):
-            if f is None:
+            if validate_ledger:
+                try:
+                    tree_sha, files = self._download_ledger_snapshot()
+                    f = files[file_path]
+                except Exception as exc:
+                    log(f"Manual journal snapshot unavailable ({type(exc).__name__}: {exc}).")
+                    return False, "无法获取完整账本，尚未保存。请稍后重试。"
+            elif f is None:
                 f = self.github_download_file(file_path)
                 if not f:
                     return False, "Failed to download from GitHub."
@@ -399,9 +426,24 @@ class LedgerMixin:
             if marker and marker in f["content"].splitlines():
                 return True, ""
             addition = (marker + "\n" if marker else "") + appendix
-            ok, status = self._github_put_file(
-                f["content"] + '\n' + addition + '\n', f["sha"], commit_message, file_path)
+            content = f["content"] + '\n' + addition + '\n'
+            if validate_ledger:
+                texts = {path: file["content"] for path, file in files.items()}
+                texts[file_path] = content
+                try:
+                    checked = self._check_commit_candidate(texts)
+                except ValueError as exc:
+                    return False, f"账本校验未通过，尚未保存：\n{exc}"
+                latest = self._list_bean_files()
+                if latest is None:
+                    return False, "无法确认账本版本，尚未保存。请稍后重试。"
+                if latest[0] != tree_sha:
+                    log("Ledger changed during manual journal check; rebuilding candidate.")
+                    continue
+            ok, status = self._github_put_file(content, f["sha"], commit_message, file_path)
             if ok:
+                if validate_ledger:
+                    self._remember_checked_ledger(texts, checked)
                 return True, ""
             if status not in (409, 422):
                 return False, "Failed to upload to GitHub."

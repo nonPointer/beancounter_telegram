@@ -243,7 +243,6 @@ class TelegramMixin:
         self.cleanup_expired_drafts()
 
     def start(self):
-        self._precheck_enabled = True
         next_registration = 0
         while not self.stop.is_set():
             try:
@@ -262,7 +261,6 @@ class TelegramMixin:
         if not self._closed:
             self.stop.set()
             self.dispatcher.close()
-            self._prechecks.shutdown(wait=True, cancel_futures=True)
             self._downloads.shutdown(wait=True)
             self._save_pending()
             self.state.close()

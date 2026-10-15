@@ -51,6 +51,10 @@ class LedgerValidationError(ValueError):
     """A generated draft failed ledger validation; its message is user-facing."""
 
 
+class JournalReviewRejected(ValueError):
+    """The independent reviewer rejected a draft; the message is its reason."""
+
+
 def _build_http_session() -> requests.Session:
     """Shared session reused for all outbound HTTP (LLM, GitHub, Telegram).
 
