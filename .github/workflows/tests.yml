@@ -14,9 +14,9 @@ jobs:
         python: ['3.10', '3.12']
         beancount: ['>=2.3.4,<3', '>=3,<4']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -45,6 +45,9 @@ jobs:
 
       - name: test_analysis
         run: python tests/test_analysis.py
+
+      - name: test_shadow
+        run: python tests/test_shadow.py
 
       - name: Synthetic ledger performance comparison
         if: matrix.python == '3.12' && matrix.beancount == '>=3,<4'

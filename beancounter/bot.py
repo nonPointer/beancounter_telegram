@@ -76,6 +76,7 @@ class Bot(EntryMixin, LedgerMixin, LLMMixin, DraftMixin, TelegramMixin, ReportMi
         self._snapshot_cache = (None, None)
         # Last passing pre-commit check, keyed by a digest of the complete candidate texts.
         self._commit_check_cache = (None, None)
+        self._checked_ledgers = []  # Guarded by _commit_check_lock; newest first.
         self._commit_check_lock = threading.Lock()
         self._account_files = {}
         self._snapshot_lock = threading.RLock()

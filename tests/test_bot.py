@@ -2001,6 +2001,40 @@ class TestCheckedApproval(unittest.TestCase):
         self.assertEqual(replacement["feedback"], ["实际用现金支付"])
         self.assertTrue(replacement["auto_confirm"])
 
+    def test_regeneration_records_the_prompt_without_its_date_line(self):
+        raw = "yesterday\nUber 打车 5 GBP"
+        self.bot.pending_llm_entries.clear()
+        pid = self.bot.publish_llm_draft(123, self.entry, "entry", raw, "2026-07-01", header="草稿：",
+                                         prompt="Uber 打车 5 GBP")
+        first = self.bot.pending_llm_entries[pid]
+        self.assertIn('  prompt: "Uber 打车 5 GBP"', first["appendix"])
+        self.bot.call_openai_compatible = MagicMock(return_value=self.entry)
+        self.bot.run_recheck(123, pid, "实际用现金支付")
+        (replacement,) = self.bot.pending_llm_entries.values()
+        self.assertIsNot(replacement, first)
+        self.assertIn('  prompt: "Uber 打车 5 GBP"', replacement["appendix"])
+        self.assertNotIn("yesterday", replacement["appendix"])
+        self.assertEqual(replacement["user_input"], raw)  # The reviewer still sees what was actually sent.
+        self.bot.run_recheck(123, next(iter(self.bot.pending_llm_entries)), "再改一次")
+        (again,) = self.bot.pending_llm_entries.values()
+        self.assertNotIn("yesterday", again["appendix"])
+
+    def test_regenerated_screenshot_without_caption_records_no_prompt(self):
+        self.bot.pending_llm_entries.clear()
+        pid = self.bot.publish_llm_draft(123, self.entry, "entry", "(expense screenshot)", "2026-07-01",
+                                         header="消费草稿：", prompt="", photo_file_id="photo")
+        self.assertNotIn("prompt:", self.bot.pending_llm_entries[pid]["appendix"])
+        self.bot.call_openai_compatible = MagicMock(return_value=self.entry)
+        self.bot.run_recheck(123, pid, "金额是 5")
+        (replacement,) = self.bot.pending_llm_entries.values()
+        self.assertNotIn("prompt:", replacement["appendix"])
+
+    def test_draft_persisted_before_recorded_prompt_falls_back_to_the_input(self):
+        self.bot.call_openai_compatible = MagicMock(return_value=self.entry)
+        self.bot.pending_llm_id = 1
+        self.bot.run_recheck(123, "1", "实际用现金支付")
+        self.assertIn('  prompt: "现金买咖啡 5 GBP"', self.bot.pending_llm_entries["2"]["appendix"])
+
     def test_failed_recheck_preserves_draft_with_timeout_paused(self):
         self.bot.call_openai_compatible = MagicMock(side_effect=ValueError("service unavailable"))
         self.bot.run_recheck(123, "1", "实际用现金支付")

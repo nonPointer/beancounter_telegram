@@ -4,6 +4,8 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import gc
+import hashlib
 import tempfile
 import threading
 import time
@@ -18,7 +20,7 @@ from beancounter.settings import Settings, llm_headers
 from beancounter.dispatch import Dispatcher
 from beancounter.state_store import StateStore
 from beancounter.ledger_validation import check_ledger, load_ledger_texts
-from beancounter.ledger_validation import _load_complete_file
+from beancounter.ledger_validation import _gc_paused, _load_complete_file
 from beancount import loader
 from beancount.ops import validation
 from test_bot import MOCK_CONFIG, FakeGitHub
@@ -516,6 +518,60 @@ class TestPerformance(unittest.TestCase):
         _, files = self.bot._download_ledger_snapshot(("second", second))
         self.bot._download_blob.assert_called_once_with("journal2")
         self.assertEqual(files["test.bean"]["content"], "; changed\n")
+
+    def test_written_journal_is_not_downloaded_again(self):
+        _, files = self.bot._download_ledger_snapshot(("first", self.paths))
+        content = files["test.bean"]["content"] + "; appended\n"
+        # Git names a blob by the SHA-1 of "blob <size>\0<bytes>"; the tree lists exactly that.
+        data = content.encode("utf-8")
+        written = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        self.bot._remember_written_file(files, "test.bean", content)
+        self.bot._download_blob.reset_mock()
+        _, after = self.bot._download_ledger_snapshot(("second", {**self.paths, "test.bean": written}))
+        self.bot._download_blob.assert_not_called()
+        self.assertEqual(after["test.bean"], {"content": content, "sha": written})
+
+    def test_written_journal_changed_remotely_is_downloaded(self):
+        _, files = self.bot._download_ledger_snapshot(("first", self.paths))
+        self.bot._remember_written_file(files, "test.bean", "; ours\n")
+        self.contents["theirs"] = "; theirs\n"
+        self.bot._download_blob.reset_mock()
+        _, after = self.bot._download_ledger_snapshot(("second", {**self.paths, "test.bean": "theirs"}))
+        self.bot._download_blob.assert_called_once_with("theirs")
+        self.assertEqual(after["test.bean"]["content"], "; theirs\n")
+
+    def test_written_journal_never_replaces_a_newer_snapshot(self):
+        _, files = self.bot._download_ledger_snapshot(("first", self.paths))
+        self.contents["journal2"] = "; changed\n"
+        newer = self.bot._download_ledger_snapshot(("second", {**self.paths, "test.bean": "journal2"}))
+        self.bot._remember_written_file(files, "test.bean", "; stale write\n")
+        self.assertIs(self.bot._snapshot_cache, newer)
+
+    def test_collector_pause_is_shared_and_restored(self):
+        self.addCleanup(gc.enable)
+        gc.enable()
+        with _gc_paused():
+            with _gc_paused():
+                self.assertFalse(gc.isenabled())
+            self.assertFalse(gc.isenabled())  # The outer load is still allocating.
+        self.assertTrue(gc.isenabled())
+        with self.assertRaises(RuntimeError), _gc_paused():
+            raise RuntimeError("synthetic failure")
+        self.assertTrue(gc.isenabled())
+        gc.disable()
+        with _gc_paused():
+            pass
+        self.assertFalse(gc.isenabled())  # A collector the host disabled stays disabled.
+
+    def test_complete_check_runs_with_collector_paused(self):
+        self.addCleanup(gc.enable)
+        gc.enable()
+        seen = []
+        real = loader._uncached_load_file
+        with patch.object(loader, "_uncached_load_file", side_effect=lambda *a: (seen.append(gc.isenabled()), real(*a))[1]):
+            check_ledger({"main.bean": "2000-01-01 open Assets:Cash GBP\n"}, "main.bean")
+        self.assertEqual(seen, [False])
+        self.assertTrue(gc.isenabled())
 
     def test_deleted_renamed_and_duplicate_blobs(self):
         self.bot._download_ledger_snapshot(("first", self.paths))

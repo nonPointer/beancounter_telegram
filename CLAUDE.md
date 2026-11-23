@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run in debug mode (extra logging)
 .venv/bin/python main.py debug
 
-# Run tests (unittest). All six suites inject settings and isolated state;
+# Run tests (unittest). Every suite injects settings and isolated state;
 # no deployment config or credentials are needed.
 .venv/bin/python tests/test_refactor.py   # core logic tests
 .venv/bin/python tests/test_bot.py        # Bot behaviour: auth, polling resilience, drafts, queries
@@ -19,6 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .venv/bin/python tests/test_runtime.py    # SQLite restart, bounded queues, configuration
 .venv/bin/python tests/test_reports.py    # Post-save BQL summaries and checked snapshot reuse
 .venv/bin/python tests/test_analysis.py   # Native tools, JSON fallback, read-only BQL worker and bounds
+.venv/bin/python tests/test_shadow.py     # Incremental check vs. complete bean-check, differential and rule tests
 
 # Interactive LLM test tool (real services; use synthetic input and a test ledger)
 .venv/bin/python scripts/preview_llm.py --live
@@ -26,7 +27,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs all six suites on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
+Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.query`. Do not suppress unrelated import errors. The result formatter accepts both legacy two-field and DB-API column descriptions. CI runs every suite on Python 3.10/3.12 with Beancount v2/v3. Parser-error fixtures must be invalid in both versions (single-letter commodities such as `O` are valid in v3).
 
 **Python Telegram Bot (`beancounter/bot.py`)** — root `main.py` is a thin, stable launch entry point.
 - Polls Telegram; persists updates before acknowledgment and uses bounded FIFO worker lanes
@@ -43,6 +44,7 @@ Beancount v2 uses its built-in `beancount.query`; v3 falls back to `beanquery.qu
 - `beancounter/bot_utils.py` — formatting/date helpers, constants, thread-local HTTP connection pools
 - `beancounter/dispatch.py`, `state_store.py` — bounded workers and SQLite state/inbox
 - `beancounter/ledger_validation.py` — complete local bean-check equivalent
+- `beancounter/ledger_shadow.py` — in-memory incremental check for transactions appended to an already checked ledger
 - `beancounter/prompts.py` — LLM system prompts and user prompt builders
 - `beancounter/templates/*.bean.j2` — Jinja2 templates located relative to the package, not the working directory
 - `scripts/preview_llm.py` — opt-in live integration preview, separate from offline `tests/`
@@ -103,7 +105,11 @@ A stable `; telegram-operation: <uuid>` marker reconciles a PUT whose response w
 Exceptions and HTTP failures restore the draft with automatic confirmation disabled.
 `/undo` rewrites precomputed content, so a conflict requires a fresh `/undo`.
 
-`_check_commit_candidate` keeps the last passing check in one slot keyed by a SHA-256 digest of the root and every candidate file. Byte-identical candidates reuse it regardless of elapsed time. A changed candidate, a process restart, or an evicted result requires a full check; failures are never cached.
+`_check_commit_candidate` keeps the last passing check in one slot keyed by a SHA-256 digest of the root and every candidate file. Byte-identical candidates reuse it regardless of elapsed time. Failures are never cached.
+
+A candidate that differs from the cached one is first tried incrementally (`ledger_shadow.CheckedLedger`). The base must be a snapshot this process already checked: the loaded ledger cache, a candidate that passed, or an accepted extension of either; the newest four are kept under `_commit_check_lock`. The candidate qualifies only when every other file is byte-identical and the journal is the base journal plus appended text that parses, on its own, to plain transactions with no option, plugin or include. The shadow ledger then holds the directives before a cutoff date other than transactions, pads and balances, one synthetic transaction per account reproducing its inventory lot by lot, every original directive dated on or after the cutoff, and the additions, and runs Beancount's own `booking.book`, `run_transformations`, `validation.validate` and `HARDCORE_VALIDATIONS` in memory. The accepted result is the base entries before the cutoff spliced with the shadow's entries from the cutoff, which `tests/test_shadow.py` requires to equal the complete loader's output.
+
+Three rules keep it equivalent and each has a test that fails without it: later-dated directives stay in the shadow (the bot dates `balance` tomorrow), the cutoff moves back to the latest pad whose account or child is asserted on or after it, and the baseline keeps lot cost, date and label. Equal sort keys are ordered by file parse order, as the loader's stable sort does. The incremental path can only accept. Any error, a ledger with user plugins, a `documents` option or raw plugin mode, a non-transaction addition, an external change, a journal without directives, or an exception inside Beancount's internals returns `None` and the complete check decides and produces the diagnostics. A process restart starts from a complete check; the base's pre-booking directives are parsed once, lazily, on its first incremental use. Do not let the incremental path reject or report errors on its own, and keep the differential test strict in both directions when upgrading Beancount.
 
 Production text, screenshot and feedback generation prepare a pending draft before calling the LLM. The retry loop finalizes prompt/datetime metadata and checks the exact candidate bytes, including its operation marker. `publish_llm_draft` accepts that prepared result, persists it and only then shows the draft. Direct publication also checks before showing. Saving downloads the current snapshot and compares the candidate digest, so an unchanged candidate reuses the generation check. There is no background precheck thread. Standalone generation calls without a prepared pending draft retain the best-effort legacy context validator for the manual preview tool.
 
@@ -125,7 +131,7 @@ renderer miscounts. Prompt gotcha: `units`/`cost` are functions, not columns.
 
 The router also accepts `analysis`. `analysis.py` owns the bounded loop: four query rounds, eight attempted BQL queries, then one final answer request. These budgets are shared across backend failover and protocol errors; an explicit tool rejection retries the same turn as JSON on the same backend, preserving query evidence. Capability probes use synthetic data with no `user.md`, verify both function calls and tool-result messages, and cache explicit support/rejection for one hour by endpoint/model/credential. Inconclusive probes, probe errors, timeouts and exhausted probe budgets use JSON on the same backend for that analysis without negative caching. Failover follows a failed JSON request, or an unrelated error during native analysis such as authentication, rate limiting or connection failure. Cached capability results remain usable after the probe budget runs out. Analysis uses the existing Chat Completions transport and preference loader. Error diagnostics retain HTTP status and selected type/code/message fields, mask configured credentials and Bearer tokens, and omit raw response bodies and separate echoed-generation fields. Error messages may still include private data; do not publish logs. See the [official function calling protocol](https://developers.openai.com/api/docs/guides/function-calling).
 
-`analysis_query.py` owns AST-based SELECT/function/column restrictions, exact typed JSON serialization and a persistent spawn worker holding the already-validated snapshot. It does not re-load or re-check the ledger between queries. Transaction and posting metadata are removed from the worker copy without modifying the shared cache. Each query has a 15-second wait limit; timeout exits the session and terminates the worker. Settings define `ANALYSIS_REQUEST_TIMEOUT_SECONDS` (180), `ANALYSIS_TIMEOUT_SECONDS` (600, starting after ledger loading), and `ANALYSIS_PROBE_BUDGET_SECONDS` (120, accumulated across all backends in one analysis). Each probe handshake shares one deadline for both requests, constrained by the remaining workflow and probe budgets. Invalid/non-positive settings use defaults. Request inactivity timeouts and process startup mean this is not a strict end-to-end wall-clock guarantee. Non-analysis LLM requests retain their existing timeout. Result rows/cells/characters and Telegram tables are capped with explicit truncation markers. The model's narrative is escaped, citations must name successful query IDs, and tables/BQL come from executed evidence, not model-written tables. Narrative accuracy remains a model limitation.
+`analysis_query.py` owns AST-based SELECT/function/column restrictions, exact typed JSON serialization and a persistent spawn worker holding the already-validated snapshot. It does not re-load or re-check the ledger between queries. Transaction and posting metadata are removed from the worker copy without modifying the shared cache. Account labels for result tables are computed once per worker snapshot, not once per query. Each query has a 15-second wait limit; timeout exits the session and terminates the worker. Settings define `ANALYSIS_REQUEST_TIMEOUT_SECONDS` (180), `ANALYSIS_TIMEOUT_SECONDS` (600, starting after ledger loading), and `ANALYSIS_PROBE_BUDGET_SECONDS` (120, accumulated across all backends in one analysis). Each probe handshake shares one deadline for both requests, constrained by the remaining workflow and probe budgets. Invalid/non-positive settings use defaults. Request inactivity timeouts and process startup mean this is not a strict end-to-end wall-clock guarantee. Non-analysis LLM requests retain their existing timeout. Result rows/cells/characters and Telegram tables are capped with explicit truncation markers. The model's narrative is escaped, citations must name successful query IDs, and tables/BQL come from executed evidence, not model-written tables. Narrative accuracy remains a model limitation.
 
 ### Payee context for drafts
 
@@ -199,6 +205,7 @@ After LLM generation, `insert_prompt_metadata()` inserts the original user text 
 - Text messages: always inserted; photo messages: inserted only when caption is present
 - Double quotes in the prompt value are escaped as `\"`
 - Idempotent: skips insertion if `prompt:` key already exists
+- The recorded text is the input after `parse_natural_date` removed its date line (`yesterday`, `昨天` and so on); the transaction date already carries that information. The pending draft keeps it as `recorded_prompt`, so feedback regeneration records the same text instead of the raw `user_input`, and a captionless screenshot still records no prompt. `user_input` stays raw for the reviewer.
 - Falls back to no-op if no transaction header line is found (e.g. balance directives)
 
 ### Account list prompt format
@@ -218,7 +225,7 @@ If a date is detected, it overrides today's date and the first line is stripped 
 - `_accounts_cache_lock` — protects `_accounts_cache` read/write (network calls run outside the lock)
 - `_accounts_refresh_lock` — coalesces concurrent account refreshes; `_load_lock` serializes ledger context loads so successful parsing is reused by tree SHA
 - `_snapshot_lock` — protects snapshot construction and shared immutable blob reuse across account and full-ledger reads; `_downloads` is one reusable pool of at most 8 workers per Bot, drained on close
-- Snapshot cache holds the latest complete ledger plus the latest complete account files, not an unbounded history of blob versions. Only missing SHAs are downloaded; failed refreshes never replace the complete snapshot. Each request still checks the remote tree, and every distinct candidate must pass full local validation before writing.
+- Snapshot cache holds the latest complete ledger plus the latest complete account files, not an unbounded history of blob versions. Only missing SHAs are downloaded; failed refreshes never replace the complete snapshot. After a validated journal write, `_remember_written_file` keeps the written text under its locally computed Git blob SHA, so the next snapshot does not download the whole journal again; a remote blob with any other SHA is downloaded as before. Each request still checks the remote tree, and every distinct candidate must pass local validation before writing: the complete check, or the incremental check described under "Appending to the ledger" when the candidate only appends transactions to a ledger already checked in this process.
 - `print_lock` — serializes log output
 - Fixed worker lanes preserve per-chat order, including timeout approval. Capacity is bounded. A full lane is skipped for the rest of the scheduling pass, without blocking other lanes or letting later jobs in that lane overtake it.
 - SQLite inbox acknowledgment follows durable enqueue; interrupted jobs replay on startup.
@@ -226,7 +233,7 @@ If a date is detected, it overrides today's date and the first line is stripped 
 
 `Timing [...]` logs expose queue wait, tree listing, blob download count/time, account refresh, ledger context, snapshot materialization, parser/validation and draft checkpoints. Stages overlap, so their durations are not additive. Full LLM output and full validation diagnostics remain available; never remove the mandatory validation/review gates as a speed optimization.
 
-`ledger_validation._load_complete_file` isolates Beancount's private v2/v3 `_uncached_load_file` entry point so disposable snapshots never write unused pickle caches. It runs the full basic pipeline, then invokes each `HARDCORE_VALIDATIONS` function explicitly; passing these as `extra_validations` mutates the global validation list in affected Beancount releases. Keep the real-loader equivalence, plugin type-error and repeated/concurrent validation tests in `tests/test_runtime.py` when upgrading Beancount. `scripts/benchmark_ledger.py` compares the previous and optimized calls using only synthetic data in separate processes; Linux CI runs the comparison on Python 3.12 with v3. The benchmark resets the validation list between samples to isolate per-check overhead; it does not claim a fixed speedup for every ledger.
+`ledger_validation._load_complete_file` isolates Beancount's private v2/v3 `_uncached_load_file` entry point so disposable snapshots never write unused pickle caches. It runs the full basic pipeline, then invokes each `HARDCORE_VALIDATIONS` function explicitly; passing these as `extra_validations` mutates the global validation list in affected Beancount releases. Keep the real-loader equivalence, plugin type-error and repeated/concurrent validation tests in `tests/test_runtime.py` when upgrading Beancount. The load runs inside `_gc_paused`: Python's cyclic collector is suspended while Beancount allocates the ledger, which removes roughly a quarter to a third of the check time on large ledgers without skipping any check. The pause is process-wide and reference-counted, so overlapping loads restore the collector only when the last one finishes, and a collector the host had disabled stays disabled. `scripts/benchmark_ledger.py` compares the previous and optimized calls using only synthetic data in separate processes; Linux CI runs the comparison on Python 3.12 with v3. The benchmark resets the validation list between samples to isolate per-check overhead; it does not claim a fixed speedup for every ledger.
 
 The loader adapter serializes v2 calls because its include parser temporarily changes the process working directory; overlapping calls can restore a deleted snapshot directory. v3 does not use that chdir path and remains concurrent. Keep the working-directory assertion in the concurrency regression test.
 

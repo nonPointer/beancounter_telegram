@@ -416,6 +416,8 @@ def display_width(text: str) -> int:
     beancount's own query_render measures in characters, which renders Chinese
     narrations misaligned in Telegram's <pre> block.
     """
+    if text.isascii():
+        return len(text)
     return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
 
 

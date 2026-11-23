@@ -1,6 +1,7 @@
 """Drafts responsibilities of Bot; shared entry points are preserved."""
 
 from .ledger_validation import check_ledger
+from .ledger_shadow import CheckedLedger
 from datetime import datetime
 import hashlib
 import requests
@@ -30,6 +31,9 @@ class DraftMixin:
             pending["feedback"] = previous.get("feedback", [])
             pending["prompt_time"] = previous.get("prompt_time", pending["prompt_time"])
             photo_file_id = previous.get("photo_file_id")
+            # Regeneration records the same prompt as the first draft: no date line, no screenshot placeholder.
+            pending["draft_prompt"] = previous.get("recorded_prompt", pending["draft_prompt"])
+        pending["recorded_prompt"] = pending["draft_prompt"]
         if photo_file_id:
             pending["photo_file_id"] = photo_file_id
         return pending
@@ -146,6 +150,7 @@ class DraftMixin:
                 texts[self.settings.FILE_PATH], current["sha"], pending["commit_message"].strip())
             if ok:
                 self._remember_checked_ledger(texts, checked)
+                self._remember_written_file(files, self.settings.FILE_PATH, texts[self.settings.FILE_PATH])
                 return appendix
             if status not in (409, 422):
                 raise ValueError(f"GitHub 提交失败（HTTP {status}）。")
@@ -170,10 +175,30 @@ class DraftMixin:
             if cached_digest == digest:
                 log("Commit bean-check reused for an identical candidate ledger.")
                 return checked
-            checked = check_ledger(texts, root, self.settings.FILE_PATH)
+            checked = self._check_appended(texts, root)
+            if checked is None:
+                checked = check_ledger(texts, root, self.settings.FILE_PATH)
+                self._checked_ledgers.insert(0, CheckedLedger(texts, root, self.settings.FILE_PATH, checked[0], checked[1]))
+            del self._checked_ledgers[4:]
             # Failures raise above and are never cached; one slot bounds memory.
             self._commit_check_cache = (digest, checked)
             return checked
+
+    def _check_appended(self, texts: dict, root: str):
+        """Accept transactions appended to a ledger this process already checked; None requires the complete check."""
+        known = self._checked_ledgers
+        with self._ledger_cache_lock:
+            cache = self._ledger_cache
+            seed = cache.get("texts"), cache.get("entries"), cache.get("options_map")
+        if None not in seed and not any(state.entries is seed[1] for state in known):
+            known.insert(0, CheckedLedger(seed[0], self._ledger_root(seed[0]), self.settings.FILE_PATH, *seed[1:]))
+        for state in known:
+            extended = state.extend(texts) if state.root == root else None
+            if extended is not None:
+                # The base stays too: several drafts are usually prepared against the same remote ledger.
+                known[:] = [extended, state] + [other for other in known if other is not state]
+                return extended.entries, extended.options
+        return None
 
     def approve_pending(self, pending_id: str, pending: dict, automatic: bool = False):
         """The caller owns the claimed draft; all failures retain it for explicit retry."""

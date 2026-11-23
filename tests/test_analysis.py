@@ -20,6 +20,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from beancounter import analysis_query
 from beancounter.analysis import CAPABILITY_TTL, render_analysis
 from beancounter.analysis_query import QuerySession, encode_value, query_result, validate_query
 from beancounter.bot import Bot
@@ -283,6 +284,18 @@ class TestQueryWorker(AnalysisFixture):
             with patch.object(session.connection, "poll", return_value=False), self.assertRaises(TimeoutError):
                 session.query(QUERY, time.monotonic() + 20)
         self.assertNotIn(pid, [p.pid for p in multiprocessing.active_children()])
+
+
+class TestAccountLabelReuse(AnalysisFixture):
+    def test_accounts_scanned_once_per_snapshot(self):
+        with patch("beancounter.analysis_query._account_labels", wraps=analysis_query._account_labels) as labels:
+            first = query_result(self.loaded, "SELECT account, sum(position) AS total GROUP BY account")
+            second = query_result(self.loaded, "SELECT account, sum(position) AS total GROUP BY account")
+            self.assertEqual(labels.call_count, 1)
+            self.assertEqual(first, second)
+            # Another snapshot is another list, even with equal contents.
+            query_result((list(self.loaded[0]), self.loaded[1]), "SELECT account LIMIT 1")
+            self.assertEqual(labels.call_count, 2)
 
 
 class TestAnalysisLoop(AnalysisFixture):

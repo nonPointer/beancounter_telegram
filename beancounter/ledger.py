@@ -5,6 +5,7 @@ from beancount.core.data import Transaction, Open, Close
 from beancount.parser import parser
 from concurrent.futures import as_completed
 import base64
+import hashlib
 from itertools import chain, islice
 try:
     from beancount.query import query as beancount_query
@@ -144,6 +145,14 @@ class LedgerMixin:
             for future in as_completed(futures):
                 cached[futures[future]] = future.result()
         return {path: cached[sha] for path, sha in paths.items()}
+
+    def _remember_written_file(self, files, path, content):
+        """Keep the bytes just written under their Git blob SHA, so the next snapshot does not download the whole journal again. The tree is still listed and every other SHA still compared; a blob that differs remotely has another SHA and is downloaded as before."""
+        data = content.encode("utf-8")
+        sha = hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+        with self._snapshot_lock:
+            if self._snapshot_cache[1] is files:
+                self._snapshot_cache = (None, {**files, path: {"content": content, "sha": sha}})
 
     def _download_ledger_snapshot(self, listed=None) -> tuple[str, dict[str, dict]]:
         with self._snapshot_lock:
@@ -444,6 +453,7 @@ class LedgerMixin:
             if ok:
                 if validate_ledger:
                     self._remember_checked_ledger(texts, checked)
+                    self._remember_written_file(files, file_path, content)
                 return True, ""
             if status not in (409, 422):
                 return False, "Failed to upload to GitHub."

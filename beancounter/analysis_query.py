@@ -93,6 +93,18 @@ def encode_value(value):
     raise ValueError(f"Unsupported result type: {type(value).__name__}")
 
 
+_labels_cache = (None, None)
+
+
+def _snapshot_labels(entries):
+    """One analysis runs up to eight queries on the same entries; scan them for accounts once."""
+    global _labels_cache
+    if _labels_cache[0] is not entries:
+        accounts = {p.account for e in entries if isinstance(e, Transaction) for p in e.postings}
+        _labels_cache = (entries, _account_labels(accounts))
+    return _labels_cache[1]
+
+
 def query_result(loaded, bql):
     validate_query(bql)
     types, rows = beancount_query.run_query(*loaded, bql)
@@ -120,8 +132,7 @@ def query_result(loaded, bql):
         kept.append(encoded)
         display.append(shown)
     # Shorten only exact known account cells, not payees/narrations containing colons.
-    accounts = {p.account for e in loaded[0] if isinstance(e, Transaction) for p in e.postings}
-    labels = _account_labels(accounts)
+    labels = _snapshot_labels(loaded[0])
     for row in display:
         for i, value in enumerate(row):
             if columns[i] == "account" and isinstance(value, str):
