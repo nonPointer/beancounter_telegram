@@ -48,6 +48,7 @@ class CheckedLedger:
         self._supported = False
         self._rank = self._journal_file = self._pads = self._balances = None
         self._inventories = self._head = None
+        self._reason = "unsupported ledger"
 
     def extend(self, texts):
         """Return the checked ledger for `texts`, or None when only the complete check can decide."""
@@ -57,6 +58,10 @@ class CheckedLedger:
         except Exception as exc:
             log(f"Incremental bean-check unavailable ({type(exc).__name__}: {exc}).")
             return None
+
+    @staticmethod
+    def _skip(reason):
+        log(f"Incremental bean-check skipped: {reason}.")
 
     def _appended(self, texts):
         if texts.keys() != self.texts.keys():
@@ -78,6 +83,8 @@ class CheckedLedger:
         options = self.options
         # User plugins and document scans may depend on history the shadow does not contain.
         if options["plugin"] or options["documents"] or options["plugin_processing_mode"] != "default":
+            self._reason = (f'ledger uses plugins {[name for name, _ in options["plugin"]]}, '
+                            f'documents {options["documents"]}, plugin mode {options["plugin_processing_mode"]}')
             return False
         with _materialized(self.texts) as directory, _LOAD_GUARD, timed("incremental bean-check parse"):
             parsed, errors, _ = loader._parse_recursive([(str(Path(directory, self.root)), True)], None)
@@ -86,6 +93,7 @@ class CheckedLedger:
         for entry in parsed:  # Files are parsed one after another; equal sort keys keep that order.
             rank.setdefault(entry.meta["filename"], len(rank))
         if errors or journal_file not in rank:
+            self._reason = f"{len(errors)} parse errors" if errors else "the journal has no directives yet"
             return False
         self._rank, self._journal_file = rank, journal_file
         parsed.sort(key=self._order)
@@ -152,15 +160,18 @@ class CheckedLedger:
 
     def _extend(self, texts):
         suffix = self._appended(texts)
-        if suffix is None or not self._prepare():
-            return None
+        if suffix is None:
+            return self._skip("the candidate is not this ledger plus appended journal text")
+        if not self._prepare():
+            return self._skip(self._reason)
         lines_before = self.texts[self.journal].count("\n")
         new, errors, options = parser.parse_string("\n" * lines_before + suffix, report_filename=self._journal_file)
         blank = parser.parse_string("", report_filename=self._journal_file)[2]
         # Only plain transactions qualify: no parse error, other directive, option, plugin or include.
         if (errors or any(not isinstance(entry, Transaction) for entry in new)
                 or any(options[key] != blank[key] for key in blank if key != "dcontext")):
-            return None
+            return self._skip(f"the addition is not plain transactions ({len(errors)} parse errors, "
+                              f"{[type(entry).__name__ for entry in new]})")
         if not new:
             return self._derived(texts, self._parsed, self.entries, self.options)
 
