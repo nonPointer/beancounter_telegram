@@ -407,6 +407,8 @@ def run():
     signal.signal(signal.SIGTERM, lambda *_: bot.stop.set())
     if debug:
         log("Debug mode")
+    # Requests arriving meanwhile wait on the same load lock and reuse its result.
+    threading.Thread(target=bot.warm_up, name="warm-up", daemon=True).start()
     try:
         bot.start()
     except KeyboardInterrupt:

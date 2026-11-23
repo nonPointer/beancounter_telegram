@@ -11,6 +11,7 @@ import unittest
 from collections import Counter
 from unittest.mock import MagicMock, patch
 
+from beancount import __version__ as BEANCOUNT_VERSION
 from beancount.parser import printer
 
 from beancounter import drafts, ledger_shadow
@@ -23,6 +24,8 @@ START = datetime.date(2026, 1, 1)
 DAYS = 90
 CASH = ["Assets:Cash", "Assets:Bank:A", "Assets:Bank:B", "Liabilities:Card"]
 EXP = ["Expenses:Food", "Expenses:Misc"]
+# v2's leafonly rejects any directive on a parent account, its Open included; v3 allows Open and Balance there.
+PARENT = "" if BEANCOUNT_VERSION.startswith("2.") else "2025-12-01 open Assets:Bank\n2025-12-02 balance Assets:Bank 0 CNY\n"
 UNSTABLE_OPTIONS = {"include", "filename", "input_hash", "dcontext"}
 
 
@@ -105,6 +108,41 @@ class TestShadowRules(EquivalenceMixin, unittest.TestCase):
                                "  Assets:Bank:A 13 CNY\n  Income:PnL")
         self.assertTrue(full(again)[1])  # That lot is gone.
         self.assertIsNone(state.extend(again))
+
+    def test_supported_plugins(self):
+        plugins = "".join(f'plugin "beancount.plugins.{name}"\n' for name in
+                          ("leafonly", "unique_prices", "sellgains", "check_average_cost", "nounused"))
+        accounts = "".join(f"2025-12-01 open {name}\n" for name in
+                           ["Assets:Cash", "Assets:Bank:A", "Assets:Old", "Assets:Broker", "Expenses:Food",
+                            "Income:PnL", "Equity:Opening"]) + '2025-12-01 open Assets:Fund FUND "NONE"\n' + PARENT
+        journal = ('2025-12-02 * "seed"\n  Assets:Bank:A 50000 CNY\n  Assets:Cash 30 CNY\n  Assets:Old 10 CNY\n'
+                   "  Assets:Broker 5 STOCK {10 CNY}\n  Assets:Fund 10 FUND {10 CNY}\n  Income:PnL -1 CNY\n  Equity:Opening\n"
+                   '2025-12-03 * "more"\n  Assets:Fund 10 FUND {12 CNY}\n  Assets:Bank:A\n'
+                   '2025-12-04 * "drain"\n  Assets:Old -10 CNY\n  Expenses:Food\n'  # Used, then empty: no baseline posting.
+                   "2025-12-05 price STOCK 11 CNY\n")
+        base = ledger(journal, accounts=accounts, options=plugins)
+        state = checked(base)
+        accepted = {
+            "plain": '2026-01-05 * "tea"\n  Expenses:Food 5 CNY\n  Assets:Cash',
+            "sale at the price": '2026-01-05 * "sell"\n  Assets:Broker -2 STOCK {10 CNY} @ 13 CNY\n'
+                                 "  Assets:Bank:A 26 CNY\n  Income:PnL",
+            "sale at the average cost": '2026-01-05 * "sell"\n  Assets:Fund -5 FUND {11 CNY}\n  Assets:Bank:A',
+        }
+        rejected = {
+            "LeafOnlyError": '2026-01-05 * "tea"\n  Expenses:Food 5 CNY\n  Assets:Bank',
+            "SellGainsError": '2026-01-05 * "sell"\n  Assets:Broker -2 STOCK {10 CNY} @ 13 CNY\n'
+                         "  Assets:Bank:A 76 CNY\n  Income:PnL",
+            "MatchBasisError": '2026-01-05 * "sell"\n  Assets:Fund -5 FUND {12 CNY}\n  Assets:Bank:A',
+        }
+        for name, addition in accepted.items():
+            with self.subTest(name):
+                self.assert_same_as_full(state.extend(appended(base, addition)), appended(base, addition))
+        if not PARENT:
+            del rejected["LeafOnlyError"]
+        for name, addition in rejected.items():
+            with self.subTest(name):
+                self.assertEqual([type(error).__name__ for error in full(appended(base, addition))[1]], [name])
+                self.assertIsNone(state.extend(appended(base, addition)))
 
     def test_chained_additions_reuse_the_state(self):
         texts = ledger(SEED)
@@ -193,11 +231,37 @@ class TestShadowRules(EquivalenceMixin, unittest.TestCase):
             self.assertIsNone(state.extend(appended(base, '2026-01-05 * "x"\n  Expenses:Food 5 CNY\n  Assets:Cash')))
 
 
+PLUGINS = ("leafonly", "unique_prices", "sellgains", "check_average_cost", "nounused")
+# Every account is referenced, so nounused accepts the starting ledger.
+FULL_SEED = ('2025-12-02 * "seed"\n  Assets:Bank:A 50000 CNY\n  Assets:Bank:B 1 CNY\n'
+             "  Liabilities:Card -1 CNY\n  Assets:Cash 3000 USD\n  Assets:Old 10 CNY\n  Expenses:Food 1 CNY\n"
+             "  Expenses:Misc 1 CNY\n  Income:Salary -1 CNY\n  Income:PnL -1 CNY\n  Assets:Broker 1 STOCK {10 CNY}\n"
+             "  Assets:Fund 10 FUND {10 CNY}\n  Equity:Opening\n")
+
+
+def plugin_case(rng, day, kind):
+    """Transactions whose validity is decided by a plugin, some of them by the lots held so far."""
+    if kind < 0.3:
+        return f'{day} * "fund"\n  Assets:Fund {rng.randint(1, 9)} FUND {{{rng.choice([10, 10.2, 12])} CNY}}\n  Assets:Bank:A'
+    if kind < 0.6:  # Sold at cost; whether that cost is acceptable depends on the average of the lots held.
+        units, cost = rng.randint(1, 6), rng.choice([10, 10.4, 11, 12.5])
+        return (f'{day} * "redeem"\n  Assets:Fund -{units} FUND {{{cost} CNY}} @ {cost} CNY\n'
+                f"  Assets:Bank:A {units * cost} CNY")
+    if kind < 0.8:  # Proceeds disagree with the price: only sellgains objects.
+        units = rng.randint(1, 3)
+        return (f'{day} * "odd sale"\n  Assets:Broker -{units} STOCK {{}} @ 13 CNY\n'
+                f"  Assets:Bank:A {units * 13 + 50} CNY\n  Income:PnL")
+    # A posting on a parent account: only leafonly objects.
+    return f'{day} * "parent"\n  {rng.choice(EXP)} 5 CNY\n  Assets:Bank'
+
+
 def directive(rng, late=False):
     day = START + datetime.timedelta(days=rng.randint(DAYS - 6, DAYS) if late else rng.randint(0, DAYS))
     kind = rng.random()
     amount = rng.choice([1, 5, 12.5, 80, 300, 1234.56])
     currency = rng.choice(["CNY", "CNY", "USD"])
+    if kind < 0.16:
+        return plugin_case(rng, day, kind / 0.16)
     if kind < 0.40:
         return f'{day} * "Shop" "spend"\n  {rng.choice(EXP)} {amount} {currency}\n  {rng.choice(CASH)}'
     if kind < 0.48:
@@ -238,6 +302,8 @@ def candidate(rng):
         return f'{day} * "bad" "currency"\n  Expenses:Food 5 EUR\n  {rng.choice(CASH)}'
     if kind < 0.26:
         return f'{day} * "old account"\n  Expenses:Food 5 CNY\n  Assets:Old'
+    if kind < 0.50:
+        return plugin_case(rng, day, rng.random())
     while True:
         text = directive(rng, late=rng.random() < 0.8)
         if " * " in text.splitlines()[0] and "close" not in text:
@@ -251,11 +317,13 @@ class TestShadowAgainstCompleteCheck(EquivalenceMixin, unittest.TestCase):
         rng = random.Random(seed)
         booking = rng.choice([None, None, "FIFO", "LIFO", "NONE"])
         options = f'option "booking_method" "{booking}"\n' if booking else ""
+        if rng.random() < 0.7:
+            options += "".join(f'plugin "beancount.plugins.{name}"\n' for name in PLUGINS if rng.random() < 0.6)
         accounts = "".join(f"2025-12-01 open {a} {rng.choice(['CNY,USD', 'CNY,USD', ''])}".rstrip() + "\n" for a in CASH)
         accounts += "".join(f"2025-12-01 open {a}\n" for a in EXP + ["Income:Salary", "Income:PnL", "Equity:Opening",
                                                                     "Assets:Broker", "Assets:Old"])
-        accounts += "2025-12-01 commodity STOCK\n"
-        texts = ledger(SEED, accounts=accounts, options=options)
+        accounts += '2025-12-01 commodity STOCK\n2025-12-01 open Assets:Fund FUND "NONE"\n' + PARENT
+        texts = ledger(FULL_SEED, accounts=accounts, options=options)
         for _ in range(rng.randint(15, 45)):  # Grow a clean ledger across two files, in file order.
             path = "extra.bean" if rng.random() < 0.2 else JOURNAL
             grown = {**texts, path: texts[path] + "\n" + directive(rng) + "\n"}
@@ -268,6 +336,9 @@ class TestShadowAgainstCompleteCheck(EquivalenceMixin, unittest.TestCase):
             extended = state.extend(grown)
             self.assertEqual(extended is not None, valid, f"seed {seed}: {grown[JOURNAL][len(texts[JOURNAL]):]}")
             stats["accepted" if valid else "rejected"] += 1
+            # Candidates only the plugins reject show that the shadow really runs them.
+            stats["plugin verdicts"] += not valid and "plugin" in options and not full(
+                {**grown, ROOT: grown[ROOT].replace("plugin ", "; plugin ")})[1]
             if valid:
                 stats["backdated cutoffs"] += state._inventories[0] < min(
                     e.date for e in extended._parsed if e not in state._parsed)
@@ -282,6 +353,7 @@ class TestShadowAgainstCompleteCheck(EquivalenceMixin, unittest.TestCase):
         self.assertGreater(stats["accepted"], 100)
         self.assertGreater(stats["rejected"], 40)
         self.assertGreater(stats["backdated cutoffs"], 5)
+        self.assertGreater(stats["plugin verdicts"], 3)
 
 
 class TestCommitGate(EquivalenceMixin, unittest.TestCase):
@@ -345,6 +417,31 @@ class TestCommitGate(EquivalenceMixin, unittest.TestCase):
         changed = {**self.base, "extra.bean": '2026-01-02 * "elsewhere"\n  Expenses:Food 1 CNY\n  Assets:Cash\n'}
         self.bot._check_commit_candidate(self.spend(changed))
         self.complete.assert_called_once()
+
+    def test_startup_warm_up_prepares_the_loaded_ledger(self):
+        self.bot.parse_accounts = MagicMock()
+        self.bot.load_ledger = lambda: self.load(self.base) or self.bot._ledger_cache["entries"]
+        with patch.object(ledger_shadow, "_materialized", wraps=ledger_shadow._materialized) as parse:
+            self.bot.warm_up()
+            self.assertEqual(parse.call_count, 1)
+            self.bot._check_commit_candidate(self.spend(self.base))
+            self.assertEqual(parse.call_count, 1)
+        self.bot.parse_accounts.assert_called_once()
+        self.complete.assert_not_called()
+
+    def test_startup_warm_up_failure_is_not_fatal(self):
+        self.bot.parse_accounts = MagicMock(side_effect=ValueError("offline"))
+        self.bot.warm_up()
+        self.bot._check_commit_candidate(self.spend(self.base))
+        self.complete.assert_called_once()
+
+    def test_startup_warm_up_reports_an_unsupported_ledger(self):
+        base = ledger(SEED, options='plugin "beancount.plugins.auto_accounts"\n')
+        self.bot.parse_accounts = MagicMock()
+        self.bot.load_ledger = lambda: self.load(base) or True
+        with patch.object(ledger_shadow, "log") as logged:
+            self.bot.warm_up()
+        self.assertIn("auto_accounts", logged.call_args.args[0])
 
     def test_known_ledgers_are_bounded(self):
         self.load(self.base)

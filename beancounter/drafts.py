@@ -186,12 +186,7 @@ class DraftMixin:
 
     def _check_appended(self, texts: dict, root: str):
         """Accept transactions appended to a ledger this process already checked; None requires the complete check."""
-        known = self._checked_ledgers
-        with self._ledger_cache_lock:
-            cache = self._ledger_cache
-            seed = cache.get("texts"), cache.get("entries"), cache.get("options_map")
-        if None not in seed and not any(state.entries is seed[1] for state in known):
-            known.insert(0, CheckedLedger(seed[0], self._ledger_root(seed[0]), self.settings.FILE_PATH, *seed[1:]))
+        known = self._known_checked_ledgers()
         for state in known:
             extended = state.extend(texts) if state.root == root else None
             if extended is not None:
@@ -199,6 +194,30 @@ class DraftMixin:
                 known[:] = [extended, state] + [other for other in known if other is not state]
                 return extended.entries, extended.options
         return None
+
+    def _known_checked_ledgers(self) -> list:
+        """Caller holds _commit_check_lock. The loaded ledger joins the bases the first time it is seen."""
+        known = self._checked_ledgers
+        with self._ledger_cache_lock:
+            cache = self._ledger_cache
+            seed = cache.get("texts"), cache.get("entries"), cache.get("options_map")
+        if None not in seed and not any(state.entries is seed[1] for state in known):
+            known.insert(0, CheckedLedger(seed[0], self._ledger_root(seed[0]), self.settings.FILE_PATH, *seed[1:]))
+        return known
+
+    def warm_up(self):
+        """Startup only: pull and check the ledger so the first message does not wait for it."""
+        try:
+            with timed("startup warm-up"):
+                self.parse_accounts()
+                if self.load_ledger() is None:
+                    return
+                with self._commit_check_lock:
+                    known = self._known_checked_ledgers()
+                    known[0].prepare()
+                    del known[4:]
+        except Exception as exc:
+            log(f"Startup warm-up failed ({type(exc).__name__}: {exc}); the first request loads the ledger instead.")
 
     def approve_pending(self, pending_id: str, pending: dict, automatic: bool = False):
         """The caller owns the claimed draft; all failures retain it for explicit retry."""

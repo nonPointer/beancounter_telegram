@@ -20,6 +20,11 @@ from beancount.parser import booking, parser
 from .bot_utils import log, timed
 from .ledger_validation import _LOAD_GUARD, _gc_paused, _materialized
 
+# Checkers whose verdict on a transaction depends only on that transaction, on the account tree, or on the lots its accounts hold, all of which the shadow reproduces. They run in the shadow.
+REPLAYED_PLUGINS = {"beancount.plugins.leafonly", "beancount.plugins.sellgains", "beancount.plugins.check_average_cost"}
+# Checkers that an appended transaction cannot newly fail: it only adds account references and no price directive. The shadow drops history they would miss, so they are left out of it.
+UNAFFECTED_PLUGINS = {"beancount.plugins.nounused", "beancount.plugins.unique_prices"}
+
 BASELINE_FILE = "<shadow-baseline>"
 BASELINE_ACCOUNT = "ShadowLedgerBaseline"
 
@@ -47,7 +52,7 @@ class CheckedLedger:
         self._parsed = None  # Directives before booking, in loader order; parsed on first use.
         self._supported = False
         self._rank = self._journal_file = self._pads = self._balances = None
-        self._inventories = self._head = None
+        self._inventories = self._head = self._plugins = None
         self._reason = "unsupported ledger"
 
     def extend(self, texts):
@@ -58,6 +63,15 @@ class CheckedLedger:
         except Exception as exc:
             log(f"Incremental bean-check unavailable ({type(exc).__name__}: {exc}).")
             return None
+
+    def prepare(self):
+        """Parse the base ahead of its first use; returns whether additions to it can be checked incrementally."""
+        try:
+            with _gc_paused():
+                return self._prepare() or bool(self._skip(self._reason))
+        except Exception as exc:
+            log(f"Incremental bean-check unavailable ({type(exc).__name__}: {exc}).")
+            return False
 
     @staticmethod
     def _skip(reason):
@@ -81,11 +95,13 @@ class CheckedLedger:
             return self._supported
         self._parsed = []
         options = self.options
-        # User plugins and document scans may depend on history the shadow does not contain.
-        if options["plugin"] or options["documents"] or options["plugin_processing_mode"] != "default":
-            self._reason = (f'ledger uses plugins {[name for name, _ in options["plugin"]]}, '
+        # Other plugins and document scans may depend on history the shadow does not contain, or rewrite entries.
+        unknown = [name for name, _ in options["plugin"] if name not in REPLAYED_PLUGINS | UNAFFECTED_PLUGINS]
+        if unknown or options["documents"] or options["plugin_processing_mode"] != "default":
+            self._reason = (f'ledger uses unsupported plugins {unknown}, '
                             f'documents {options["documents"]}, plugin mode {options["plugin_processing_mode"]}')
             return False
+        self._plugins = [plugin for plugin in options["plugin"] if plugin[0] in REPLAYED_PLUGINS]
         with _materialized(self.texts) as directory, _LOAD_GUARD, timed("incremental bean-check parse"):
             parsed, errors, _ = loader._parse_recursive([(str(Path(directory, self.root)), True)], None)
             journal_file = str(Path(directory, self.journal))
@@ -184,7 +200,7 @@ class CheckedLedger:
         display.update_from(options["dcontext"])
         display.set_commas(self.options["dcontext"].commas)
         options = {**self.options, "dcontext": display}
-        final, errors = _pipeline(shadow, options)
+        final, errors = _pipeline(shadow, {**options, "plugin": self._plugins})
         if errors:
             log(f"Incremental bean-check found {len(errors)} errors; the complete check decides.")
             return None
@@ -196,7 +212,7 @@ class CheckedLedger:
     def _derived(self, texts, parsed, entries, options):
         state = CheckedLedger(texts, self.root, self.journal, entries, options)
         state._parsed, state._supported = parsed, True
-        state._rank, state._journal_file = self._rank, self._journal_file
+        state._rank, state._journal_file, state._plugins = self._rank, self._journal_file, self._plugins
         state._pads, state._balances = self._pads, self._balances  # Only transactions were added.
         # Additions are dated on or after the cutoff just used, so everything cached before it still holds.
         state._inventories, state._head = self._inventories, self._head
